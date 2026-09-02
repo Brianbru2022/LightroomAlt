@@ -1,19 +1,22 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { SetupScreen } from "./components/SetupScreen";
+import { ImportDialog } from "./components/ImportDialog";
 import { TagDialog } from "./components/TagDialog";
 import { Topbar } from "./components/Topbar";
 import { api } from "./lib/bridge";
 import { decisionLabel } from "./lib/format";
-import type { Asset, AssetFilter, BatchJob, Decision, EditIntent, EditRecipe, LibraryStatus, ServiceHealth, ViewName } from "./types";
+import type { Asset, AssetFilter, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryStatus, ServiceHealth, ViewName } from "./types";
 import { LibraryView } from "./views/LibraryView";
 import { MapView } from "./views/MapView";
 import { TriageView } from "./views/TriageView";
 import { WorkshopView } from "./views/WorkshopView";
+import { SettingsView } from "./views/SettingsView";
 
 const PAGE_SIZE = 240;
 const emptyStatus: LibraryStatus = { configured: false, counts: { total: 0, keep: 0, undecided: 0, discard: 0 } };
 const emptyHealth: ServiceHealth = { localAiAvailable: false, serviceReachable: false, localAiBusy: false, localAiDetail: "No local image service is responding.", analysisModelInstalled: false };
+type OperationProgress = { kind: "Import" | "Trash" | "Cache"; current: number; total: number; importId?: string; file?: string; error?: string };
 
 export function App() {
   const [status, setStatus] = useState<LibraryStatus>(emptyStatus);
@@ -29,9 +32,11 @@ export function App() {
   const [busy, setBusy] = useState(true);
   const [tagAsset, setTagAsset] = useState<Asset | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [importPaths, setImportPaths] = useState<string[]>([]);
+  const [operationProgress, setOperationProgress] = useState<OperationProgress | null>(null);
   const requestId = useRef(0);
   const deferredSearch = useDeferredValue(filter.search);
-  const effectiveFilter = useMemo<AssetFilter>(() => ({ ...filter, search: deferredSearch }), [deferredSearch, filter.decision, filter.tag, filter.year]);
+  const effectiveFilter = useMemo<AssetFilter>(() => ({ ...filter, search: deferredSearch, trashed: view === "trash" }), [deferredSearch, filter.decision, filter.tag, filter.year, view]);
   const selected = useMemo(() => assets.find((asset) => asset.id === selectedId) ?? assets[0] ?? null, [assets, selectedId]);
   const selectedAssetId = selected?.id;
 
@@ -99,6 +104,20 @@ export function App() {
       .catch((error) => active && setNotice(`Could not open the catalogue: ${String(error)}`))
       .finally(() => active && setBusy(false));
     return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    if (!api.isNative()) return;
+    let active = true;
+    const unlisteners: Array<() => void> = [];
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      const registrations = await Promise.all([
+        listen<Record<string, unknown>>("import-progress", ({ payload }) => active && setOperationProgress({ kind: "Import", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), importId: String(payload.importId ?? ""), file: String(payload.file ?? ""), error: payload.error ? String(payload.error) : undefined })),
+        listen<Record<string, unknown>>("trash-progress", ({ payload }) => active && setOperationProgress({ kind: "Trash", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), error: payload.error ? String(payload.error) : undefined })),
+        listen<Record<string, unknown>>("cache-progress", ({ payload }) => active && setOperationProgress({ kind: "Cache", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), error: payload.error ? String(payload.error) : undefined })),
+      ]);
+      if (active) unlisteners.push(...registrations); else registrations.forEach((unlisten) => unlisten());
+    });
+    return () => { active = false; unlisteners.forEach((unlisten) => unlisten()); };
   }, []);
   useEffect(() => { if (status.configured) void loadFirstPage(); }, [loadFirstPage, status.configured]);
   useEffect(() => {
@@ -203,24 +222,53 @@ export function App() {
     }
   };
   const importPhotos = async () => {
-    const paths = await api.chooseImport(); if (!paths.length) return;
-    setBusy(true); try { const result = await api.importPhotos(paths); setNotice(`Imported ${result.imported}; ${result.duplicates} duplicates skipped; ${result.failed} failed.`); await refreshCatalogue(); } finally { setBusy(false); }
+    const paths = await api.chooseImport();
+    if (paths.length) setImportPaths(paths);
   };
-  const deleteAllDiscarded = async () => {
+  const startImport = async (options: ImportOptions) => {
+    const paths = importPaths;
+    setImportPaths([]);
+    setBusy(true);
+    try {
+      const result = await api.importPhotos(paths, options);
+      setNotice(`${result.copied} copied; ${result.moved} moved; ${result.sourceRetained} sources retained; ${result.duplicates} exact duplicates; ${result.failed} failed.`);
+      await refreshCatalogue();
+    } catch (error) { setNotice(`Import could not complete: ${String(error)}`); } finally { setBusy(false); setOperationProgress(null); }
+  };
+  const moveAllDiscarded = async () => {
     if (!visibleTotal) return;
     const scope = filter.search ? " matching the current search" : "";
-    if (!window.confirm(`Move all ${visibleTotal} discarded ${visibleTotal === 1 ? "photograph" : "photographs"}${scope} to the Windows Recycle Bin?\n\nThis cannot be undone inside Keepframe.`)) return;
+    if (!window.confirm(`Move all ${visibleTotal} discarded ${visibleTotal === 1 ? "photograph" : "photographs"}${scope} to Keepframe Trash?\n\nThey remain catalogued and can be restored until you separately empty Trash.`)) return;
     setBusy(true);
     try {
       const ids = await api.assetIds({ ...effectiveFilter, decision: "discard" });
-      const result = await api.deleteDiscarded(ids);
-      setNotice(`${result.deleted} discarded ${result.deleted === 1 ? "photograph" : "photographs"} moved to the Recycle Bin${result.failed ? `; ${result.failed} could not be removed` : ""}.`);
+      const result = await api.moveToTrash(ids);
+      setNotice(`${result.affected} discarded ${result.affected === 1 ? "photograph" : "photographs"} moved to Keepframe Trash${result.failed ? `; ${result.failed} need attention` : ""}.`);
       await refreshCatalogue();
     } catch (error) {
-      setNotice(`Could not delete discarded photographs: ${String(error)}`);
+      setNotice(`Could not move discarded photographs to Trash: ${String(error)}`);
     } finally {
       setBusy(false);
     }
+  };
+  const restoreAllTrash = async () => {
+    const ids = await api.assetIds({ ...effectiveFilter, decision: "all", trashed: true });
+    if (!ids.length) return;
+    setBusy(true);
+    try {
+      const result = await api.restoreFromTrash(ids);
+      setNotice(`${result.affected} ${result.affected === 1 ? "photograph" : "photographs"} restored${result.failed ? `; ${result.failed} need attention` : ""}.`);
+      await refreshCatalogue();
+    } catch (error) { setNotice(`Restore failed: ${String(error)}`); } finally { setBusy(false); }
+  };
+  const emptyAllTrash = async () => {
+    if (!visibleTotal || !window.confirm("Empty Keepframe Trash?\n\nFiles will be sent to the Windows Recycle Bin. This cannot be undone inside Keepframe.")) return;
+    setBusy(true);
+    try {
+      const result = await api.emptyTrash();
+      setNotice(`${result.affected} managed ${result.affected === 1 ? "file was" : "files were"} sent to the Windows Recycle Bin${result.failed ? `; ${result.failed} need attention` : ""}.`);
+      await refreshCatalogue();
+    } catch (error) { setNotice(`Empty Trash failed: ${String(error)}`); } finally { setBusy(false); }
   };
   const saveTags = async (tags: string[]) => { if (!tagAsset) return; await api.updateTags(tagAsset.id, tags); setTagAsset(null); setNotice("Tags updated. Ctrl+Z to undo."); await refreshCatalogue(); };
   const saveLocation = async (id: string, latitude: number, longitude: number) => { await api.updateLocation(id, latitude, longitude); setNotice("Map location updated. Ctrl+Z to undo."); await refreshCatalogue(); };
@@ -239,20 +287,24 @@ export function App() {
   const approveJobs = async (ids: string[]) => { try { await api.approveJobs(ids); setJobs(await api.jobs()); setNotice(`${ids.length} reviewed ${ids.length === 1 ? "job" : "jobs"} approved for local editing.`); } catch (error) { setNotice(`Bulk approval failed: ${String(error)}`); } };
 
   if (busy && !status.configured) return <div className="app-loading"><span className="brand-mark">K</span><p>Opening Keepframe…</p></div>;
-  if (!status.configured) return <SetupScreen onChoose={api.chooseLibrary} onCreate={async (path) => { setBusy(true); try { setStatus(await api.initialiseLibrary(path)); } finally { setBusy(false); } }} />;
+  if (!status.configured) return <SetupScreen issue={status.libraryIssue} onChoose={api.chooseLibrary} onCreate={async (path) => { setBusy(true); try { setStatus(await api.initialiseLibrary(path)); } catch (error) { setNotice(`Could not open the library: ${String(error)}`); } finally { setBusy(false); } }} />;
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} status={{ ...status, ...health }} onView={setView} />
+      <Sidebar view={view} status={{ ...status, ...health }} onView={(nextView) => { setView(nextView); if (nextView === "trash") setFilter((value) => ({ ...value, decision: "all" })); }} />
       <div className="workspace">
-        <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => setFilter((value) => ({ ...value, search }))} onDecision={(decision) => setFilter((value) => ({ ...value, decision }))} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={deleteAllDiscarded} />
+        <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => setFilter((value) => ({ ...value, search }))} onDecision={(decision) => setFilter((value) => ({ ...value, decision }))} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={moveAllDiscarded} />
         {view === "library" ? <LibraryView assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={openAsset} /> : null}
         {view === "triage" ? <TriageView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onDecision={decide} onWorkshop={() => setView("workshop")} onMap={() => setView("map")} onTags={setTagAsset} /> : null}
         {view === "map" ? <MapView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onLocation={saveLocation} /> : null}
         {view === "workshop" ? <WorkshopView asset={selected} assets={assets} jobs={jobs} serviceHealth={health} onAnalyse={(asset, intent: EditIntent, brief) => api.analyse(asset, intent, brief)} onPrompts={api.prompts} onCopy={api.copy} onPrepare={async (assetId, provider, prompt) => { const path = await api.prepareCloud(assetId, provider, prompt); setNotice(`Prepared cloud-edit PNG and prompt at ${path}`); }} onExportExternal={async (assetId, provider, prompt) => { const path = await api.exportExternal(assetId, provider, prompt); if (path) setNotice(`External AI image and prompt exported to ${path}`); }} onImportReturned={async (assetId, provider, prompt) => { const job = await api.importReturned(assetId, provider, prompt); if (job) { setJobs(await api.jobs()); setNotice("Returned edit imported as a candidate version."); } }} onLoadVersions={api.versions} onSetPreferred={async (assetId, versionId) => { await api.setPreferredVersion(assetId, versionId); await refreshCatalogue(); setNotice("Preferred display version updated; catalogue metadata is unchanged."); }} onReplace={async (asset) => { const version = await api.chooseReplacement(asset); if (version) { await refreshCatalogue(); setNotice("Replacement imported as a derived version; original metadata and file are preserved."); } }} onEnqueue={enqueue} onRunLocal={runLocal} onJob={updateJob} onSaveJobReview={saveJobReview} onApproveJobs={approveJobs} /> : null}
+        {view === "trash" ? <LibraryView mode="trash" assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={(asset) => setSelectedId(asset.id)} onRestoreAll={restoreAllTrash} onEmptyTrash={emptyAllTrash} /> : null}
+        {view === "settings" ? <SettingsView status={status} health={health} busy={busy} onIntegrity={async () => { setBusy(true); try { setNotice(`Catalogue integrity: ${await api.catalogueIntegrity()}.`); } catch (error) { setNotice(`Integrity check failed: ${String(error)}`); } finally { setBusy(false); } }} onBackup={async () => { setBusy(true); try { setNotice(`Verified backup created at ${await api.createBackup()}`); } catch (error) { setNotice(`Backup failed: ${String(error)}`); } finally { setBusy(false); } }} onRestore={async () => { if (!window.confirm("Restore a catalogue backup? Keepframe will first create a safety backup of the current catalogue.")) return; setBusy(true); try { if (await api.restoreBackup()) { await refreshCatalogue(); setNotice("Catalogue backup restored and verified."); } } catch (error) { setNotice(`Restore failed: ${String(error)}`); } finally { setBusy(false); } }} onRebuild={async () => { setBusy(true); try { const count = await api.rebuildThumbnails(); await refreshCatalogue(); setNotice(`${count} thumbnails rebuilt.`); } catch (error) { setNotice(`Thumbnail rebuild failed: ${String(error)}`); } finally { setBusy(false); } }} onDiagnostics={async () => { setBusy(true); try { const path = await api.exportDiagnostics(); if (path) setNotice(`Privacy-safe diagnostics exported to ${path}`); } catch (error) { setNotice(`Diagnostics export failed: ${String(error)}`); } finally { setBusy(false); } }} /> : null}
       </div>
       {tagAsset ? <TagDialog asset={tagAsset} onClose={() => setTagAsset(null)} onSave={saveTags} /> : null}
+      {importPaths.length ? <ImportDialog sourceCount={importPaths.length} onClose={() => setImportPaths([])} onStart={startImport} /> : null}
       {notice ? <button className="toast" aria-live="polite" onClick={() => setNotice(null)}>{notice}</button> : null}
+      {operationProgress ? <section className="operation-progress" aria-live="polite"><div><strong>{operationProgress.kind}</strong><span>{operationProgress.current} of {operationProgress.total}</span></div><progress max={Math.max(1, operationProgress.total)} value={operationProgress.current} /><small>{operationProgress.error ?? operationProgress.file ?? "Working safely in the background…"}</small>{operationProgress.kind === "Import" && operationProgress.importId ? <button className="quiet-button" onClick={() => api.cancelImport(operationProgress.importId!).then(() => setNotice("Import cancellation requested; the current safe boundary will finish first."))}>Cancel import</button> : null}</section> : null}
     </div>
   );
 }

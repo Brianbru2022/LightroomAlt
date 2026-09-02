@@ -1,4 +1,4 @@
-import { Aperture, Images, Map, ScanSearch, Sparkles } from "lucide-react";
+import { Aperture, Images, Map, ScanSearch, Settings, Sparkles, Trash2 } from "lucide-react";
 import type { LibraryStatus, ServiceHealth, ViewName } from "../types";
 
 const items: Array<{ id: ViewName; label: string; icon: typeof Images }> = [
@@ -6,6 +6,8 @@ const items: Array<{ id: ViewName; label: string; icon: typeof Images }> = [
   { id: "triage", label: "Triage", icon: ScanSearch },
   { id: "map", label: "Map", icon: Map },
   { id: "workshop", label: "AI Workshop", icon: Sparkles },
+  { id: "trash", label: "Trash", icon: Trash2 },
+  { id: "settings", label: "Settings & Health", icon: Settings },
 ];
 
 type Props = { view: ViewName; status: LibraryStatus & ServiceHealth; onView: (view: ViewName) => void };

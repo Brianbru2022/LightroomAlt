@@ -90,17 +90,20 @@ describe("Keepframe application shell", () => {
     expect(await screen.findByRole("heading", { name: "AI Workshop" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Triage/ }));
     fireEvent.keyDown(window, { key: "m" });
-    expect(await screen.findByRole("heading", { name: /places/ })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /located photographs/ })).toBeInTheDocument();
   });
 
-  it("deletes all photographs shown in the discard folder after confirmation", async () => {
+  it("moves discarded photographs to reversible Trash before emptying", async () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App />);
     await screen.findByRole("heading", { name: "Photographs" });
     fireEvent.click(screen.getByRole("button", { name: "Discard", current: false }));
-    const deleteAll = await screen.findByRole("button", { name: /Delete all 1 discarded photograph/ });
-    fireEvent.click(deleteAll);
+    const moveAll = await screen.findByRole("button", { name: /Move all \d+ discarded photographs to Trash/ });
+    fireEvent.click(moveAll);
     await waitFor(() => expect(screen.getByText("No photographs match")).toBeInTheDocument());
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("Windows Recycle Bin"));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("Keepframe Trash"));
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    expect(await screen.findByRole("heading", { name: "Trash" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restore all" })).toBeEnabled();
   });
 });

@@ -27,7 +27,7 @@ export function Topbar({ search, decision, busy, onSearch, onDecision, onImport,
           <button key={value} className={decision === value ? "selected" : ""} onClick={() => onDecision(value)}>{value === "all" ? "All" : value[0].toUpperCase() + value.slice(1)}</button>
         ))}
       </div>
-      {decision === "discard" ? <button className="danger-button" onClick={onDeleteAll} disabled={busy || discardCount === 0} aria-label={`Delete all ${discardCount} discarded photographs`}><Trash2 size={17} /> Delete all ({discardCount})</button> : null}
+      {decision === "discard" ? <button className="danger-button" onClick={onDeleteAll} disabled={busy || discardCount === 0} aria-label={`Move all ${discardCount} discarded photographs to Trash`}><Trash2 size={17} /> Move to Trash ({discardCount})</button> : null}
       <button className="icon-button" onClick={onUndo} title="Undo last catalogue action" aria-label="Undo last catalogue action"><Undo2 size={18} /></button>
       <button className="primary-button" onClick={onImport} disabled={busy}><FolderInput size={17} /> {busy ? "Importing…" : "Import"}</button>
     </header>

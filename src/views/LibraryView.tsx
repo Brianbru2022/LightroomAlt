@@ -12,13 +12,16 @@ type Props = {
   selected: Asset | null;
   onSelect: (asset: Asset) => void;
   onOpen: (asset: Asset) => void;
+  mode?: "library" | "trash";
+  onRestoreAll?: () => void;
+  onEmptyTrash?: () => void;
 };
 
 type VirtualRow =
   | { key: string; kind: "year"; year: string; count: number; top: number; height: number }
   | { key: string; kind: "photos"; assets: Asset[]; columns: number; top: number; height: number };
 
-export function LibraryView({ assets, total, loading, hasMore, onLoadMore, selected, onSelect, onOpen }: Props) {
+export function LibraryView({ assets, total, loading, hasMore, onLoadMore, selected, onSelect, onOpen, mode = "library", onRestoreAll, onEmptyTrash }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({ width: 1000, height: 600, top: 0 });
   useEffect(() => {
@@ -72,15 +75,15 @@ export function LibraryView({ assets, total, loading, hasMore, onLoadMore, selec
   return (
     <main className="view library-view">
       <div className="view-heading">
-        <div><span className="eyebrow">Master library</span><h1>Photographs</h1><p>{total} visible · {assets.length < total ? `${assets.length} loaded · ` : ""}originals protected</p></div>
-        <div className="library-shortcuts" aria-label="Library keyboard shortcuts">
+        <div><span className="eyebrow">{mode === "trash" ? "Reversible holding area" : "Master library"}</span><h1>{mode === "trash" ? "Trash" : "Photographs"}</h1><p>{total} visible · {assets.length < total ? `${assets.length} loaded · ` : ""}{mode === "trash" ? "catalogue records retained" : "originals protected"}</p></div>
+        {mode === "trash" ? <div className="trash-actions"><button className="quiet-button" disabled={!total} onClick={onRestoreAll}>Restore all</button><button className="danger-button" disabled={!total} onClick={onEmptyTrash}>Empty Trash</button></div> : <div className="library-shortcuts" aria-label="Library keyboard shortcuts">
           <span><kbd>←↑↓→</kbd> Browse</span>
           <span><kbd>M</kbd> Keep</span>
           <span><kbd>X</kbd> Mark for removal</span>
-        </div>
+        </div>}
       </div>
       {assets.length === 0 && !loading ? (
-        <div className="empty-state"><ImageOff size={40} /><h2>No photographs match</h2><p>Clear a filter or import a folder to begin.</p></div>
+        <div className="empty-state"><ImageOff size={40} /><h2>{mode === "trash" ? "Trash is empty" : "No photographs match"}</h2><p>{mode === "trash" ? "Discarded photographs moved here can be restored before Empty Trash is used." : "Clear a filter or import a folder to begin."}</p></div>
       ) : (
         <div ref={scrollRef} className="library-scroll" onScroll={onScroll}>
           <div className="virtual-library" style={{ height }}>

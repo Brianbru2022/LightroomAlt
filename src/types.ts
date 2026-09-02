@@ -1,4 +1,4 @@
-export type ViewName = "library" | "triage" | "map" | "workshop";
+export type ViewName = "library" | "triage" | "map" | "workshop" | "trash" | "settings";
 export type Decision = "undecided" | "keep" | "discard";
 export type EditIntent =
   | "restoration"
@@ -53,6 +53,7 @@ export type Asset = {
 export type LibraryStatus = {
   configured: boolean;
   libraryRoot?: string;
+  libraryIssue?: string;
   counts: Record<Decision, number> & { total: number };
 };
 
@@ -83,6 +84,7 @@ export type AssetFilter = {
   search: string;
   year?: number;
   tag?: string;
+  trashed?: boolean;
 };
 
 export type AssetPage = {
@@ -133,14 +135,23 @@ export type BatchJob = {
 
 export type ImportSummary = {
   importId: string;
+  state: "running" | "cancelled" | "completed" | "needs_attention";
   discovered: number;
   imported: number;
+  copied: number;
+  moved: number;
+  sourceRetained: number;
   duplicates: number;
   unsupported: number;
   failed: number;
 };
 
-export type DeleteSummary = {
-  deleted: number;
+export type ImportOptions = {
+  mode: "copy" | "move";
+  duplicateSourcePolicy: "retain" | "remove_after_verified_match";
+};
+
+export type TrashSummary = {
+  affected: number;
   failed: number;
 };

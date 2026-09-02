@@ -1,7 +1,7 @@
 {
   "name": "keepframe",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -9,7 +9,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri",
-    "check": "pnpm test && pnpm build && cargo test --manifest-path src-tauri/Cargo.toml"
+    "check": "pnpm test && pnpm build && cargo test --manifest-path src-tauri/Cargo.toml",
+    "check:all": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-all.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

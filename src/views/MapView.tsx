@@ -101,7 +101,7 @@ export function MapView({ assets, total, hasMore, loading, onLoadMore, selected,
         {selected && selected.latitude === undefined ? <div className="placement-hint"><MapPin size={16} /><span>Click the map to place {selected.filename}</span></div> : null}
       </div>
       <aside className="map-panel">
-        <span className="eyebrow">Photo atlas</span><h1>{located.length} loaded places</h1><p>{assets.length} of {total} filtered photographs loaded. Browse photographs already carrying GPS coordinates.</p>
+        <span className="eyebrow">Photo atlas</span><h1>{located.length} located photographs</h1><p>{assets.length} of {total} filtered photographs loaded. Browse photographs already carrying GPS coordinates.</p>
         {selected ? <div className="map-selection"><img src={selected.thumbnailUrl} alt="" /><div><strong>{selected.filename}</strong><span>{selected.latitude === undefined ? "Location not set" : `${selected.latitude.toFixed(4)}, ${selected.longitude?.toFixed(4)}`}</span></div></div> : null}
         {selected?.latitude === undefined ? <button className="primary-button full" onClick={placeSelected}><MapPin size={16} /> Place at current map centre</button> : null}
         <div className="map-list-title"><span>Without a location</span><strong>{unlocated.length}</strong></div>

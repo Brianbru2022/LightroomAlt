@@ -1,4 +1,5 @@
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
+use fs2::FileExt;
 use image::ImageFormat;
 use reqwest::multipart;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
@@ -9,7 +10,7 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs,
-    io::Read,
+    io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -20,7 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SUPPORTED: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "heic", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf",
     "rw2",
@@ -58,6 +59,8 @@ struct AnalysisWorker {
 }
 struct AppState {
     root: Mutex<Option<PathBuf>>,
+    library_lock: Mutex<Option<fs::File>>,
+    library_issue: Mutex<Option<String>>,
     local_ai_url: Mutex<String>,
     analysis_worker: Mutex<AnalysisWorker>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
@@ -103,6 +106,7 @@ struct Counts {
 struct LibraryStatus {
     configured: bool,
     library_root: Option<String>,
+    library_issue: Option<String>,
     counts: Counts,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -136,6 +140,7 @@ struct AssetFilter {
     search: String,
     year: Option<i32>,
     tag: Option<String>,
+    trashed: Option<bool>,
 }
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -170,16 +175,46 @@ struct AssetPage {
 #[serde(rename_all = "camelCase")]
 struct ImportSummary {
     import_id: String,
+    state: String,
     discovered: usize,
     imported: usize,
+    copied: usize,
+    moved: usize,
+    source_retained: usize,
     duplicates: usize,
     unsupported: usize,
     failed: usize,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ImportOptions {
+    mode: String,
+    duplicate_source_policy: String,
+}
+
+impl ImportOptions {
+    fn validate(&self) -> Result<()> {
+        if !matches!(self.mode.as_str(), "copy" | "move") {
+            return Err(KeepframeError::Message(
+                "Import mode must be copy or move.".into(),
+            ));
+        }
+        if !matches!(
+            self.duplicate_source_policy.as_str(),
+            "retain" | "remove_after_verified_match"
+        ) {
+            return Err(KeepframeError::Message(
+                "Duplicate source policy is invalid.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DeleteSummary {
-    deleted: usize,
+struct TrashSummary {
+    affected: usize,
     failed: usize,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -258,11 +293,12 @@ struct JobExecution {
 }
 
 fn settings_path() -> Result<PathBuf> {
-    let dir = dirs::home_dir()
+    let dir = std::env::var_os("KEEPFRAME_SETTINGS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|path| path.join(".keepframe")))
         .ok_or_else(|| {
             KeepframeError::Message("Windows user-profile folder is unavailable".into())
-        })?
-        .join(".keepframe");
+        })?;
     fs::create_dir_all(&dir)?;
     Ok(dir.join("settings.json"))
 }
@@ -272,6 +308,36 @@ fn save_settings(root: &Path, local_ai_url: &str) -> Result<()> {
         serde_json::to_vec_pretty(&json!({"libraryRoot": root, "localAiUrl": local_ai_url}))?,
     )?;
     Ok(())
+}
+fn validated_loopback_url(value: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| KeepframeError::Message("The local AI service URL is invalid.".into()))?;
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() != "http" || !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        return Err(KeepframeError::Message(
+            "Local AI services must use an HTTP loopback address (127.0.0.1, localhost or ::1)."
+                .into(),
+        ));
+    }
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(KeepframeError::Message(
+            "The local AI service URL contains unsupported components.".into(),
+        ));
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+fn validated_provider(value: &str) -> Result<&str> {
+    match value {
+        "chatgpt" | "gemini" => Ok(value),
+        _ => Err(KeepframeError::Message(
+            "The external edit provider is invalid.".into(),
+        )),
+    }
 }
 fn load_settings() -> Option<(PathBuf, String)> {
     let primary = settings_path().ok()?;
@@ -290,6 +356,8 @@ fn load_settings() -> Option<(PathBuf, String)> {
             .and_then(Value::as_str)
             .unwrap_or("http://127.0.0.1:7868")
             .to_string();
+        let local_ai_url = validated_loopback_url(&local_ai_url)
+            .unwrap_or_else(|_| "http://127.0.0.1:7868".into());
         if path != primary {
             let _ = save_settings(&root, &local_ai_url);
         }
@@ -315,6 +383,83 @@ fn open_db(root: &Path) -> Result<Connection> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
+fn allow_media_scope(app: &AppHandle, root: &Path) -> Result<()> {
+    let scope = app.asset_protocol_scope();
+    for directory in [
+        root.join(".keepframe/thumbnails"),
+        root.join(".keepframe/previews"),
+        root.join(".keepframe/review"),
+        root.join("Edits"),
+    ] {
+        scope.allow_directory(directory, true).map_err(|error| {
+            KeepframeError::Message(format!("Could not constrain the media scope: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryMarker {
+    library_id: String,
+    format_version: i64,
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+fn database_integrity(connection: &Connection) -> Result<String> {
+    connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(KeepframeError::from)
+}
+
+fn backup_database(root: &Path, label: &str) -> Result<PathBuf> {
+    let path = db_path(root);
+    if !path.is_file() {
+        return Err(KeepframeError::Message(
+            "The catalogue database does not exist.".into(),
+        ));
+    }
+    let connection = open_db(root)?;
+    connection.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+    let backup = root.join(".keepframe/backups").join(format!(
+        "catalogue-{}-{}-{}.sqlite",
+        label,
+        Local::now().format("%Y%m%d-%H%M%S"),
+        &Uuid::new_v4().to_string()[..8]
+    ));
+    connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+    let verification = Connection::open(&backup)?;
+    if database_integrity(&verification)? != "ok" {
+        let _ = fs::remove_file(&backup);
+        return Err(KeepframeError::Message(
+            "The catalogue backup failed its integrity check.".into(),
+        ));
+    }
+    Ok(backup)
+}
+
+fn acquire_library_lock(root: &Path) -> Result<fs::File> {
+    let control = root.join(".keepframe");
+    fs::create_dir_all(&control)?;
+    let path = control.join("catalogue.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.try_lock_exclusive().map_err(|_| {
+        KeepframeError::Message("This library is already open in another Keepframe window.".into())
+    })?;
+    Ok(file)
+}
 
 fn initialise_layout(root: &Path) -> Result<()> {
     for relative in [
@@ -322,28 +467,32 @@ fn initialise_layout(root: &Path) -> Result<()> {
         "Edits",
         "Exports",
         ".keepframe/thumbnails",
+        ".keepframe/previews",
+        ".keepframe/review",
         ".keepframe/staging",
+        ".keepframe/Trash",
         ".keepframe/backups",
         ".keepframe/logs",
     ] {
         fs::create_dir_all(root.join(relative))?;
     }
     let path = db_path(root);
-    if path.exists() {
-        let version = Connection::open(&path)?
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap_or(0);
-        if version < SCHEMA_VERSION {
-            let backup = root.join(".keepframe/backups").join(format!(
-                "catalogue-{}.sqlite",
-                Local::now().format("%Y%m%d-%H%M%S")
-            ));
-            fs::copy(&path, backup)?;
-        }
+    let existed = path.is_file();
+    let mut connection = open_db(root)?;
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0);
+    if version > SCHEMA_VERSION {
+        return Err(KeepframeError::Message(format!(
+            "This library uses catalogue format {version}, but this build supports only {SCHEMA_VERSION}."
+        )));
     }
-    let connection = open_db(root)?;
+    if existed && version < SCHEMA_VERSION {
+        backup_database(root, &format!("before-v{SCHEMA_VERSION}"))?;
+    }
     connection.execute_batch(r#"
-      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
       CREATE TABLE IF NOT EXISTS representations(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, path TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, extension TEXT NOT NULL, stem TEXT NOT NULL, byte_size INTEGER NOT NULL, is_raw INTEGER NOT NULL DEFAULT 0, UNIQUE(asset_id,path));
       CREATE INDEX IF NOT EXISTS idx_representations_hash ON representations(sha256);
       CREATE INDEX IF NOT EXISTS idx_representations_asset ON representations(asset_id,is_raw,path);
@@ -352,8 +501,8 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE INDEX IF NOT EXISTS idx_asset_tags_tag_asset ON asset_tags(tag_id,asset_id);
       CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at DESC);
       CREATE INDEX IF NOT EXISTS idx_assets_decision_captured_at ON assets(decision,captured_at DESC);
-      CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, discovered INTEGER NOT NULL DEFAULT 0, imported INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, unsupported INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), source_path TEXT NOT NULL, representation_id TEXT, state TEXT NOT NULL, error TEXT);
+      CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, discovered INTEGER NOT NULL DEFAULT 0, imported INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, unsupported INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'running', mode TEXT NOT NULL DEFAULT 'copy', duplicate_policy TEXT NOT NULL DEFAULT 'retain', cancel_requested INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), source_path TEXT NOT NULL, representation_id TEXT, state TEXT NOT NULL, error TEXT, staging_path TEXT, managed_path TEXT, source_hash TEXT, source_size INTEGER, source_modified TEXT, source_action TEXT);
       CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, kind TEXT NOT NULL, path TEXT NOT NULL, provider TEXT, prompt TEXT, recipe_json TEXT, source_hash TEXT, output_hash TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS edit_recipes(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, schema_version INTEGER NOT NULL, recipe_json TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, common_brief TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0);
@@ -361,8 +510,68 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE TABLE IF NOT EXISTS job_attempts(id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, attempt_number INTEGER NOT NULL, state TEXT NOT NULL, source_hash TEXT NOT NULL, recipe_json TEXT NOT NULL, prompt TEXT NOT NULL, negative_prompt TEXT NOT NULL, model TEXT NOT NULL, seed INTEGER NOT NULL, settings_json TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, output_path TEXT, output_hash TEXT, error TEXT, UNIQUE(job_id,attempt_number));
       CREATE INDEX IF NOT EXISTS idx_job_attempts_job ON job_attempts(job_id,attempt_number DESC);
       CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, old_json TEXT, new_json TEXT, created_at TEXT NOT NULL, undone INTEGER NOT NULL DEFAULT 0);
-      PRAGMA user_version=3;
+      CREATE TABLE IF NOT EXISTS trash_operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,created_at TEXT NOT NULL,completed_at TEXT,error TEXT);
+      CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY,operation_id TEXT NOT NULL REFERENCES trash_operations(id),asset_id TEXT NOT NULL REFERENCES assets(id),original_path TEXT NOT NULL,trash_path TEXT NOT NULL,state TEXT NOT NULL,error TEXT,UNIQUE(operation_id,original_path));
+      CREATE INDEX IF NOT EXISTS idx_trash_items_asset ON trash_items(asset_id,state);
     "#)?;
+    if existed && version < 4 {
+        let additions = [
+            ("assets", "trashed_at", "ALTER TABLE assets ADD COLUMN trashed_at TEXT"),
+            ("imports", "state", "ALTER TABLE imports ADD COLUMN state TEXT NOT NULL DEFAULT 'completed'"),
+            ("imports", "mode", "ALTER TABLE imports ADD COLUMN mode TEXT NOT NULL DEFAULT 'move'"),
+            ("imports", "duplicate_policy", "ALTER TABLE imports ADD COLUMN duplicate_policy TEXT NOT NULL DEFAULT 'remove_after_verified_match'"),
+            ("imports", "cancel_requested", "ALTER TABLE imports ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"),
+            ("import_items", "staging_path", "ALTER TABLE import_items ADD COLUMN staging_path TEXT"),
+            ("import_items", "managed_path", "ALTER TABLE import_items ADD COLUMN managed_path TEXT"),
+            ("import_items", "source_hash", "ALTER TABLE import_items ADD COLUMN source_hash TEXT"),
+            ("import_items", "source_size", "ALTER TABLE import_items ADD COLUMN source_size INTEGER"),
+            ("import_items", "source_modified", "ALTER TABLE import_items ADD COLUMN source_modified TEXT"),
+            ("import_items", "source_action", "ALTER TABLE import_items ADD COLUMN source_action TEXT"),
+        ];
+        let missing = additions
+            .iter()
+            .map(|(table, column, sql)| Ok((*sql, !column_exists(&connection, table, column)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let tx = connection.transaction()?;
+        for (sql, should_add) in missing {
+            if should_add {
+                tx.execute(sql, [])?;
+            }
+        }
+        tx.execute(
+            "UPDATE imports SET state=CASE WHEN completed_at IS NULL THEN 'needs_attention' ELSE 'completed' END",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(4,?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+    } else if !existed {
+        connection.execute(
+            "INSERT INTO schema_migrations(version,applied_at)VALUES(?1,?2)",
+            params![SCHEMA_VERSION, Utc::now().to_rfc3339()],
+        )?;
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    if database_integrity(&connection)? != "ok" {
+        return Err(KeepframeError::Message(
+            "The catalogue failed its integrity check and was not opened.".into(),
+        ));
+    }
+    let marker_path = root.join(".keepframe/library.json");
+    if !marker_path.is_file() {
+        let marker = LibraryMarker {
+            library_id: Uuid::new_v4().to_string(),
+            format_version: 1,
+        };
+        let temporary = marker_path.with_extension("json.tmp");
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(&marker)?)?;
+        file.sync_all()?;
+        fs::rename(temporary, marker_path)?;
+    }
     let recovered_at = Utc::now().to_rfc3339();
     connection.execute(
         "UPDATE job_attempts SET state='failed',finished_at=?1,error='Keepframe closed while this attempt was running' WHERE state='running'",
@@ -427,6 +636,17 @@ fn parse_local_ai_health(value: &Value) -> ServiceHealth {
     }
 }
 async fn local_ai_health(url: &str) -> ServiceHealth {
+    let Ok(url) = validated_loopback_url(url) else {
+        return ServiceHealth {
+            local_ai_available: false,
+            service_reachable: false,
+            local_ai_busy: false,
+            local_ai_model: None,
+            local_ai_detail:
+                "The configured AI service was blocked because it is not loopback-only.".into(),
+            analysis_model_installed: analysis_installed(),
+        };
+    };
     let response = reqwest::Client::new()
         .get(format!("{url}/api/status"))
         .timeout(std::time::Duration::from_secs(2))
@@ -500,19 +720,23 @@ fn start_analysis_worker(state: &AppState) {
 }
 fn counts(connection: &Connection) -> Result<Counts> {
     Ok(Counts {
-        total: connection.query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?,
+        total: connection.query_row(
+            "SELECT count(*) FROM assets WHERE trashed_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?,
         keep: connection.query_row(
-            "SELECT count(*) FROM assets WHERE decision='keep'",
+            "SELECT count(*) FROM assets WHERE decision='keep' AND trashed_at IS NULL",
             [],
             |r| r.get(0),
         )?,
         undecided: connection.query_row(
-            "SELECT count(*) FROM assets WHERE decision='undecided'",
+            "SELECT count(*) FROM assets WHERE decision='undecided' AND trashed_at IS NULL",
             [],
             |r| r.get(0),
         )?,
         discard: connection.query_row(
-            "SELECT count(*) FROM assets WHERE decision='discard'",
+            "SELECT count(*) FROM assets WHERE decision='discard' AND trashed_at IS NULL",
             [],
             |r| r.get(0),
         )?,
@@ -521,6 +745,11 @@ fn counts(connection: &Connection) -> Result<Counts> {
 
 #[tauri::command]
 fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
+    let issue = state
+        .library_issue
+        .lock()
+        .map_err(|_| KeepframeError::Message("Library issue lock failed".into()))?
+        .clone();
     let root = state
         .root
         .lock()
@@ -532,12 +761,14 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
             Ok(LibraryStatus {
                 configured: true,
                 library_root: Some(root.to_string_lossy().into()),
+                library_issue: issue,
                 counts: c,
             })
         }
         _ => Ok(LibraryStatus {
             configured: false,
             library_root: None,
+            library_issue: issue,
             counts: Counts {
                 total: 0,
                 keep: 0,
@@ -557,17 +788,141 @@ async fn get_service_health(state: State<'_, AppState>) -> Result<ServiceHealth>
     Ok(local_ai_health(&url).await)
 }
 #[tauri::command]
-async fn initialise_library(path: String, state: State<'_, AppState>) -> Result<LibraryStatus> {
+async fn initialise_library(
+    path: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<LibraryStatus> {
     let root = PathBuf::from(path);
-    initialise_layout(&root)?;
+    let library_lock = acquire_library_lock(&root)?;
+    if let Err(error) = initialise_layout(&root) {
+        *state.library_issue.lock().unwrap() = Some(error.to_string());
+        return Err(error);
+    }
     *state
         .root
         .lock()
         .map_err(|_| KeepframeError::Message("Library state lock failed".into()))? =
         Some(root.clone());
+    *state.library_lock.lock().unwrap() = Some(library_lock);
+    *state.library_issue.lock().unwrap() = None;
+    allow_media_scope(&app, &root)?;
     let url = state.local_ai_url.lock().unwrap().clone();
     save_settings(&root, &url)?;
     get_library_status(state)
+}
+
+#[tauri::command]
+fn check_catalogue_integrity(state: State<'_, AppState>) -> Result<String> {
+    database_integrity(&open_db(&root_from(&state)?)?)
+}
+
+#[tauri::command]
+fn create_catalogue_backup(state: State<'_, AppState>) -> Result<String> {
+    Ok(backup_database(&root_from(&state)?, "manual")?
+        .to_string_lossy()
+        .into())
+}
+
+#[tauri::command]
+fn restore_catalogue_backup(path: String, state: State<'_, AppState>) -> Result<()> {
+    let root = root_from(&state)?;
+    let source = PathBuf::from(path);
+    if !source.is_file() || database_integrity(&Connection::open(&source)?)? != "ok" {
+        return Err(KeepframeError::Message(
+            "The selected backup is not a valid SQLite catalogue.".into(),
+        ));
+    }
+    let _safety_backup = backup_database(&root, "before-restore")?;
+    let database = db_path(&root);
+    let temporary = database.with_extension("restore.sqlite");
+    fs::copy(&source, &temporary)?;
+    if database_integrity(&Connection::open(&temporary)?)? != "ok" {
+        let _ = fs::remove_file(&temporary);
+        return Err(KeepframeError::Message(
+            "The copied restore candidate failed verification.".into(),
+        ));
+    }
+    {
+        let connection = open_db(&root)?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    }
+    let displaced = database.with_extension(format!(
+        "pre-restore-{}.sqlite",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    fs::rename(&database, &displaced)?;
+    if let Err(error) = fs::rename(&temporary, &database) {
+        let _ = fs::rename(&displaced, &database);
+        return Err(KeepframeError::Io(error));
+    }
+    match database_integrity(&open_db(&root)?) {
+        Ok(result) if result == "ok" => Ok(()),
+        _ => {
+            let failed = database.with_extension("failed-restore.sqlite");
+            let _ = fs::rename(&database, failed);
+            fs::rename(displaced, database)?;
+            Err(KeepframeError::Message("The restored catalogue failed verification and the prior catalogue was reinstated.".into()))
+        }
+    }
+}
+
+#[tauri::command]
+async fn rebuild_thumbnails(state: State<'_, AppState>, app: AppHandle) -> Result<usize> {
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<usize> {
+        let connection = open_db(&root)?;
+        let mut statement = connection.prepare(
+            "SELECT a.id,a.thumbnail_path,r.path FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.trashed_at IS NULL AND r.id=(SELECT r2.id FROM representations r2 WHERE r2.asset_id=a.id ORDER BY CASE WHEN r2.is_raw=0 THEN 0 ELSE 1 END,r2.path LIMIT 1) ORDER BY a.id",
+        )?;
+        let assets = statement.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let total = assets.len();
+        let mut rebuilt = 0usize;
+        for (index, (asset_id, thumbnail, source)) in assets.into_iter().enumerate() {
+            let thumbnail = PathBuf::from(thumbnail);
+            let temporary = thumbnail.with_extension("jpg.rebuild");
+            match thumbnail_from(Path::new(&source), &temporary) {
+                Ok(()) => {
+                    if thumbnail.exists() { fs::remove_file(&thumbnail)?; }
+                    fs::rename(&temporary, &thumbnail)?;
+                    rebuilt += 1;
+                    let _ = app.emit("cache-progress", json!({"current":index+1,"total":total,"assetId":asset_id}));
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary);
+                    let _ = app.emit("cache-progress", json!({"current":index+1,"total":total,"assetId":asset_id,"error":error.to_string()}));
+                }
+            }
+        }
+        Ok(rebuilt)
+    }).await.map_err(|error| KeepframeError::Message(format!("Thumbnail rebuild failed: {error}")))?
+}
+
+#[tauri::command]
+fn export_diagnostics(destination: String, state: State<'_, AppState>) -> Result<String> {
+    let root = root_from(&state)?;
+    let destination = PathBuf::from(destination);
+    if !destination.is_dir() {
+        return Err(KeepframeError::Message(
+            "Choose an existing diagnostics destination.".into(),
+        ));
+    }
+    let connection = open_db(&root)?;
+    let output = destination.join(format!(
+        "keepframe-diagnostics-{}.json",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let payload = json!({
+        "applicationVersion": env!("CARGO_PKG_VERSION"),
+        "createdAt": Utc::now().to_rfc3339(),
+        "libraryRoot": root,
+        "schemaVersion": connection.pragma_query_value(None, "user_version", |row| row.get::<_,i64>(0))?,
+        "integrity": database_integrity(&connection)?,
+        "counts": counts(&connection)?,
+        "privacy": "No image pixels, prompts, recipes or model inputs are included."
+    });
+    fs::write(&output, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(output.to_string_lossy().into())
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -913,19 +1268,63 @@ fn encode_srgb_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
 }
 
 #[tauri::command]
+async fn prepare_review_preview(asset_id: String, state: State<'_, AppState>) -> Result<String> {
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<String> {
+        let connection = open_db(&root)?;
+        let (source, source_hash, width, height): (String, String, Option<u32>, Option<u32>) = connection.query_row(
+            "SELECT r.path,r.sha256,a.width,a.height FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 AND a.trashed_at IS NULL ORDER BY CASE WHEN lower(r.extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN r.is_raw=1 THEN 1 ELSE 2 END,r.path LIMIT 1",
+            [&asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let output = root.join(".keepframe/review").join(format!("{}-{}.png", asset_id, &source_hash[..12]));
+        if !output.exists() {
+            let image = prepare_full_resolution_image(Path::new(&source), width.zip(height), &root.join(".keepframe/staging/working"))?;
+            let temporary = output.with_extension("png.tmp");
+            fs::write(&temporary, encode_srgb_png(&image)?)?;
+            fs::rename(&temporary, &output)?;
+        }
+        Ok(output.to_string_lossy().into())
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Full-resolution review failed: {error}")))?
+}
+
+#[tauri::command]
 async fn import_photos(
     paths: Vec<String>,
+    options: ImportOptions,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportSummary> {
+    options.validate()?;
     let root = root_from(&state)?;
+    let canonical_root = root.canonicalize()?;
     let import_id = Uuid::new_v4().to_string();
     let mut files = Vec::new();
     let mut unsupported = 0usize;
     for raw in &paths {
         let path = PathBuf::from(raw);
+        if !path.exists() {
+            unsupported += 1;
+            continue;
+        }
+        if path.canonicalize()?.starts_with(&canonical_root) {
+            return Err(KeepframeError::Message(
+                "The master library cannot be imported into itself.".into(),
+            ));
+        }
         if path.is_file() {
-            files.push(path)
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if SUPPORTED.contains(&extension.as_str()) {
+                files.push(path)
+            } else {
+                unsupported += 1;
+            }
         } else {
             for entry in WalkDir::new(path)
                 .follow_links(false)
@@ -947,43 +1346,90 @@ async fn import_photos(
             }
         }
     }
+    let required_bytes = files.iter().try_fold(0u64, |total, path| {
+        let bytes = fs::metadata(path)?.len();
+        total.checked_add(bytes).ok_or_else(|| {
+            KeepframeError::Message("Import size overflowed the safety check.".into())
+        })
+    })?;
+    let available_bytes = fs2::available_space(&root)?;
+    let safety_margin = required_bytes / 20 + 256 * 1024 * 1024;
+    if available_bytes < required_bytes.saturating_add(safety_margin) {
+        return Err(KeepframeError::Message(format!(
+            "Not enough free space for a verified import. Required at least {} bytes including the safety margin; {} bytes are available.",
+            required_bytes.saturating_add(safety_margin), available_bytes
+        )));
+    }
+    let items = files
+        .into_iter()
+        .map(|path| (Uuid::new_v4().to_string(), path))
+        .collect::<Vec<_>>();
     {
-        let connection = open_db(&root)?;
-        connection.execute("INSERT INTO imports(id,source,started_at,discovered,unsupported) VALUES(?1,?2,?3,?4,?5)",params![import_id,paths.join(";"),Utc::now().to_rfc3339(),files.len() as i64,unsupported as i64])?;
+        let mut connection = open_db(&root)?;
+        let tx = connection.transaction()?;
+        tx.execute("INSERT INTO imports(id,source,started_at,discovered,unsupported,state,mode,duplicate_policy) VALUES(?1,?2,?3,?4,?5,'running',?6,?7)",params![import_id,paths.join(";"),Utc::now().to_rfc3339(),items.len() as i64,unsupported as i64,options.mode,options.duplicate_source_policy])?;
+        for (item_id, source) in &items {
+            let source_metadata = fs::metadata(source)?;
+            tx.execute(
+                "INSERT INTO import_items(id,import_id,source_path,state,source_size,source_modified,source_action)VALUES(?1,?2,?3,'discovered',?4,?5,'pending')",
+                params![item_id, import_id, source.to_string_lossy(), source_metadata.len() as i64, source_metadata.modified().ok().map(DateTime::<Utc>::from).map(|value|value.to_rfc3339())],
+            )?;
+        }
+        tx.commit()?;
     }
     let mut imported = 0;
+    let mut copied = 0;
+    let mut moved = 0;
+    let mut source_retained = 0;
     let mut duplicates = 0;
     let mut failed = 0;
-    for (index, source) in files.iter().enumerate() {
+    let mut final_state = "completed".to_string();
+    for (index, (item_id, source)) in items.iter().enumerate() {
+        let cancelled: bool = open_db(&root)?.query_row(
+            "SELECT cancel_requested!=0 FROM imports WHERE id=?1",
+            [&import_id],
+            |row| row.get(0),
+        )?;
+        if cancelled {
+            final_state = "cancelled".into();
+            break;
+        }
         let _ = app.emit(
             "import-progress",
-            json!({"importId":import_id,"current":index+1,"total":files.len(),"file":source}),
+            json!({"importId":import_id,"current":index+1,"total":items.len(),"file":source}),
         );
-        let result = (|| -> Result<(bool, String)> {
+        let result = (|| -> Result<(bool, String, String)> {
             let source_hash = hash_file(source)?;
             let mut connection = open_db(&root)?;
             if has_verified_representation(&connection, &source_hash)? {
-                let item_id = Uuid::new_v4().to_string();
                 let tx = connection.transaction()?;
-                tx.execute("INSERT INTO import_items(id,import_id,source_path,state) VALUES(?1,?2,?3,'duplicate')",params![item_id,import_id,source.to_string_lossy()])?;
+                tx.execute("UPDATE import_items SET state='duplicate',source_hash=?2,source_action='retained' WHERE id=?1",params![item_id,source_hash])?;
                 tx.commit()?;
-                return Ok((true, item_id));
+                return Ok((true, item_id.clone(), source_hash));
             }
             let meta = metadata(source);
             let captured = meta.captured.unwrap_or_else(Utc::now);
             let stage_dir = root.join(".keepframe/staging").join(&import_id);
             fs::create_dir_all(&stage_dir)?;
-            let staged = stage_dir.join(
-                source
-                    .file_name()
-                    .ok_or_else(|| KeepframeError::Message("Source has no filename".into()))?,
-            );
+            let source_name = source
+                .file_name()
+                .ok_or_else(|| KeepframeError::Message("Source has no filename".into()))?;
+            let staged = stage_dir.join(format!("{}-{}", item_id, source_name.to_string_lossy()));
+            connection.execute("UPDATE import_items SET state='staging',staging_path=?2,source_hash=?3,error=NULL WHERE id=?1",params![item_id,staged.to_string_lossy(),source_hash])?;
             fs::copy(source, &staged)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&staged)?
+                .sync_all()?;
             if hash_file(&staged)? != source_hash {
                 return Err(KeepframeError::Message(
                     "Staged copy did not match the source hash".into(),
                 ));
             }
+            connection.execute(
+                "UPDATE import_items SET state='verified' WHERE id=?1",
+                [&item_id],
+            )?;
             let target_dir = root
                 .join("Originals")
                 .join(format!("{:04}", captured.year()))
@@ -1011,13 +1457,29 @@ async fn import_photos(
                 }
             }
             fs::rename(&staged, &target)?;
+            if hash_file(&target)? != source_hash {
+                let _ = fs::remove_file(&target);
+                return Err(KeepframeError::Message(
+                    "Managed copy did not match the verified staged hash".into(),
+                ));
+            }
+            connection.execute(
+                "UPDATE import_items SET state='placed',managed_path=?2 WHERE id=?1",
+                params![item_id, target.to_string_lossy()],
+            )?;
             let stem = source
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_ascii_lowercase();
+            let extension = source
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let is_raw = RAW.contains(&extension.as_str());
             let captured_string = captured.to_rfc3339();
-            let paired:Option<String>=connection.query_row("SELECT a.id FROM assets a JOIN representations r ON r.asset_id=a.id WHERE lower(r.stem)=?1 AND a.captured_at=?2 LIMIT 1",params![stem,captured_string],|r|r.get(0)).optional()?;
+            let paired:Option<String>=connection.query_row("SELECT a.id FROM assets a JOIN representations r ON r.asset_id=a.id WHERE lower(r.stem)=?1 AND a.captured_at=?2 AND r.is_raw!=?3 LIMIT 1",params![stem,captured_string,is_raw],|r|r.get(0)).optional()?;
             let asset_id = paired.unwrap_or_else(|| Uuid::new_v4().to_string());
             let thumb = root
                 .join(".keepframe/thumbnails")
@@ -1037,13 +1499,7 @@ async fn import_photos(
                 .optional()?
                 .is_some();
             let representation_id = Uuid::new_v4().to_string();
-            let extension = source
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
             let byte_size = fs::metadata(&target)?.len() as i64;
-            let item_id = Uuid::new_v4().to_string();
             let persist_result = (|| -> Result<()> {
                 let tx = connection.transaction()?;
                 if !asset_exists {
@@ -1066,7 +1522,10 @@ async fn import_photos(
                         params![asset_id, tag_id],
                     )?;
                 }
-                tx.execute("INSERT INTO import_items(id,import_id,source_path,representation_id,state)VALUES(?1,?2,?3,?4,'imported')",params![item_id,import_id,source.to_string_lossy(),representation_id])?;
+                tx.execute(
+                    "UPDATE import_items SET representation_id=?2,state='catalogued' WHERE id=?1",
+                    params![item_id, representation_id],
+                )?;
                 tx.commit()?;
                 Ok(())
             })();
@@ -1077,20 +1536,55 @@ async fn import_photos(
                 }
                 return Err(error);
             }
-            Ok((false, item_id))
+            Ok((false, item_id.clone(), source_hash))
         })();
         match result {
-            Ok((is_duplicate, item_id)) => {
-                match remove_import_source(source, &root) {
+            Ok((is_duplicate, item_id, source_hash)) => {
+                let remove_source = options.mode == "move"
+                    && (!is_duplicate
+                        || options.duplicate_source_policy == "remove_after_verified_match");
+                let source_action = if remove_source {
+                    match hash_file(source) {
+                        Ok(current_hash) if current_hash == source_hash => {
+                            remove_import_source(source, &root)
+                        }
+                        Ok(_) => Err(KeepframeError::Message(
+                            "Source changed after verification and was retained.".into(),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Ok(())
+                };
+                match source_action {
                     Ok(()) => {
                         if is_duplicate {
                             duplicates += 1;
                         } else {
                             imported += 1;
+                            if remove_source {
+                                moved += 1;
+                            } else {
+                                copied += 1;
+                            }
                         }
+                        if !remove_source {
+                            source_retained += 1;
+                        }
+                        let connection = open_db(&root)?;
+                        connection.execute(
+                            "UPDATE import_items SET state=?2,source_action=?3,error=NULL WHERE id=?1",
+                            params![item_id,if is_duplicate { "duplicate" } else { "completed" },if remove_source { "removed" } else { "retained" }],
+                        )?;
                     }
                     Err(error) => {
-                        failed += 1;
+                        if is_duplicate {
+                            duplicates += 1;
+                        } else {
+                            imported += 1;
+                            copied += 1;
+                        }
+                        source_retained += 1;
                         let connection = open_db(&root)?;
                         connection.execute(
                         "UPDATE import_items SET state='source_retained',error=?2 WHERE id=?1",
@@ -1102,35 +1596,111 @@ async fn import_photos(
             Err(error) => {
                 failed += 1;
                 let connection = open_db(&root)?;
-                connection.execute("INSERT INTO import_items(id,import_id,source_path,state,error)VALUES(?1,?2,?3,'failed',?4)",params![Uuid::new_v4().to_string(),import_id,source.to_string_lossy(),error.to_string()])?;
+                connection.execute(
+                    "UPDATE import_items SET state='failed',error=?2 WHERE id=?1",
+                    params![item_id, error.to_string()],
+                )?;
             }
         }
     }
     let connection = open_db(&root)?;
     connection.execute(
-        "UPDATE imports SET completed_at=?2,imported=?3,duplicates=?4,failed=?5 WHERE id=?1",
+        "UPDATE imports SET completed_at=?2,imported=?3,duplicates=?4,failed=?5,state=?6 WHERE id=?1",
         params![
             import_id,
             Utc::now().to_rfc3339(),
             imported as i64,
             duplicates as i64,
-            failed as i64
+            failed as i64,
+            final_state
         ],
     )?;
-    let _ = fs::remove_dir_all(root.join(".keepframe/staging").join(&import_id));
+    if final_state == "completed" && failed == 0 {
+        let _ = fs::remove_dir_all(root.join(".keepframe/staging").join(&import_id));
+    }
     Ok(ImportSummary {
         import_id,
-        discovered: files.len(),
+        state: final_state,
+        discovered: items.len(),
         imported,
+        copied,
+        moved,
+        source_retained,
         duplicates,
         unsupported,
         failed,
     })
 }
 
+#[tauri::command]
+fn cancel_import(import_id: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    if connection.execute(
+        "UPDATE imports SET cancel_requested=1 WHERE id=?1 AND state='running'",
+        [&import_id],
+    )? != 1
+    {
+        return Err(KeepframeError::Message(
+            "The import is no longer running.".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_import(
+    import_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ImportSummary> {
+    let root = root_from(&state)?;
+    let (mode, duplicate_source_policy, paths) = {
+        let connection = open_db(&root)?;
+        let (mode, duplicate_source_policy): (String, String) = connection.query_row(
+            "SELECT mode,duplicate_policy FROM imports WHERE id=?1 AND state IN ('cancelled','needs_attention','running')",
+            [&import_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let paths = {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT source_path FROM import_items WHERE import_id=?1 AND state NOT IN ('completed','duplicate') ORDER BY source_path",
+            )?;
+            let selected = statement
+                .query_map([&import_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            selected
+        };
+        connection.execute(
+            "UPDATE imports SET state='cancelled',completed_at=?2 WHERE id=?1",
+            params![import_id, Utc::now().to_rfc3339()],
+        )?;
+        (mode, duplicate_source_policy, paths)
+    };
+    if paths.is_empty() {
+        return Err(KeepframeError::Message(
+            "The import has no incomplete items to resume.".into(),
+        ));
+    }
+    import_photos(
+        paths,
+        ImportOptions {
+            mode,
+            duplicate_source_policy,
+        },
+        app,
+        state,
+    )
+    .await
+}
+
 fn asset_where(filter: &AssetFilter) -> (String, Vec<SqlValue>) {
     let mut clauses = Vec::new();
     let mut values = Vec::new();
+    clauses.push(if filter.trashed.unwrap_or(false) {
+        "a.trashed_at IS NOT NULL AND EXISTS (SELECT 1 FROM trash_items ti WHERE ti.asset_id=a.id AND ti.state IN ('moved','restore_failed','empty_failed'))"
+    } else {
+        "a.trashed_at IS NULL"
+    });
     if filter.decision != "all" {
         clauses.push("a.decision = ?");
         values.push(SqlValue::Text(filter.decision.clone()));
@@ -1320,151 +1890,332 @@ fn replace_asset_tags(
     Ok(())
 }
 
-fn managed_delete_target(
-    library_root: &Path,
-    canonical_root: &Path,
-    candidate: &Path,
-) -> Result<Option<PathBuf>> {
-    if !candidate.is_absolute() || !candidate.starts_with(library_root) {
-        return Err(KeepframeError::Message(format!(
-            "Refusing to remove a file outside the master library: {}",
-            candidate.display()
-        )));
+fn catalogued_paths(connection: &Connection, asset_id: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for sql in [
+        "SELECT path FROM representations WHERE asset_id=?1",
+        "SELECT path FROM versions WHERE asset_id=?1",
+        "SELECT output_path FROM jobs WHERE asset_id=?1 AND output_path IS NOT NULL",
+    ] {
+        let mut statement = connection.prepare(sql)?;
+        paths.extend(
+            statement
+                .query_map([asset_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(PathBuf::from),
+        );
     }
-    if !candidate.exists() {
-        return Ok(None);
-    }
-    let canonical = candidate.canonicalize()?;
-    if !canonical.starts_with(canonical_root) || !canonical.is_file() {
-        return Err(KeepframeError::Message(format!(
-            "Refusing unsafe removal target: {}",
-            candidate.display()
-        )));
-    }
-    Ok(Some(candidate.to_path_buf()))
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    Ok(paths)
 }
 
-fn delete_discarded_assets_inner(
+fn contained_library_file(root: &Path, candidate: &Path) -> Result<Option<PathBuf>> {
+    if !candidate.is_absolute() || !candidate.exists() {
+        return Ok(None);
+    }
+    let canonical_root = root.canonicalize()?;
+    let canonical = candidate.canonicalize()?;
+    if !canonical.starts_with(&canonical_root) || !canonical.is_file() {
+        return Err(KeepframeError::Message(format!(
+            "Refusing a file outside the master library: {}",
+            candidate.display()
+        )));
+    }
+    Ok(Some(canonical))
+}
+
+fn move_to_trash_inner(
     asset_ids: Vec<String>,
     root: PathBuf,
     app: AppHandle,
-) -> Result<DeleteSummary> {
-    let canonical_root = root.canonicalize()?;
-    let mut connection = open_db(&root)?;
+) -> Result<TrashSummary> {
+    let connection = open_db(&root)?;
+    let operation_id = Uuid::new_v4().to_string();
+    let created_at = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO trash_operations(id,state,created_at)VALUES(?1,'running',?2)",
+        params![operation_id, created_at],
+    )?;
     let asset_ids = asset_ids.into_iter().collect::<HashSet<_>>();
     let total = asset_ids.len();
-    let mut deleted = 0usize;
+    let mut affected = 0usize;
     let mut failed = 0usize;
 
     for (index, asset_id) in asset_ids.into_iter().enumerate() {
         let result = (|| -> Result<()> {
-            let tx =
-                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let asset = tx
+            let state: Option<(String, Option<String>)> = connection
                 .query_row(
-                    "SELECT decision,thumbnail_path FROM assets WHERE id=?1",
+                    "SELECT decision,trashed_at FROM assets WHERE id=?1",
                     [&asset_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .optional()?
+                .optional()?;
+            let (decision, trashed_at) = state
                 .ok_or_else(|| KeepframeError::Message("Photograph no longer exists".into()))?;
-            if asset.0 != "discard" {
+            if decision != "discard" || trashed_at.is_some() {
                 return Err(KeepframeError::Message(
-                    "Only discarded photographs can be deleted".into(),
+                    "Only discarded photographs outside Trash can be moved to Trash".into(),
                 ));
             }
 
-            let mut stored_paths = vec![PathBuf::from(asset.1)];
-            for sql in [
-                "SELECT path FROM representations WHERE asset_id=?1",
-                "SELECT path FROM versions WHERE asset_id=?1",
-                "SELECT output_path FROM jobs WHERE asset_id=?1 AND output_path IS NOT NULL",
-            ] {
-                let mut statement = tx.prepare(sql)?;
-                stored_paths.extend(
-                    statement
-                        .query_map([&asset_id], |row| row.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .map(PathBuf::from),
-                );
+            let paths = catalogued_paths(&connection, &asset_id)?;
+            let mut journal = Vec::new();
+            for candidate in paths {
+                let Some(original) = contained_library_file(&root, &candidate)? else {
+                    continue;
+                };
+                let relative = original.strip_prefix(root.canonicalize()?).map_err(|_| {
+                    KeepframeError::Message("Could not resolve the library-relative path".into())
+                })?;
+                if relative.starts_with(".keepframe\\Trash") {
+                    return Err(KeepframeError::Message(
+                        "Photograph already contains a Trash path".into(),
+                    ));
+                }
+                let item_id = Uuid::new_v4().to_string();
+                let destination = root
+                    .join(".keepframe")
+                    .join("Trash")
+                    .join(&operation_id)
+                    .join(&item_id)
+                    .join(relative.file_name().ok_or_else(|| {
+                        KeepframeError::Message("Trash source has no filename".into())
+                    })?);
+                connection.execute(
+                    "INSERT INTO trash_items(id,operation_id,asset_id,original_path,trash_path,state)VALUES(?1,?2,?3,?4,?5,'planned')",
+                    params![item_id, operation_id, asset_id, original.to_string_lossy(), destination.to_string_lossy()],
+                )?;
+                journal.push((item_id, original, destination));
+            }
+            if journal.is_empty() {
+                return Err(KeepframeError::Message(
+                    "No managed files were available to move to Trash".into(),
+                ));
             }
 
-            let mut seen = HashSet::new();
-            let mut recycle = Vec::new();
-            for path in stored_paths {
-                if seen.insert(path.clone()) {
-                    if let Some(path) = managed_delete_target(&root, &canonical_root, &path)? {
-                        recycle.push(path);
+            let mut moved = Vec::new();
+            for (item_id, original, destination) in &journal {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                match fs::rename(original, destination) {
+                    Ok(()) => {
+                        connection.execute(
+                            "UPDATE trash_items SET state='moved',error=NULL WHERE id=?1",
+                            [item_id],
+                        )?;
+                        moved.push((item_id, original, destination));
+                    }
+                    Err(error) => {
+                        connection.execute(
+                            "UPDATE trash_items SET state='failed',error=?2 WHERE id=?1",
+                            params![item_id, error.to_string()],
+                        )?;
+                        let mut rollback_failed = false;
+                        for (moved_id, moved_original, moved_destination) in moved.iter().rev() {
+                            if let Some(parent) = moved_original.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            if fs::rename(moved_destination, moved_original).is_ok() {
+                                connection.execute(
+                                    "UPDATE trash_items SET state='restored',error=NULL WHERE id=?1",
+                                    [moved_id],
+                                )?;
+                            } else {
+                                rollback_failed = true;
+                            }
+                        }
+                        if rollback_failed {
+                            connection.execute(
+                                "UPDATE assets SET trashed_at=?2 WHERE id=?1",
+                                params![asset_id, Utc::now().to_rfc3339()],
+                            )?;
+                        }
+                        return Err(KeepframeError::Io(error));
                     }
                 }
             }
-            if !recycle.is_empty() {
-                trash::delete_all(&recycle).map_err(|error| {
-                    KeepframeError::Message(format!(
-                        "Could not move files to the Recycle Bin: {error}"
-                    ))
-                })?;
-            }
-
-            tx.execute("DELETE FROM jobs WHERE asset_id=?1", [&asset_id])?;
-            tx.execute(
-                "DELETE FROM audit_log WHERE entity_type='asset' AND entity_id=?1",
-                [&asset_id],
+            connection.execute(
+                "UPDATE assets SET trashed_at=?2 WHERE id=?1",
+                params![asset_id, Utc::now().to_rfc3339()],
             )?;
-            if tx.execute(
-                "DELETE FROM assets WHERE id=?1 AND decision='discard'",
-                [&asset_id],
-            )? != 1
-            {
-                return Err(KeepframeError::Message(
-                    "Photograph changed before deletion completed".into(),
-                ));
-            }
-            tx.commit()?;
             Ok(())
         })();
 
         match result {
-            Ok(()) => deleted += 1,
+            Ok(()) => affected += 1,
             Err(error) => {
                 failed += 1;
                 let _ = app.emit(
-                    "delete-progress",
+                    "trash-progress",
                     json!({"current":index + 1,"total":total,"assetId":asset_id,"error":error.to_string()}),
                 );
                 continue;
             }
         }
         let _ = app.emit(
-            "delete-progress",
+            "trash-progress",
             json!({"current":index + 1,"total":total,"assetId":asset_id}),
         );
     }
-
     connection.execute(
-        "DELETE FROM batches WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.batch_id=batches.id)",
-        [],
+        "UPDATE trash_operations SET state=?2,completed_at=?3 WHERE id=?1",
+        params![
+            operation_id,
+            if failed == 0 {
+                "completed"
+            } else {
+                "needs_attention"
+            },
+            Utc::now().to_rfc3339()
+        ],
     )?;
-    connection.execute(
-        "DELETE FROM tags WHERE NOT EXISTS(SELECT 1 FROM asset_tags WHERE asset_tags.tag_id=tags.id)",
-        [],
-    )?;
-    Ok(DeleteSummary { deleted, failed })
+    Ok(TrashSummary { affected, failed })
 }
 
 #[tauri::command]
-async fn delete_discarded_assets(
+async fn move_to_trash(
     asset_ids: Vec<String>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> Result<DeleteSummary> {
+) -> Result<TrashSummary> {
     let root = root_from(&state)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        delete_discarded_assets_inner(asset_ids, root, app)
+    tauri::async_runtime::spawn_blocking(move || move_to_trash_inner(asset_ids, root, app))
+        .await
+        .map_err(|error| KeepframeError::Message(format!("Trash task failed: {error}")))?
+}
+
+#[tauri::command]
+async fn restore_from_trash(
+    asset_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<TrashSummary> {
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<TrashSummary> {
+        let connection = open_db(&root)?;
+        let mut affected = 0usize;
+        let mut failed = 0usize;
+        for asset_id in asset_ids.into_iter().collect::<HashSet<_>>() {
+            let mut statement = connection.prepare(
+                "SELECT id,original_path,trash_path FROM trash_items WHERE asset_id=?1 AND state='moved' ORDER BY rowid DESC",
+            )?;
+            let items = statement
+                .query_map([&asset_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            let mut restored = Vec::new();
+            let mut asset_failed = false;
+            for (item_id, original, trashed) in items {
+                let original = PathBuf::from(original);
+                let trashed = PathBuf::from(trashed);
+                if original.exists() || contained_library_file(&root, &trashed)?.is_none() {
+                    connection.execute(
+                        "UPDATE trash_items SET state='restore_failed',error='Original path occupied or Trash file missing' WHERE id=?1",
+                        [&item_id],
+                    )?;
+                    asset_failed = true;
+                    continue;
+                }
+                if let Some(parent) = original.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                match fs::rename(&trashed, &original) {
+                    Ok(()) => {
+                        connection.execute(
+                            "UPDATE trash_items SET state='restored',error=NULL WHERE id=?1",
+                            [&item_id],
+                        )?;
+                        restored.push(item_id);
+                    }
+                    Err(error) => {
+                        connection.execute(
+                            "UPDATE trash_items SET state='restore_failed',error=?2 WHERE id=?1",
+                            params![item_id, error.to_string()],
+                        )?;
+                        asset_failed = true;
+                    }
+                }
+            }
+            if !asset_failed && !restored.is_empty() {
+                connection.execute("UPDATE assets SET trashed_at=NULL WHERE id=?1", [&asset_id])?;
+                affected += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        Ok(TrashSummary { affected, failed })
     })
     .await
-    .map_err(|error| KeepframeError::Message(format!("Delete task failed: {error}")))?
+    .map_err(|error| KeepframeError::Message(format!("Restore task failed: {error}")))?
+}
+
+#[tauri::command]
+async fn empty_trash(
+    operation_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<TrashSummary> {
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<TrashSummary> {
+        let connection = open_db(&root)?;
+        let operation_ids = if operation_ids.is_empty() {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT operation_id FROM trash_items WHERE state='moved'",
+            )?;
+            let selected = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            selected
+        } else {
+            operation_ids.into_iter().collect::<HashSet<_>>()
+        };
+        let mut affected = 0usize;
+        let mut failed = 0usize;
+        for operation_id in operation_ids {
+            let mut statement = connection.prepare(
+                "SELECT id,trash_path FROM trash_items WHERE operation_id=?1 AND state='moved'",
+            )?;
+            let items = statement
+                .query_map([&operation_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            for (item_id, path) in items {
+                let path = PathBuf::from(path);
+                let Some(path) = contained_library_file(&root, &path)? else {
+                    connection.execute(
+                        "UPDATE trash_items SET state='missing',error='Trash file missing during Empty Trash' WHERE id=?1",
+                        [&item_id],
+                    )?;
+                    failed += 1;
+                    continue;
+                };
+                match trash::delete(&path) {
+                    Ok(()) => {
+                        connection.execute(
+                            "UPDATE trash_items SET state='recycled',error=NULL WHERE id=?1",
+                            [&item_id],
+                        )?;
+                        affected += 1;
+                    }
+                    Err(error) => {
+                        connection.execute(
+                            "UPDATE trash_items SET state='empty_failed',error=?2 WHERE id=?1",
+                            params![item_id, error.to_string()],
+                        )?;
+                        failed += 1;
+                    }
+                }
+            }
+        }
+        Ok(TrashSummary { affected, failed })
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Empty Trash task failed: {error}")))?
 }
 
 fn undo_last_action_in(connection: &mut Connection) -> Result<bool> {
@@ -1589,6 +2340,25 @@ async fn create_edit_recipe(
         .ok()
         .and_then(|value| Some((value.url.clone()?, value.token.clone()?)));
     analyse_asset(&root, &asset_id, &intent, common_brief, worker).await
+}
+
+async fn unload_analysis_worker(state: &State<'_, AppState>) -> Result<()> {
+    let worker = state
+        .analysis_worker
+        .lock()
+        .ok()
+        .and_then(|value| Some((value.url.clone()?, value.token.clone()?)));
+    let Some((url, token)) = worker else {
+        return Ok(());
+    };
+    reqwest::Client::new()
+        .post(format!("{url}/unload"))
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 const EDIT_INTENTS: &[&str] = &[
@@ -2033,6 +2803,7 @@ fn list_jobs(state: State<'_, AppState>) -> Result<Vec<BatchJob>> {
 }
 
 async fn execute_job(root: PathBuf, url: String, job_id: String, app: AppHandle) -> Result<()> {
+    let url = validated_loopback_url(&url)?;
     let execution = {
         let connection = open_db(&root)?;
         connection.query_row(
@@ -2365,6 +3136,9 @@ async fn update_job(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<()> {
+    if matches!(action.as_str(), "approve" | "retry") {
+        unload_analysis_worker(&state).await?;
+    }
     let root = root_from(&state)?;
     let connection = open_db(&root)?;
     let next = transition_job_in(&connection, &job_id, &action)?;
@@ -2382,6 +3156,7 @@ async fn approve_jobs(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<()> {
+    unload_analysis_worker(&state).await?;
     let root = root_from(&state)?;
     let mut connection = open_db(&root)?;
     let tx = connection.transaction()?;
@@ -2409,7 +3184,7 @@ async fn approve_jobs(
 fn list_versions(asset_id: String, state: State<'_, AppState>) -> Result<Vec<AssetVersion>> {
     let connection = open_db(&root_from(&state)?)?;
     let (original_id, original_path, original_hash, created_at, preferred_id): (String, String, String, String, Option<String>) = connection.query_row(
-        "SELECT r.id,r.path,r.sha256,a.created_at,a.preferred_version_id FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 ORDER BY CASE WHEN lower(r.extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 ELSE 1 END,r.path LIMIT 1",
+        "SELECT r.id,a.thumbnail_path,r.sha256,a.created_at,a.preferred_version_id FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 ORDER BY CASE WHEN lower(r.extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 ELSE 1 END,r.path LIMIT 1",
         [&asset_id],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
     )?;
@@ -2542,6 +3317,7 @@ fn prepare_external_export(
     prompt: &str,
     destination: &Path,
 ) -> Result<PathBuf> {
+    validated_provider(provider)?;
     if !destination.is_dir() {
         return Err(KeepframeError::Message(
             "Choose an existing export folder.".into(),
@@ -2556,10 +3332,7 @@ fn prepare_external_export(
         width.zip(height),
         &root.join(".keepframe/staging/working"),
     )?;
-    let safe_provider: String = provider
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
+    let safe_provider = provider;
     let stem = Path::new(&filename)
         .file_stem()
         .unwrap_or_default()
@@ -2602,6 +3375,7 @@ fn prepare_cloud_export(
     prompt: String,
     state: State<'_, AppState>,
 ) -> Result<String> {
+    validated_provider(&provider)?;
     let root = root_from(&state)?;
     let connection = open_db(&root)?;
     let (filename, source, width, height): (String, String, Option<u32>, Option<u32>) = connection
@@ -2629,10 +3403,7 @@ fn prepare_cloud_export(
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    let safe_provider = provider
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>();
+    let safe_provider = provider;
     let output = root.join("Exports").join(format!(
         "{}-{}-{}.png",
         Local::now().format("%Y%m%d-%H%M%S"),
@@ -2652,6 +3423,7 @@ fn import_returned_edit(
     prompt: String,
     state: State<'_, AppState>,
 ) -> Result<BatchJob> {
+    validated_provider(&provider)?;
     let root = root_from(&state)?;
     let mut connection = open_db(&root)?;
     let (captured,source_hash,asset_name):(String,String,String)=connection.query_row("SELECT a.captured_at,r.sha256,a.filename FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 LIMIT 1",[&asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -2669,7 +3441,16 @@ fn import_returned_edit(
     image::open(&source).map_err(|_| {
         KeepframeError::Message("The returned edit is not a supported image".into())
     })?;
-    let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let extension = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff") {
+        return Err(KeepframeError::Message(
+            "The returned edit has an unsupported file extension.".into(),
+        ));
+    }
     let output = output_dir.join(format!(
         "cloud-{}-{}.{}",
         provider,
@@ -2710,6 +3491,8 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             root: Mutex::new(None),
+            library_lock: Mutex::new(None),
+            library_issue: Mutex::new(None),
             local_ai_url: Mutex::new("http://127.0.0.1:7868".into()),
             analysis_worker: Mutex::new(AnalysisWorker::default()),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -2717,8 +3500,25 @@ pub fn run() {
         .setup(|app| {
             if let Some((root, url)) = load_settings() {
                 if root.exists() {
-                    let _ = initialise_layout(&root);
-                    *app.state::<AppState>().root.lock().unwrap() = Some(root);
+                    match acquire_library_lock(&root).and_then(|lock| {
+                        initialise_layout(&root)?;
+                        Ok(lock)
+                    }) {
+                        Ok(lock) => {
+                            allow_media_scope(app.handle(), &root)?;
+                            *app.state::<AppState>().root.lock().unwrap() = Some(root);
+                            *app.state::<AppState>().library_lock.lock().unwrap() = Some(lock);
+                        }
+                        Err(error) => {
+                            *app.state::<AppState>().library_issue.lock().unwrap() =
+                                Some(error.to_string());
+                        }
+                    }
+                } else {
+                    *app.state::<AppState>().library_issue.lock().unwrap() = Some(format!(
+                        "The configured library is unavailable at {}. Reconnect the library instead of creating a replacement.",
+                        root.display()
+                    ));
                 }
                 *app.state::<AppState>().local_ai_url.lock().unwrap() = url;
             }
@@ -2729,11 +3529,21 @@ pub fn run() {
             get_library_status,
             get_service_health,
             initialise_library,
+            prepare_review_preview,
+            check_catalogue_integrity,
+            create_catalogue_backup,
+            restore_catalogue_backup,
+            rebuild_thumbnails,
+            export_diagnostics,
             import_photos,
+            cancel_import,
+            resume_import,
             query_assets,
             query_asset_ids,
             set_decision,
-            delete_discarded_assets,
+            move_to_trash,
+            restore_from_trash,
+            empty_trash,
             undo_last_action,
             update_tags,
             update_location,
@@ -2777,6 +3587,90 @@ mod tests {
         assert_eq!(len, values.len());
         assert!(SUPPORTED.contains(&"cr3"));
         assert!(SUPPORTED.contains(&"heic"));
+    }
+
+    #[test]
+    fn local_service_urls_are_loopback_only() {
+        assert_eq!(
+            validated_loopback_url("http://127.0.0.1:7868/").unwrap(),
+            "http://127.0.0.1:7868"
+        );
+        assert!(validated_loopback_url("http://localhost:7868").is_ok());
+        assert!(validated_loopback_url("http://[::1]:7868").is_ok());
+        assert!(validated_loopback_url("https://127.0.0.1:7868").is_err());
+        assert!(validated_loopback_url("http://192.168.1.10:7868").is_err());
+        assert!(validated_loopback_url("http://127.0.0.1:7868?token=secret").is_err());
+        assert!(validated_loopback_url("http://user@127.0.0.1:7868").is_err());
+    }
+
+    #[test]
+    fn returned_edit_providers_are_an_enum() {
+        assert_eq!(validated_provider("chatgpt").unwrap(), "chatgpt");
+        assert_eq!(validated_provider("gemini").unwrap(), "gemini");
+        assert!(validated_provider("../../outside").is_err());
+        assert!(validated_provider("openai").is_err());
+    }
+
+    #[test]
+    fn catalogue_backup_contains_committed_wal_data() {
+        let root = std::env::temp_dir().join(format!("keepframe-backup-test-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let connection = open_db(&root).unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets(id,filename,captured_at,thumbnail_path,created_at) VALUES('asset','photo.jpg','2026-09-02T12:00:00Z','thumb.jpg','2026-09-02T12:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let backup = backup_database(&root, "test").unwrap();
+        let restored = Connection::open(&backup).unwrap();
+        let count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM assets WHERE id='asset'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(database_integrity(&restored).unwrap(), "ok");
+
+        drop(restored);
+        drop(connection);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_library_rejects_a_second_writer() {
+        let root = std::env::temp_dir().join(format!("keepframe-lock-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let first = acquire_library_lock(&root).unwrap();
+        assert!(acquire_library_lock(&root).is_err());
+        drop(first);
+        assert!(acquire_library_lock(&root).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn trash_view_hides_fully_emptied_tombstones() {
+        let trashed = AssetFilter {
+            decision: "all".into(),
+            search: String::new(),
+            year: None,
+            tag: None,
+            trashed: Some(true),
+        };
+        let normal = AssetFilter {
+            decision: "all".into(),
+            search: String::new(),
+            year: None,
+            tag: None,
+            trashed: Some(false),
+        };
+        let (trash_where, _) = asset_where(&trashed);
+        let (normal_where, _) = asset_where(&normal);
+        assert!(trash_where.contains("trash_items"));
+        assert!(trash_where.contains("empty_failed"));
+        assert!(!trash_where.contains("recycled"));
+        assert!(normal_where.contains("a.trashed_at IS NULL"));
     }
     #[test]
     fn prompt_keeps_safety_constraints() {
@@ -3000,7 +3894,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_targets_must_be_files_inside_the_master_library() {
+    fn trash_targets_must_be_files_inside_the_master_library() {
         let base =
             std::env::temp_dir().join(format!("keepframe-delete-target-test-{}", Uuid::new_v4()));
         let library = base.join("library");
@@ -3009,16 +3903,13 @@ mod tests {
         fs::create_dir_all(managed.parent().unwrap()).unwrap();
         fs::write(&managed, b"managed photograph").unwrap();
         fs::write(&outside, b"outside photograph").unwrap();
-        let canonical_library = library.canonicalize().unwrap();
-
         assert_eq!(
-            managed_delete_target(&library, &canonical_library, &managed).unwrap(),
-            Some(managed.clone())
+            contained_library_file(&library, &managed).unwrap(),
+            Some(managed.canonicalize().unwrap())
         );
-        assert!(managed_delete_target(&library, &canonical_library, &outside).is_err());
+        assert!(contained_library_file(&library, &outside).is_err());
         assert_eq!(
-            managed_delete_target(&library, &canonical_library, &library.join("missing.jpg"))
-                .unwrap(),
+            contained_library_file(&library, &library.join("missing.jpg")).unwrap(),
             None
         );
 
@@ -3122,6 +4013,7 @@ mod tests {
             search: String::new(),
             year: None,
             tag: None,
+            trashed: None,
         };
         let first = query_assets_in(&connection, &keep, 0, 1).unwrap();
         assert_eq!(first.total, 2);
@@ -3136,6 +4028,7 @@ mod tests {
             search: "coast".into(),
             year: Some(2026),
             tag: Some("COAST".into()),
+            trashed: None,
         };
         let result = query_assets_in(&connection, &tag_search, 0, 50).unwrap();
         assert_eq!(result.total, 1);

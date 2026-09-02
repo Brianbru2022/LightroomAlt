@@ -2,6 +2,7 @@ import { Check, CircleHelp, Info, MapPin, Maximize2, Sparkles, Tag, X } from "lu
 import { useEffect, useRef, useState } from "react";
 import type { Asset, Decision } from "../types";
 import { formatDate } from "../lib/format";
+import { api } from "../lib/bridge";
 
 type Props = {
   assets: Asset[];
@@ -19,6 +20,8 @@ type Props = {
 
 export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags }: Props) {
   const [zoomed, setZoomed] = useState(false);
+  const [reviewUrl, setReviewUrl] = useState<string | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const selectedId = selected?.id;
   const decisionRef = useRef(onDecision); decisionRef.current = onDecision;
   const selectRef = useRef(onSelect); selectRef.current = onSelect;
@@ -30,6 +33,13 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const selectedIndex = Math.max(0, assets.findIndex((asset) => asset.id === selectedId));
   const filmstripStart = Math.max(0, selectedIndex - 30);
   const filmstripAssets = assets.slice(filmstripStart, selectedIndex + 31);
+  useEffect(() => { setZoomed(false); setReviewUrl(null); setReviewError(null); }, [selectedId]);
+  const toggleZoom = () => {
+    if (zoomed) { setZoomed(false); return; }
+    if (!selected) return;
+    setReviewError(null);
+    void api.reviewPreview(selected).then((url) => { setReviewUrl(url); setZoomed(true); }).catch((error) => setReviewError(String(error)));
+  };
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       const target = event.target;
@@ -50,7 +60,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
       if (key === "t" && selectedRef.current) { event.preventDefault(); tagsRef.current(selectedRef.current); return; }
       const decision = event.key === "ArrowRight" || key === "k" ? "keep" : event.key === "ArrowLeft" || key === "x" ? "discard" : event.key === "ArrowUp" || key === "u" ? "undecided" : null;
       if (decision) { event.preventDefault(); decisionRef.current(selectedId, decision); }
-      if (event.code === "Space") { event.preventDefault(); setZoomed((value) => !value); }
+      if (event.code === "Space") { event.preventDefault(); toggleZoom(); }
     };
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [selectedId]);
@@ -59,7 +69,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   return (
     <main className="view triage-view">
       <div className="triage-stage">
-        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img src={selected.preferredVersionUrl ?? selected.previewUrl} alt={selected.filename} /></div>
+        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img src={zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl} alt={selected.filename} />{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
         <div className="triage-actions">
           <button className={`triage-button discard ${selected.decision === "discard" ? "active" : ""}`} onClick={() => onDecision(selected.id, "discard")}><X size={20} /><span>Discard</span><kbd>←</kbd></button>
           <button className={`triage-button undecided ${selected.decision === "undecided" ? "active" : ""}`} onClick={() => onDecision(selected.id, "undecided")}><CircleHelp size={20} /><span>Undecided</span><kbd>↑</kbd></button>
@@ -83,7 +93,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
         <div className="inspector-actions">
           <button onClick={onWorkshop}><Sparkles size={17} /> Edit with AI <kbd>E</kbd></button>
           <button onClick={onMap}><MapPin size={17} /> Show on map <kbd>M</kbd></button>
-          <button onClick={() => setZoomed((value) => !value)}><Maximize2 size={17} /> {zoomed ? "Fit image" : "View at 100%"} <kbd>Space</kbd></button>
+          <button onClick={toggleZoom}><Maximize2 size={17} /> {zoomed ? "Fit image" : "Load full-resolution 100%"} <kbd>Space</kbd></button>
         </div>
         <div className="safety-note"><Check size={15} /><span>Original protected<br /><small>Shift + ←/→ browses without deciding. Ctrl+Z undoes the latest change.</small></span></div>
       </aside>

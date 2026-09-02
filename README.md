@@ -1,59 +1,72 @@
-# Keepframe
+# Keepframe 0.2 beta
 
-Keepframe is a private Windows photo catalogue and AI workshop. It moves imports into a managed master library after hash verification, keeps managed originals untouched, supports map/tag/timeline browsing and provides a three-state keyboard triage workflow. AI edits are provider-neutral recipes saved as derived versions.
+Keepframe is a local-first Windows photo catalogue for safely organising, triaging and mapping a personal archive, then preparing and tracking AI-assisted restorations. It is deliberately not a conventional RAW developer: protected originals, catalogue decisions and derived edits remain separate.
 
-## What works
+> Keepframe is a provisional beta name. Do not publish this build commercially until naming clearance and the release gates in `RELEASE_GATES.md` are complete.
 
-- Tauri 2 desktop shell with React/TypeScript and Rust.
-- First-run master-library selection and self-contained SQLite catalogue.
-- Verified staging copies followed by source removal, SHA-256 duplicate detection and `Year/Month/Day` organisation.
-- Bundled ExifTool 13.59 metadata and RAW-preview extraction.
-- JPEG, PNG, TIFF, HEIC and common RAW discovery; unsupported/corrupt files are reported per import.
-- RAW+JPEG logical pairing, thumbnails, timeline, tags, GPS map and manual placement.
-- Keep/Undecided/Discard decisions, keyboard shortcuts and persistent undo history.
-- Versioned edit recipes and deterministic ChatGPT, Gemini and local-Qwen prompts.
-- Persistent batches/jobs, restart recovery and one-at-a-time local calls to `http://127.0.0.1:7868/api/edit-image`.
-- Optional authenticated Qwen3-VL-8B analysis worker with deterministic fallback.
+## Principal workflow
 
-Discard never deletes or moves a photograph. Direct cloud API submission, video, ratings, face recognition, semantic search and XMP writing are intentionally absent from v1.
+1. Choose or reconnect a portable master-library folder.
+2. Import with **Copy** (default) or explicitly choose **Move after verification**.
+3. Browse the timeline, tags and OpenStreetMap-backed map; click the map to place an unlocated photograph.
+4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
+5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
+6. Create and edit a provider-specific recipe for local Qwen editing, ChatGPT or Gemini.
+7. Export a full-resolution sRGB PNG for an external service and import the returned image as a traceable candidate version.
 
-## Development
+Catalogue, triage and manual external-edit workflows work without either optional AI service. Keepframe does not submit to ChatGPT or Gemini APIs and stores no cloud API keys.
 
-Requirements are Node.js 24+, pnpm 11+, Rust 1.96+ and the Windows WebView2 runtime.
+## Safety model
+
+- Copy and duplicate retention are always the import defaults.
+- A staged file and final managed file must match the source SHA-256 before catalogue registration.
+- Move removes a source only after managed placement, verification and catalogue commit, followed by an immediate source identity recheck.
+- Unsupported, changed, missing or failed source files are retained.
+- Discard is only a catalogue decision. Trash is internal and reversible; Empty Trash uses the Windows Recycle Bin.
+- SQLite runs in WAL mode. Schema upgrades create and integrity-check a SQLite-consistent backup.
+- Each library has a UUID marker and an exclusive lock. Missing/corrupt libraries open recovery rather than silent first-run setup.
+- Browser media access is restricted to generated previews and derived edits inside the current library. RAW files are not served to the WebView.
+
+## Clean-checkout validation
+
+Requirements: Windows 10/11, WebView2, Node.js 24+, pnpm 11+, Rust 1.96+ and Python 3.11+.
 
 ```powershell
 pnpm install
-pnpm test
-pnpm build
-cargo test --manifest-path .\src-tauri\Cargo.toml
+pnpm check:all
+```
+
+The command runs React tests, TypeScript/Vite production build, Rust tests, strict Clippy and the lightweight Python schema tests. It creates `ai-worker\.test-venv` with Pydantic only; PyTorch and model weights are not installed.
+
+Run a disposable native profile:
+
+```powershell
+$env:KEEPFRAME_SETTINGS_DIR = "$PWD\.test-profile"
 pnpm tauri dev
 ```
 
-If a managed environment blocks package postinstall scripts, run TypeScript and Vite through their local Node entrypoints:
+Build the invitation-only NSIS beta:
 
 ```powershell
-node .\node_modules\typescript\bin\tsc -b
-node .\node_modules\vite\bin\vite.js build
+pnpm tauri build --bundles nsis
 ```
 
-## Local AI
+## Optional local AI
 
-Keepframe uses the existing local edit service at `http://127.0.0.1:7868`. Catalogue functions remain available if that service is stopped.
-
-Image-specific Qwen analysis is optional. Its runtime and model are installed separately:
+The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.
 
 ```powershell
 .\scripts\setup-ai-worker.ps1
 .\scripts\download-analysis-model.ps1
 ```
 
-The second script states the expected 17.5 GB download and requires the exact confirmation `DOWNLOAD`. All weights and caches are constrained to `D:\AI Models\Keepframe`. Without the model, Keepframe creates a safe deterministic recipe from the selected intent, metadata and preservation controls.
+The model download is approximately 17.5 GB and requires explicit confirmation. Every weight and cache is constrained beneath `D:\AI Models\Keepframe`.
 
-## Library safety
+## Current beta boundaries
 
-- Sources are read and copied, never removed.
-- A staged copy must match the source SHA-256 before it is moved into `Originals`; the external source file is removed only after catalogue registration succeeds.
-- Catalogue metadata is stored in `.keepframe\catalogue.sqlite` using WAL mode.
-- Existing catalogues are backed up before schema migrations.
-- Thumbnail caches can be deleted and regenerated without catalogue loss.
-- A stale running AI job is restored to `queued` when Keepframe starts again.
+- Windows-only, single user.
+- HEIC catalogue previews depend on available decoding; full-resolution HEIC edit/export remains disabled unless decoding succeeds.
+- No exposure/curve/mask tools, conventional RAW development, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
+- The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
+
+See `BETA_TESTING.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

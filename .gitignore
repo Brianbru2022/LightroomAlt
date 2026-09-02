@@ -7,11 +7,13 @@ coverage/
 *.log
 .env
 ai-worker/.venv/
+ai-worker/.test-venv/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.pyc
 *.tsbuildinfo
+release/*.exe
+.test-profile-*/
 vite.config.js
 vite.config.d.ts
-src-tauri/icons/

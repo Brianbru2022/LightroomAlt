@@ -2,12 +2,13 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { Asset, AssetFilter, AssetPage, AssetVersion, BatchJob, Decision, DeleteSummary, EditIntent, EditRecipe, ImportSummary, LibraryStatus, PromptSet, ServiceHealth } from "../types";
+import type { Asset, AssetFilter, AssetPage, AssetVersion, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, ImportSummary, LibraryStatus, PromptSet, ServiceHealth, TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
 let browserAssets = structuredClone(demoAssets);
 let browserJobs = structuredClone(demoJobs);
+const browserTrash = new Set<string>();
 type BrowserHistory =
   | { kind: "decision"; id: string; decision: Decision }
   | { kind: "tags"; id: string; tags: string[] }
@@ -45,6 +46,33 @@ export const api = {
   async serviceHealth(): Promise<ServiceHealth> {
     return tauri() ? invoke("get_service_health") : { localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "The local Qwen image editor is ready.", analysisModelInstalled: false };
   },
+  async catalogueIntegrity(): Promise<string> {
+    return tauri() ? invoke("check_catalogue_integrity") : "ok";
+  },
+  async createBackup(): Promise<string> {
+    if (!tauri()) return "D:\\Photo Library\\.keepframe\\backups\\catalogue-manual.sqlite";
+    const path = await invoke<string>("create_catalogue_backup");
+    await revealItemInDir(path);
+    return path;
+  },
+  async restoreBackup(): Promise<boolean> {
+    if (!tauri()) return true;
+    const path = await open({ multiple: false, directory: false, title: "Choose a verified Keepframe catalogue backup", filters: [{ name: "SQLite catalogue", extensions: ["sqlite"] }] });
+    if (typeof path !== "string") return false;
+    await invoke("restore_catalogue_backup", { path });
+    return true;
+  },
+  async rebuildThumbnails(): Promise<number> {
+    return tauri() ? invoke("rebuild_thumbnails") : browserAssets.length;
+  },
+  async exportDiagnostics(): Promise<string | null> {
+    if (!tauri()) return "D:\\keepframe-diagnostics.json";
+    const destination = await open({ directory: true, multiple: false, title: "Choose a diagnostics export folder" });
+    if (typeof destination !== "string") return null;
+    const path = await invoke<string>("export_diagnostics", { destination });
+    await revealItemInDir(path);
+    return path;
+  },
   async chooseLibrary(): Promise<string | null> {
     if (!tauri()) return "D:\\Photo Library";
     const result = await open({ directory: true, multiple: false, title: "Choose the Keepframe master library" });
@@ -58,9 +86,13 @@ export const api = {
     const result = await open({ directory: true, multiple: false, title: "Choose a folder to import" });
     return typeof result === "string" ? [result] : [];
   },
-  async importPhotos(paths: string[]): Promise<ImportSummary> {
-    if (tauri()) return invoke("import_photos", { paths });
-    return { importId: crypto.randomUUID(), discovered: paths.length ? 6 : 0, imported: paths.length ? 6 : 0, duplicates: 0, unsupported: 0, failed: 0 };
+  async importPhotos(paths: string[], options: ImportOptions = { mode: "copy", duplicateSourcePolicy: "retain" }): Promise<ImportSummary> {
+    if (tauri()) return invoke("import_photos", { paths, options });
+    const imported = paths.length ? 6 : 0;
+    return { importId: crypto.randomUUID(), state: "completed", discovered: imported, imported, copied: options.mode === "copy" ? imported : 0, moved: options.mode === "move" ? imported : 0, sourceRetained: options.mode === "copy" ? imported : 0, duplicates: 0, unsupported: 0, failed: 0 };
+  },
+  async cancelImport(importId: string): Promise<void> {
+    if (tauri()) return invoke("cancel_import", { importId });
   },
   async assets(filter: AssetFilter, offset = 0, limit = 240): Promise<AssetPage> {
     if (tauri()) {
@@ -69,6 +101,7 @@ export const api = {
     }
     const query = filter.search.toLocaleLowerCase();
     const matching = browserAssets.filter((asset) => {
+      if (browserTrash.has(asset.id) !== Boolean(filter.trashed)) return false;
       if (filter.decision !== "all" && asset.decision !== filter.decision) return false;
       if (filter.year && new Date(asset.capturedAt).getFullYear() !== filter.year) return false;
       if (filter.tag && !asset.tags.includes(filter.tag)) return false;
@@ -97,12 +130,27 @@ export const api = {
     if (prior.kind === "location") { asset.latitude = prior.latitude; asset.longitude = prior.longitude; }
     return true;
   },
-  async deleteDiscarded(assetIds: string[]): Promise<DeleteSummary> {
-    if (tauri()) return invoke("delete_discarded_assets", { assetIds });
-    const selected = new Set(assetIds);
-    const before = browserAssets.length;
-    browserAssets = browserAssets.filter((asset) => !selected.has(asset.id) || asset.decision !== "discard");
-    return { deleted: before - browserAssets.length, failed: 0 };
+  async moveToTrash(assetIds: string[]): Promise<TrashSummary> {
+    if (tauri()) return invoke("move_to_trash", { assetIds });
+    let affected = 0;
+    for (const id of assetIds) {
+      const asset = browserAssets.find((item) => item.id === id);
+      if (asset?.decision === "discard" && !browserTrash.has(id)) { browserTrash.add(id); affected += 1; }
+    }
+    return { affected, failed: 0 };
+  },
+  async restoreFromTrash(assetIds: string[]): Promise<TrashSummary> {
+    if (tauri()) return invoke("restore_from_trash", { assetIds });
+    let affected = 0;
+    for (const id of assetIds) if (browserTrash.delete(id)) affected += 1;
+    return { affected, failed: 0 };
+  },
+  async emptyTrash(): Promise<TrashSummary> {
+    if (tauri()) return invoke("empty_trash", { operationIds: [] });
+    const affected = browserTrash.size;
+    browserAssets = browserAssets.filter((asset) => !browserTrash.has(asset.id));
+    browserTrash.clear();
+    return { affected, failed: 0 };
   },
   async updateTags(id: string, tags: string[]): Promise<void> {
     if (tauri()) return invoke("update_tags", { assetId: id, tags });
@@ -139,6 +187,10 @@ export const api = {
   async versions(asset: Asset): Promise<AssetVersion[]> {
     if (!tauri()) return [{ id: `original:${asset.id}`, kind: "original", provider: "Keepframe protected original", createdAt: asset.capturedAt, state: "protected", imageUrl: asset.previewUrl, isPreferred: !asset.preferredVersionUrl }];
     return (await invoke<AssetVersion[]>("list_versions", { assetId: asset.id })).map(withVersionUrl);
+  },
+  async reviewPreview(asset: Asset): Promise<string> {
+    if (!tauri()) return asset.previewUrl;
+    return convertFileSrc(await invoke<string>("prepare_review_preview", { assetId: asset.id }));
   },
   async setPreferredVersion(assetId: string, versionId?: string): Promise<void> {
     if (tauri()) return invoke("set_preferred_version", { assetId, versionId: versionId ?? null });
