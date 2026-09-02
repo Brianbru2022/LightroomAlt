@@ -1,6 +1,6 @@
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
-use image::ImageFormat;
+use image::{ImageDecoder, ImageFormat};
 use reqwest::multipart;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,7 @@ struct AnalysisWorker {
     url: Option<String>,
     token: Option<String>,
     child: Option<Child>,
+    last_error: Option<String>,
 }
 struct AppState {
     root: Mutex<Option<PathBuf>>,
@@ -118,6 +119,8 @@ struct ServiceHealth {
     local_ai_model: Option<String>,
     local_ai_detail: String,
     analysis_model_installed: bool,
+    analysis_available: bool,
+    analysis_detail: String,
 }
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -383,6 +386,22 @@ fn open_db(root: &Path) -> Result<Connection> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
+
+fn append_runtime_log(root: &Path, event: &str, detail: &str) {
+    let log_path = root.join(".keepframe/logs/runtime.jsonl");
+    let entry = json!({
+        "time": Utc::now().to_rfc3339(),
+        "event": event,
+        "detail": detail,
+    });
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(file, "{entry}");
+    }
+}
 fn allow_media_scope(app: &AppHandle, root: &Path) -> Result<()> {
     let scope = app.asset_protocol_scope();
     for directory in [
@@ -633,6 +652,8 @@ fn parse_local_ai_health(value: &Value) -> ServiceHealth {
         local_ai_model: model,
         local_ai_detail: detail,
         analysis_model_installed: analysis_installed(),
+        analysis_available: false,
+        analysis_detail: analysis_installation_detail(),
     }
 }
 async fn local_ai_health(url: &str) -> ServiceHealth {
@@ -645,6 +666,8 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
             local_ai_detail:
                 "The configured AI service was blocked because it is not loopback-only.".into(),
             analysis_model_installed: analysis_installed(),
+            analysis_available: false,
+            analysis_detail: analysis_installation_detail(),
         };
     };
     let response = reqwest::Client::new()
@@ -663,6 +686,8 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
                 local_ai_detail: "The service responded, but its capability report was invalid."
                     .into(),
                 analysis_model_installed: analysis_installed(),
+                analysis_available: false,
+                analysis_detail: analysis_installation_detail(),
             },
         },
         _ => ServiceHealth {
@@ -672,27 +697,98 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
             local_ai_model: None,
             local_ai_detail: format!("No local image service is responding at {url}."),
             analysis_model_installed: analysis_installed(),
+            analysis_available: false,
+            analysis_detail: analysis_installation_detail(),
         },
     }
 }
+
+fn analysis_runtime_path() -> Option<PathBuf> {
+    let durable = PathBuf::from(r"D:\AI Models\Keepframe\runtime\Scripts\python.exe");
+    if durable.is_file() {
+        return Some(durable);
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project = manifest.parent().unwrap_or(Path::new("."));
+    let development = project.join("ai-worker/.venv/Scripts/python.exe");
+    development.is_file().then_some(development)
+}
+
+fn analysis_installation_detail() -> String {
+    if !analysis_installed() {
+        "Image analysis is unavailable: Qwen3-VL-8B-Instruct is not installed under D:\\AI Models\\Keepframe. Recipes will use the deterministic controls-only fallback.".into()
+    } else if analysis_runtime_path().is_none() {
+        "Image analysis is unavailable: the Keepframe analysis runtime is not installed. Recipes will use the deterministic controls-only fallback.".into()
+    } else {
+        "The analysis components are installed, but the worker is not ready.".into()
+    }
+}
+
+fn ensure_analysis_worker_source() -> Result<PathBuf> {
+    let source_root = PathBuf::from(r"D:\AI Models\Keepframe\worker-source");
+    let package = source_root.join("keepframe_worker");
+    fs::create_dir_all(&package)?;
+    for (name, contents) in [
+        (
+            "__init__.py",
+            include_str!("../../ai-worker/keepframe_worker/__init__.py"),
+        ),
+        (
+            "main.py",
+            include_str!("../../ai-worker/keepframe_worker/main.py"),
+        ),
+        (
+            "schemas.py",
+            include_str!("../../ai-worker/keepframe_worker/schemas.py"),
+        ),
+    ] {
+        let destination = package.join(name);
+        if fs::read_to_string(&destination).ok().as_deref() != Some(contents) {
+            fs::write(destination, contents)?;
+        }
+    }
+    Ok(source_root)
+}
+
 fn analysis_installed() -> bool {
     Path::new(r"D:\AI Models\Keepframe\Qwen3-VL-8B-Instruct").exists()
         || Path::new(r"D:\AI Models\Keepframe\huggingface\hub\models--Qwen--Qwen3-VL-8B-Instruct")
             .exists()
 }
 fn start_analysis_worker(state: &AppState) {
+    if state
+        .analysis_worker
+        .lock()
+        .is_ok_and(|worker| worker.child.is_some())
+    {
+        return;
+    }
     if !analysis_installed() {
+        if let Ok(mut worker) = state.analysis_worker.lock() {
+            worker.last_error = Some(analysis_installation_detail());
+        }
         return;
     }
-    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let worker_python = project.join("ai-worker/.venv/Scripts/python.exe");
-    if !worker_python.exists() {
+    let Some(worker_python) = analysis_runtime_path() else {
+        if let Ok(mut worker) = state.analysis_worker.lock() {
+            worker.last_error = Some(analysis_installation_detail());
+        }
         return;
-    }
+    };
+    let worker_source = match ensure_analysis_worker_source() {
+        Ok(path) => path,
+        Err(error) => {
+            if let Ok(mut worker) = state.analysis_worker.lock() {
+                worker.last_error = Some(format!("Could not prepare the analysis worker: {error}"));
+            }
+            return;
+        }
+    };
     let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+        if let Ok(mut worker) = state.analysis_worker.lock() {
+            worker.last_error =
+                Some("Could not reserve a loopback port for image analysis.".into());
+        }
         return;
     };
     let Ok(port) = listener.local_addr().map(|address| address.port()) else {
@@ -703,18 +799,26 @@ fn start_analysis_worker(state: &AppState) {
     let mut command = hidden_command(worker_python);
     command
         .args(["-m", "uvicorn", "keepframe_worker.main:app", "--app-dir"])
-        .arg(project.join("ai-worker"))
+        .arg(worker_source)
         .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         .env("KEEPFRAME_MODEL_ROOT", r"D:\AI Models\Keepframe")
         .env("KEEPFRAME_WORKER_TOKEN", &token)
         .env("HF_HOME", r"D:\AI Models\Keepframe\huggingface")
         .env("HF_HUB_OFFLINE", "1")
         .env("TRANSFORMERS_OFFLINE", "1");
-    if let Ok(child) = command.spawn() {
-        if let Ok(mut worker) = state.analysis_worker.lock() {
-            worker.url = Some(format!("http://127.0.0.1:{port}"));
-            worker.token = Some(token);
-            worker.child = Some(child);
+    match command.spawn() {
+        Ok(child) => {
+            if let Ok(mut worker) = state.analysis_worker.lock() {
+                worker.last_error = None;
+                worker.url = Some(format!("http://127.0.0.1:{port}"));
+                worker.token = Some(token);
+                worker.child = Some(child);
+            }
+        }
+        Err(error) => {
+            if let Ok(mut worker) = state.analysis_worker.lock() {
+                worker.last_error = Some(format!("The analysis worker could not start: {error}"));
+            }
         }
     }
 }
@@ -780,12 +884,66 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
 }
 #[tauri::command]
 async fn get_service_health(state: State<'_, AppState>) -> Result<ServiceHealth> {
+    start_analysis_worker(&state);
     let url = state
         .local_ai_url
         .lock()
         .map_err(|_| KeepframeError::Message("AI service setting lock failed".into()))?
         .clone();
-    Ok(local_ai_health(&url).await)
+    let mut health = local_ai_health(&url).await;
+    let worker_status = state.analysis_worker.lock().ok().map(|mut worker| {
+        let running = worker
+            .child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if !running && worker.child.is_some() {
+            worker.child = None;
+            worker.url = None;
+            worker.token = None;
+            worker
+                .last_error
+                .get_or_insert_with(|| "The analysis worker exited unexpectedly.".into());
+        }
+        (
+            running,
+            worker.url.clone(),
+            worker.token.clone(),
+            worker
+                .last_error
+                .clone()
+                .unwrap_or_else(analysis_installation_detail),
+        )
+    });
+    if let Some((running, worker_url, token, fallback_detail)) = worker_status {
+        let ready = if let (true, Some(worker_url), Some(token)) = (running, worker_url, token) {
+            match reqwest::Client::new()
+                .get(format!("{worker_url}/health"))
+                .header("X-Keepframe-Token", token)
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|value| value.get("ready").and_then(Value::as_bool))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        health.analysis_available = ready;
+        health.analysis_detail = if ready {
+            "Qwen3-VL-8B image analysis is ready and remains on this computer.".into()
+        } else if running {
+            "The image-analysis worker is starting; Keepframe will use the deterministic fallback until it is ready.".into()
+        } else {
+            fallback_detail
+        };
+    }
+    Ok(health)
 }
 #[tauri::command]
 async fn initialise_library(
@@ -1137,12 +1295,44 @@ fn decode_browsing_image(path: &Path) -> Result<image::DynamicImage> {
                 }
             }
         }
-        decoded.ok_or_else(|| {
+        let mut image = decoded.ok_or_else(|| {
             KeepframeError::Message(format!("No usable preview was found in {}", path.display()))
-        })
+        })?;
+        if let Some(orientation) = source_orientation(path) {
+            image.apply_orientation(orientation);
+        }
+        Ok(image)
     } else {
-        Ok(image::open(path)?)
+        decode_standard_with_orientation(path)
     }
+}
+
+fn source_orientation(path: &Path) -> Option<image::metadata::Orientation> {
+    let output = hidden_command(exiftool_path())
+        .args(["-s3", "-n", "-Orientation"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u8>()
+        .ok()?;
+    image::metadata::Orientation::from_exif(value)
+}
+
+fn decode_standard_with_orientation(path: &Path) -> Result<image::DynamicImage> {
+    let mut decoder = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_decoder()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 fn thumbnail_from(path: &Path, output: &Path) -> Result<()> {
@@ -1243,7 +1433,7 @@ fn prepare_full_resolution_image(
             path.display()
         )));
     } else {
-        image::open(path).map_err(|error| {
+        decode_standard_with_orientation(path).map_err(|error| {
             KeepframeError::Message(format!(
                 "Could not open {} at full resolution: {error}",
                 path.display()
@@ -2353,7 +2543,7 @@ async fn unload_analysis_worker(state: &State<'_, AppState>) -> Result<()> {
     };
     reqwest::Client::new()
         .post(format!("{url}/unload"))
-        .bearer_auth(token)
+        .header("X-Keepframe-Token", token)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await?
@@ -2432,7 +2622,8 @@ async fn analyse_asset(
     };
     let mut analysis_model = "deterministic-fallback".to_string();
     let mut observations = vec![
-        format!("The source {} should remain authoritative.", filename),
+        "No vision analysis was run. Inspect the supplied photograph and apply only the selected intent and user brief.".into(),
+        format!("Treat {} as the authoritative source photograph.", filename),
         if date_fallback != 0 {
             "Capture date came from the file timestamp; do not infer a historical period.".into()
         } else {
@@ -2464,7 +2655,7 @@ async fn analyse_asset(
                     .file_name("analysis.jpg")
                     .mime_str("image/jpeg")?,
             );
-        if let Ok(response) = reqwest::Client::new()
+        match reqwest::Client::new()
             .post(format!("{url}/v1/analyse"))
             .header("X-Keepframe-Token", token)
             .multipart(form)
@@ -2472,28 +2663,45 @@ async fn analyse_asset(
             .send()
             .await
         {
-            if response.status().is_success() {
-                if let Ok(value) = response.json::<AnalysisResponse>().await {
-                    let valid = !value.observations.is_empty()
-                        && !value.suggested_intents.is_empty()
-                        && !value.negative_constraints.is_empty()
-                        && value
-                            .suggested_intents
-                            .iter()
-                            .all(|item| EDIT_INTENTS.contains(&item.as_str()))
-                        && value
-                            .preserve
-                            .iter()
-                            .all(|item| PRESERVE_CONSTRAINTS.contains(&item.as_str()));
-                    if valid {
-                        observations = value.observations;
-                        suggested = value.suggested_intents;
-                        preserve = value.preserve;
-                        constraints = value.negative_constraints;
-                        analysis_model = "Qwen/Qwen3-VL-8B-Instruct".into();
+            Ok(response) if response.status().is_success() => {
+                match response.json::<AnalysisResponse>().await {
+                    Ok(value) => {
+                        let valid = !value.observations.is_empty()
+                            && !value.suggested_intents.is_empty()
+                            && !value.negative_constraints.is_empty()
+                            && value
+                                .suggested_intents
+                                .iter()
+                                .all(|item| EDIT_INTENTS.contains(&item.as_str()))
+                            && value
+                                .preserve
+                                .iter()
+                                .all(|item| PRESERVE_CONSTRAINTS.contains(&item.as_str()));
+                        if valid {
+                            observations = value.observations;
+                            suggested = value.suggested_intents;
+                            preserve = value.preserve;
+                            constraints = value.negative_constraints;
+                            analysis_model = "Qwen/Qwen3-VL-8B-Instruct".into();
+                        } else {
+                            append_runtime_log(
+                                root,
+                                "analysis_invalid",
+                                "The worker returned a recipe outside Keepframe's schema.",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        append_runtime_log(root, "analysis_invalid_json", &error.to_string())
                     }
                 }
             }
+            Ok(response) => append_runtime_log(
+                root,
+                "analysis_http_error",
+                &format!("Worker returned HTTP {}", response.status()),
+            ),
+            Err(error) => append_runtime_log(root, "analysis_request_failed", &error.to_string()),
         }
     }
     let recipe = EditRecipe {
@@ -2520,13 +2728,53 @@ async fn analyse_asset(
 }
 #[tauri::command]
 fn render_prompts(recipe: EditRecipe) -> PromptSet {
-    let intent = recipe.intents.join(", ").replace('_', " ");
+    fn intent_instruction(intent: &str) -> &'static str {
+        match intent {
+            "restoration" => "Restore only visible age, fading, dust or damage while retaining authentic photographic detail.",
+            "scratch_repair" => "Remove visible scratches, dust marks and small surface defects; reconstruct only from neighbouring evidence.",
+            "denoise" => "Reduce distracting sensor or scan noise without smearing faces, edges, texture or natural grain.",
+            "sharpen" => "Apply restrained, edge-aware sharpening without halos, crunchy texture or invented detail.",
+            "upscale" => "Increase usable resolution while preserving identity, geometry and believable fine detail.",
+            "lighting_correction" => "Correct exposure, contrast and colour balance naturally; recover available highlight and shadow detail without an HDR look.",
+            "object_removal" => "Remove only the object identified in the user brief and fill the area consistently with the surrounding scene.",
+            "sky_replacement" => "Replace only the sky described in the user brief, matching scene lighting, reflections, horizon and depth.",
+            "colourisation" => "Colourise plausibly and conservatively while preserving tonal structure, period detail and identity.",
+            "custom" => "Apply only the change explicitly described in the user brief.",
+            _ => "Apply only the selected edit.",
+        }
+    }
+
+    let requested_work = recipe
+        .intents
+        .iter()
+        .map(|intent| intent_instruction(intent))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let brief = recipe
+        .common_brief
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("No additional user brief was supplied; do not make changes beyond the selected intent.");
     let observations = recipe.observations.join(" ");
     let preserve = recipe.preserve.join(", ").replace('_', " ");
     let constraints = recipe.negative_constraints.join(" ");
-    let brief = recipe.common_brief.clone().unwrap_or_default();
-    let core=format!("Edit the supplied photograph with {} strength. User brief: {} Requested work: {}. Image-specific observations: {} Preserve {}. {} Keep the original dimensions and return an sRGB PNG.",recipe.strength,brief,intent,observations,preserve,constraints);
-    PromptSet{local:format!("{} Make only the requested changes and retain natural photographic texture.",core),chatgpt:format!("{} Treat the source as authoritative; produce a faithful, natural edit rather than a reimagining.",core),gemini:format!("{} Maintain subject consistency and make no unrequested generative changes.",core),negative:recipe.negative_constraints.join(", ")}
+    let core = format!(
+        "Use the attached photograph as the sole visual source. Goal: {brief} Selected editing instructions: {requested_work} Relevant notes: {observations} Preserve: {preserve}. Restrictions: {constraints} Editing strength: {}. Preserve the original composition and dimensions. Output one colour-managed sRGB PNG.",
+        recipe.strength
+    );
+    PromptSet {
+        local: format!(
+            "Qwen Image Edit instruction. {core} Make local, targeted changes only. Retain natural photographic texture and leave unaffected areas unchanged."
+        ),
+        chatgpt: format!(
+            "Edit the attached photograph rather than generating a replacement scene. {core} Inspect the image itself before editing and return only the finished photograph."
+        ),
+        gemini: format!(
+            "Perform a faithful image edit on the attached photograph. {core} Maintain subject and scene consistency; do not add unrequested generative content."
+        ),
+        negative: recipe.negative_constraints.join(", "),
+    }
 }
 fn attempts_for_job(connection: &Connection, job_id: &str) -> Result<Vec<JobAttempt>> {
     let mut statement = connection.prepare(
@@ -3120,6 +3368,7 @@ fn spawn_queued_job(
             return;
         }
         if let Err(error) = execute_job(root.clone(), url, job_id.clone(), app.clone()).await {
+            append_runtime_log(&root, "local_edit_failed", &error.to_string());
             let _ = fail_running_attempt(&root, &job_id, &error.to_string());
             let _ = app.emit(
                 "job-progress",
@@ -3693,7 +3942,13 @@ mod tests {
         };
         let prompts = render_prompts(recipe);
         assert!(prompts.local.contains("No face reshaping"));
-        assert!(prompts.chatgpt.contains("source as authoritative"));
+        assert!(prompts
+            .chatgpt
+            .contains("rather than generating a replacement scene"));
+        assert!(prompts.local.contains("Qwen Image Edit instruction"));
+        assert!(prompts
+            .gemini
+            .contains("Maintain subject and scene consistency"));
     }
 
     fn test_recipe(asset_id: &str) -> EditRecipe {

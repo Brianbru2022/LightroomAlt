@@ -7,8 +7,9 @@ describe("provider-neutral edit recipes", () => {
     const prompts = renderPrompts(recipe);
     expect(recipe.preserve).toContain("identity_faces");
     expect(prompts.local).toContain("Do not reshape faces");
-    expect(prompts.chatgpt).toContain("source as authoritative");
-    expect(prompts.gemini).toContain("no unrequested generative changes");
+    expect(prompts.chatgpt).toContain("sole visual source");
+    expect(prompts.chatgpt).toContain("rather than generating a replacement scene");
+    expect(prompts.gemini).toContain("do not add unrequested generative content");
   });
 
   it("uses individual observations for different photographs", () => {

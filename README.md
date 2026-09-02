@@ -60,7 +60,9 @@ The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe r
 .\scripts\download-analysis-model.ps1
 ```
 
-The model download is approximately 17.5 GB and requires explicit confirmation. Every weight and cache is constrained beneath `D:\AI Models\Keepframe`.
+The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The model download is approximately 17.5 GB and requires explicit confirmation. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
+
+When the vision model is absent, Keepframe now labels the recipe as a deterministic controls-only fallback. Qwen-Image-Edit at port 7868 is a separate integration and is reported independently in Settings & Health.
 
 ## Current beta boundaries
 

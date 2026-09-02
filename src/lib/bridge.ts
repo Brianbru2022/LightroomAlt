@@ -44,7 +44,7 @@ export const api = {
     return tauri() ? invoke("get_library_status") : demoStatus(browserAssets);
   },
   async serviceHealth(): Promise<ServiceHealth> {
-    return tauri() ? invoke("get_service_health") : { localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "The local Qwen image editor is ready.", analysisModelInstalled: false };
+    return tauri() ? invoke("get_service_health") : { localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "The local Qwen image editor is ready.", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "Demo mode uses the deterministic controls-only fallback." };
   },
   async catalogueIntegrity(): Promise<string> {
     return tauri() ? invoke("check_catalogue_integrity") : "ok";

@@ -15,7 +15,7 @@ import { SettingsView } from "./views/SettingsView";
 
 const PAGE_SIZE = 240;
 const emptyStatus: LibraryStatus = { configured: false, counts: { total: 0, keep: 0, undecided: 0, discard: 0 } };
-const emptyHealth: ServiceHealth = { localAiAvailable: false, serviceReachable: false, localAiBusy: false, localAiDetail: "No local image service is responding.", analysisModelInstalled: false };
+const emptyHealth: ServiceHealth = { localAiAvailable: false, serviceReachable: false, localAiBusy: false, localAiDetail: "No local image service is responding.", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "The image-analysis worker is unavailable. Recipes will use the controls-only fallback." };
 type OperationProgress = { kind: "Import" | "Trash" | "Cache"; current: number; total: number; importId?: string; file?: string; error?: string };
 
 export function App() {
@@ -124,7 +124,7 @@ export function App() {
     let active = true;
     const check = () => api.serviceHealth().then((value) => { if (active) setHealth(value); }).catch(() => { if (active) setHealth(emptyHealth); });
     void check();
-    const timer = window.setInterval(check, 30_000);
+    const timer = window.setInterval(check, 5_000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
   useEffect(() => {

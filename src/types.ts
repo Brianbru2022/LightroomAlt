@@ -64,6 +64,8 @@ export type ServiceHealth = {
   localAiModel?: string;
   localAiDetail: string;
   analysisModelInstalled: boolean;
+  analysisAvailable: boolean;
+  analysisDetail: string;
 };
 
 export type AssetVersion = {

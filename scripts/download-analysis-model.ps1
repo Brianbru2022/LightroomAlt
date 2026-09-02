@@ -1,7 +1,7 @@
 param([string]$ModelRoot = "D:\AI Models\Keepframe")
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$Python = Join-Path $ProjectRoot "ai-worker\.venv\Scripts\python.exe"
+$Python = Join-Path $ModelRoot "runtime\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $Python)) { throw "Set up the analysis worker first with scripts\setup-ai-worker.ps1." }
 if (-not $ModelRoot.StartsWith("D:\AI Models", [System.StringComparison]::OrdinalIgnoreCase)) { throw "AI model assets must remain under D:\AI Models." }
 Write-Host "Qwen3-VL-8B-Instruct requires approximately 17.5 GB plus download/cache overhead."

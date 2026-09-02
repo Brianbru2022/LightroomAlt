@@ -87,6 +87,11 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
     const next = { ...recipe, preserve: recipe.preserve.includes(value) ? recipe.preserve.filter((item) => item !== value) : [...recipe.preserve, value] };
     setRecipe(next); setPrompts(await onPrompts(next));
   };
+  const updateRecipe = async (next: EditRecipe) => {
+    setRecipe(next);
+    setPrompts(await onPrompts(next));
+  };
+  const recipeLines = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean);
   const copy = async () => { if (!prompts) return; await onCopy(prompts[provider]); setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
 
   return (
@@ -100,8 +105,8 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
               <div className="workbench-controls">
                 <label><span>What should change?</span><div className="select-wrap"><select value={intent} onChange={(event) => setIntent(event.target.value as EditIntent)}>{intents.map((item) => <option key={item} value={item}>{displayIntent(item)}</option>)}</select><ChevronDown size={15} /></div></label>
                 <label><span>Your brief</span><textarea value={brief} onChange={(event) => setBrief(event.target.value)} rows={4} /></label>
-                <button className="primary-button full" onClick={analyse} disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />} {busy ? "Analysing this frame…" : "Build image-specific recipe"}</button>
-                <small className="privacy-line"><Cpu size={13} /> Analysis is local; no photograph is uploaded.</small>
+                <button className="primary-button full" onClick={analyse} disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />} {busy ? "Building this recipe…" : serviceHealth.analysisAvailable ? "Analyse and build recipe" : "Build recipe from controls"}</button>
+                <small className={serviceHealth.analysisAvailable ? "privacy-line" : "local-warning"}><Cpu size={13} /> {serviceHealth.analysisAvailable ? "Vision analysis is local; no photograph is uploaded." : serviceHealth.analysisDetail}</small>
               </div>
             </div>
             <section className="version-panel" aria-labelledby="versions-heading">
@@ -115,13 +120,14 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
             {recipe && prompts ? (
               <div className="recipe-panel">
                 <div className="recipe-heading"><div><span className="step-number">01</span><div><h2>Review the recipe</h2><p>{recipe.analysisModel} · {recipe.strength}</p></div></div><button className="icon-button" onClick={analyse} title="Analyse again"><RotateCcw size={16} /></button></div>
-                <div className="observations">{recipe.observations.map((item) => <div key={item}><Check size={14} />{item}</div>)}</div>
+                <label><span>Analysis notes</span><textarea rows={4} value={recipe.observations.join("\n")} onChange={(event) => setRecipe({ ...recipe, observations: recipeLines(event.target.value) })} onBlur={(event) => void updateRecipe({ ...recipe, observations: recipeLines(event.currentTarget.value) })} /></label>
                 <h3>Preserve</h3><div className="choice-chips">{preservation.map((item) => <button key={item} className={recipe.preserve.includes(item) ? "selected" : ""} onClick={() => togglePreserve(item)}>{displayIntent(item)}</button>)}</div>
+                <div className="recipe-edit-grid"><label><span>Strength</span><select value={recipe.strength} onChange={(event) => void updateRecipe({ ...recipe, strength: event.target.value as EditRecipe["strength"] })}><option value="subtle">Subtle</option><option value="balanced">Balanced</option><option value="strong">Strong</option></select></label><label><span>Restrictions</span><textarea rows={4} value={recipe.negativeConstraints.join("\n")} onChange={(event) => setRecipe({ ...recipe, negativeConstraints: recipeLines(event.target.value) })} onBlur={(event) => void updateRecipe({ ...recipe, negativeConstraints: recipeLines(event.currentTarget.value) })} /></label></div>
                 <div className="prompt-stage">
                   <div className="prompt-tabs">{(["local", "chatgpt", "gemini"] as const).map((item) => <button key={item} className={provider === item ? "active" : ""} onClick={() => setProvider(item)}>{item === "local" ? <Cpu size={14} /> : <Cloud size={14} />}{item === "chatgpt" ? "ChatGPT" : displayIntent(item)}</button>)}</div>
                   <textarea value={prompts[provider]} onChange={(event) => setPrompts({ ...prompts, [provider]: event.target.value })} rows={7} aria-label={`${provider} prompt`} />
                   <div className="prompt-actions"><button className="quiet-button" onClick={copy}>{copied ? <Check size={16} /> : <Clipboard size={16} />} {copied ? "Copied" : "Copy prompt"}</button>{provider !== "local" ? <><button className="quiet-button" onClick={() => onPrepare(asset.id, provider, prompts[provider])}><Download size={16} /> Library export</button><button className="quiet-button" onClick={() => onExportExternal(asset.id, provider, prompts[provider])}><FolderOutput size={16} /> Export to folder</button><button className="quiet-button" onClick={() => onImportReturned(asset.id, provider, prompts[provider])}>Import result</button></> : null}{provider === "local" ? <button className="primary-button" disabled={!serviceHealth.localAiAvailable || serviceHealth.localAiBusy} onClick={() => onRunLocal(asset.id, recipe, prompts.local)}><Play size={16} /> Approve and start local edit</button> : null}</div>
-                  {provider === "local" ? <p className={serviceHealth.localAiAvailable && !serviceHealth.localAiBusy ? "service-ready" : "local-warning"}>{serviceHealth.localAiDetail}</p> : null}
+                  {provider === "local" ? <p className={serviceHealth.localAiAvailable && !serviceHealth.localAiBusy ? "service-ready" : "local-warning"}>{serviceHealth.localAiDetail}</p> : <p className="privacy-line"><Cloud size={13} /> Keepframe prepares the image and prompt locally; it does not submit them to {provider === "chatgpt" ? "ChatGPT" : "Gemini"}.</p>}
                 </div>
               </div>
             ) : null}

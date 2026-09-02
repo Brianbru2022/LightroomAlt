@@ -66,15 +66,28 @@ export const makeRecipe = (asset: Asset, intent: EditRecipe["intents"][number] =
 });
 
 export const renderPrompts = (recipe: EditRecipe): PromptSet => {
-  const intent = recipe.intents.join(", ").replaceAll("_", " ");
+  const instructions: Record<EditRecipe["intents"][number], string> = {
+    restoration: "Restore only visible age, fading, dust or damage while retaining authentic photographic detail.",
+    scratch_repair: "Remove visible scratches, dust marks and small surface defects; reconstruct only from neighbouring evidence.",
+    denoise: "Reduce distracting noise without smearing faces, edges, texture or natural grain.",
+    sharpen: "Apply restrained, edge-aware sharpening without halos or invented detail.",
+    upscale: "Increase usable resolution while preserving identity, geometry and believable detail.",
+    lighting_correction: "Correct exposure, contrast and colour balance naturally without an HDR look.",
+    object_removal: "Remove only the object identified in the user brief and fill the area consistently.",
+    sky_replacement: "Replace only the sky described in the user brief and match the scene lighting and horizon.",
+    colourisation: "Colourise plausibly while preserving tonal structure and period detail.",
+    custom: "Apply only the change explicitly described in the user brief.",
+  };
+  const requestedWork = recipe.intents.map((intent) => instructions[intent]).join(" ");
   const observations = recipe.observations.join(" ");
   const preserve = recipe.preserve.join(", ").replaceAll("_", " ");
   const constraints = recipe.negativeConstraints.join(" ");
-  const core = `Edit the supplied photograph with ${recipe.strength} strength. Requested work: ${intent}. Image-specific observations: ${observations} Preserve ${preserve}. ${constraints} Keep the original dimensions and return an sRGB PNG.`;
+  const brief = recipe.commonBrief?.trim() || "No additional user brief was supplied; do not make changes beyond the selected intent.";
+  const core = `Use the attached photograph as the sole visual source. Goal: ${brief} Selected editing instructions: ${requestedWork} Relevant notes: ${observations} Preserve: ${preserve}. Restrictions: ${constraints} Editing strength: ${recipe.strength}. Preserve the original composition and dimensions. Output one colour-managed sRGB PNG.`;
   return {
-    local: `${core} Make only the requested changes and retain natural photographic texture.`,
-    chatgpt: `${core} Treat the source as authoritative; produce a faithful, natural edit rather than a reimagining.`,
-    gemini: `${core} Maintain subject consistency and make no unrequested generative changes.`,
+    local: `Qwen Image Edit instruction. ${core} Make local, targeted changes only. Retain natural photographic texture and leave unaffected areas unchanged.`,
+    chatgpt: `Edit the attached photograph rather than generating a replacement scene. ${core} Inspect the image itself before editing and return only the finished photograph.`,
+    gemini: `Perform a faithful image edit on the attached photograph. ${core} Maintain subject and scene consistency; do not add unrequested generative content.`,
     negative: recipe.negativeConstraints.join(", "),
   };
 };
