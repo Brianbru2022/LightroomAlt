@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/target-fixed/
+.vite/
+coverage/
+*.log
+.env
+ai-worker/.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+src-tauri/icons/

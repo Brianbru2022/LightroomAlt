@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Keepframe",
+  "version": "0.1.0",
+  "identifier": "com.keepframe.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "Keepframe", "width": 1440, "height": 920, "minWidth": 820, "minHeight": 620, "resizable": true, "fullscreen": false }],
+    "security": {
+      "csp": "default-src 'self' asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* https://tile.openstreetmap.org https://*.tile.openstreetmap.org; worker-src 'self' blob:",
+      "assetProtocol": { "enable": true, "scope": ["**"] }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [],
+    "resources": [
+      "resources/exiftool/exiftool-13.59_64/exiftool.exe",
+      "resources/exiftool/exiftool-13.59_64/exiftool_files/**/*",
+      "resources/libraw/libraw-0.22.2-win64/dcraw_emu.exe",
+      "resources/libraw/libraw-0.22.2-win64/libraw.dll",
+      "resources/libraw/libraw-0.22.2-win64/COPYRIGHT",
+      "resources/libraw/libraw-0.22.2-win64/LICENSE.CDDL",
+      "resources/libraw/libraw-0.22.2-win64/LICENSE.LGPL"
+    ]
+  }
+}

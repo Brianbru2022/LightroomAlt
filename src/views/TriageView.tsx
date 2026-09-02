@@ -1,0 +1,92 @@
+import { Check, CircleHelp, Info, MapPin, Maximize2, Sparkles, Tag, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import type { Asset, Decision } from "../types";
+import { formatDate } from "../lib/format";
+
+type Props = {
+  assets: Asset[];
+  total: number;
+  hasMore: boolean;
+  loading: boolean;
+  onLoadMore: () => void;
+  selected: Asset | null;
+  onSelect: (asset: Asset) => void;
+  onDecision: (id: string, decision: Decision) => void;
+  onWorkshop: () => void;
+  onMap: () => void;
+  onTags: (asset: Asset) => void;
+};
+
+export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags }: Props) {
+  const [zoomed, setZoomed] = useState(false);
+  const selectedId = selected?.id;
+  const decisionRef = useRef(onDecision); decisionRef.current = onDecision;
+  const selectRef = useRef(onSelect); selectRef.current = onSelect;
+  const workshopRef = useRef(onWorkshop); workshopRef.current = onWorkshop;
+  const mapRef = useRef(onMap); mapRef.current = onMap;
+  const tagsRef = useRef(onTags); tagsRef.current = onTags;
+  const assetsRef = useRef(assets); assetsRef.current = assets;
+  const selectedRef = useRef(selected); selectedRef.current = selected;
+  const selectedIndex = Math.max(0, assets.findIndex((asset) => asset.id === selectedId));
+  const filmstripStart = Math.max(0, selectedIndex - 30);
+  const filmstripAssets = assets.slice(filmstripStart, selectedIndex + 31);
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable);
+      if (!selectedId || isEditing || event.ctrlKey || event.altKey || event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+        const current = assetsRef.current.findIndex((asset) => asset.id === selectedId);
+        const next = assetsRef.current[current + (event.key === "ArrowLeft" ? -1 : 1)];
+        if (next) {
+          event.preventDefault();
+          selectRef.current(next);
+        }
+        return;
+      }
+      if (key === "e") { event.preventDefault(); workshopRef.current(); return; }
+      if (key === "m") { event.preventDefault(); mapRef.current(); return; }
+      if (key === "t" && selectedRef.current) { event.preventDefault(); tagsRef.current(selectedRef.current); return; }
+      const decision = event.key === "ArrowRight" || key === "k" ? "keep" : event.key === "ArrowLeft" || key === "x" ? "discard" : event.key === "ArrowUp" || key === "u" ? "undecided" : null;
+      if (decision) { event.preventDefault(); decisionRef.current(selectedId, decision); }
+      if (event.code === "Space") { event.preventDefault(); setZoomed((value) => !value); }
+    };
+    window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
+  }, [selectedId]);
+
+  if (!selected) return <main className="view empty-state"><CircleHelp size={42} /><h2>Nothing to triage</h2></main>;
+  return (
+    <main className="view triage-view">
+      <div className="triage-stage">
+        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img src={selected.preferredVersionUrl ?? selected.previewUrl} alt={selected.filename} /></div>
+        <div className="triage-actions">
+          <button className={`triage-button discard ${selected.decision === "discard" ? "active" : ""}`} onClick={() => onDecision(selected.id, "discard")}><X size={20} /><span>Discard</span><kbd>←</kbd></button>
+          <button className={`triage-button undecided ${selected.decision === "undecided" ? "active" : ""}`} onClick={() => onDecision(selected.id, "undecided")}><CircleHelp size={20} /><span>Undecided</span><kbd>↑</kbd></button>
+          <button className={`triage-button keep ${selected.decision === "keep" ? "active" : ""}`} onClick={() => onDecision(selected.id, "keep")}><Check size={20} /><span>Keep</span><kbd>→</kbd></button>
+        </div>
+        <div className="filmstrip" aria-label="Triage filmstrip">
+          {filmstripStart > 0 ? <span className="filmstrip-count">+{filmstripStart} earlier</span> : null}
+          {filmstripAssets.map((asset) => <button key={asset.id} className={asset.id === selected.id ? "active" : ""} onClick={() => onSelect(asset)}><img src={asset.thumbnailUrl} alt={asset.filename} /><span className={`mini-state ${asset.decision}`} /></button>)}
+          {hasMore ? <button className="filmstrip-more" disabled={loading} onClick={onLoadMore}>{loading ? "…" : `+${Math.max(0, total - assets.length)}`}</button> : assets.length > filmstripStart + filmstripAssets.length ? <span className="filmstrip-count">+{assets.length - filmstripStart - filmstripAssets.length} later</span> : null}
+        </div>
+      </div>
+      <aside className="inspector">
+        <div className="inspector-heading"><div><span className="eyebrow">Current frame</span><h2>{selected.filename}</h2></div><Info size={18} /></div>
+        <dl className="metadata-list">
+          <div><dt>Captured</dt><dd>{formatDate(selected.capturedAt, { dateStyle: "medium", timeStyle: "short" })}{selected.dateFallback ? <em>File date</em> : null}</dd></div>
+          <div><dt>Camera</dt><dd>{selected.camera ?? "Unknown"}</dd></div>
+          <div><dt>Dimensions</dt><dd>{selected.width} × {selected.height}</dd></div>
+          <div><dt>Files</dt><dd>{selected.representationCount > 1 ? `${selected.representationCount} paired representations` : "1 original"}</dd></div>
+        </dl>
+        <div className="tag-list">{selected.tags.map((tag) => <span key={tag}>{tag}</span>)}<button onClick={() => onTags(selected)}><Tag size={13} /> Edit <kbd>T</kbd></button></div>
+        <div className="inspector-actions">
+          <button onClick={onWorkshop}><Sparkles size={17} /> Edit with AI <kbd>E</kbd></button>
+          <button onClick={onMap}><MapPin size={17} /> Show on map <kbd>M</kbd></button>
+          <button onClick={() => setZoomed((value) => !value)}><Maximize2 size={17} /> {zoomed ? "Fit image" : "View at 100%"} <kbd>Space</kbd></button>
+        </div>
+        <div className="safety-note"><Check size={15} /><span>Original protected<br /><small>Shift + ←/→ browses without deciding. Ctrl+Z undoes the latest change.</small></span></div>
+      </aside>
+    </main>
+  );
+}
