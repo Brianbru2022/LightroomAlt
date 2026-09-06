@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { Asset, AssetFilter, AssetPage, AssetVersion, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, ImportSummary, LibraryStatus, PromptSet, ServiceHealth, TrashSummary } from "../types";
+import type { Asset, AssetFilter, AssetPage, AssetVersion, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, ImportSummary, LibraryStatus, PromptSet, ServiceHealth, TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -194,6 +194,14 @@ export const api = {
   },
   async setPreferredVersion(assetId: string, versionId?: string): Promise<void> {
     if (tauri()) return invoke("set_preferred_version", { assetId, versionId: versionId ?? null });
+  },
+  async autoBasicAdjustments(assetId: string): Promise<BasicAdjustments> {
+    if (tauri()) return invoke("auto_basic_adjustments", { assetId });
+    return { exposure: 0, lightBalance: 0, dynamicRange: 100, colourBoost: 10 };
+  },
+  async applyBasicAdjustments(asset: Asset, adjustments: BasicAdjustments): Promise<AssetVersion> {
+    if (tauri()) return withVersionUrl(await invoke<AssetVersion>("apply_basic_adjustments", { assetId: asset.id, adjustments }));
+    return { id: crypto.randomUUID(), kind: "adjusted", provider: "keepframe-controls", createdAt: new Date().toISOString(), state: "candidate", imageUrl: asset.preferredVersionUrl ?? asset.previewUrl, isPreferred: false };
   },
   async chooseReplacement(asset: Asset): Promise<AssetVersion | null> {
     if (!tauri()) return null;

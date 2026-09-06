@@ -1,6 +1,6 @@
-import { Check, ChevronDown, Clipboard, Cloud, Cpu, Download, FolderOutput, LoaderCircle, Play, RotateCcw, Sparkles, Upload } from "lucide-react";
+import { Check, ChevronDown, Clipboard, Cloud, Cpu, Download, FolderOutput, LoaderCircle, Play, RotateCcw, SlidersHorizontal, Sparkles, SunMedium, Upload, WandSparkles } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { Asset, AssetVersion, BatchJob, EditIntent, EditRecipe, PreserveConstraint, PromptSet, ServiceHealth } from "../types";
+import type { Asset, AssetVersion, BasicAdjustments, BatchJob, EditIntent, EditRecipe, PreserveConstraint, PromptSet, ServiceHealth } from "../types";
 import { displayIntent } from "../lib/format";
 
 const intents: EditIntent[] = ["restoration", "scratch_repair", "denoise", "sharpen", "upscale", "lighting_correction", "object_removal", "sky_replacement", "colourisation", "custom"];
@@ -20,6 +20,8 @@ type Props = {
   onLoadVersions: (asset: Asset) => Promise<AssetVersion[]>;
   onSetPreferred: (assetId: string, versionId?: string) => Promise<void>;
   onReplace: (asset: Asset) => Promise<void>;
+  onAutoAdjustments: (assetId: string) => Promise<BasicAdjustments>;
+  onApplyAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<AssetVersion>;
   onEnqueue: (assetIds: string[], brief: string) => Promise<void>;
   onRunLocal: (assetId: string, recipe: EditRecipe, prompt: string) => Promise<void>;
   onJob: (id: string, action: "approve" | "cancel" | "retry" | "accept" | "reject") => Promise<void>;
@@ -57,7 +59,20 @@ function BatchRecipeReview({ job, onSave }: { job: BatchJob; onSave: Props["onSa
   );
 }
 
-export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onReplace, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
+function AdjustmentSlider({ label, value, min, max, step, suffix = "", low, high, onChange }: { label: string; value: number; min: number; max: number; step: number; suffix?: string; low?: string; high?: string; onChange: (value: number) => void }) {
+  const shown = `${value > 0 ? "+" : ""}${Number.isInteger(value) ? value : value.toFixed(2)}${suffix}`;
+  return (
+    <label className="adjustment-slider">
+      <span><strong>{label}</strong><output>{shown}</output></span>
+      <input aria-label={label} type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+      {low && high ? <small><span>{low}</span><span>{high}</span></small> : null}
+    </label>
+  );
+}
+
+const neutralAdjustments: BasicAdjustments = { exposure: 0, lightBalance: 0, dynamicRange: 0, colourBoost: 0 };
+
+export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onReplace, onAutoAdjustments, onApplyAdjustments, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
   const [intent, setIntent] = useState<EditIntent>("restoration");
   const [brief, setBrief] = useState("Restore naturally, retain character and make no unrequested changes.");
   const [recipe, setRecipe] = useState<EditRecipe | null>(null);
@@ -67,13 +82,15 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   const [copied, setCopied] = useState(false);
   const [versions, setVersions] = useState<AssetVersion[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState<string>("");
+  const [adjustments, setAdjustments] = useState<BasicAdjustments>(neutralAdjustments);
+  const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const refreshVersions = async (current: Asset) => {
     const next = await onLoadVersions(current);
     setVersions(next);
     setSelectedVersionId((selected) => next.some((item) => item.id === selected) ? selected : next.find((item) => item.isPreferred)?.id ?? next[0]?.id ?? "");
   };
   useEffect(() => {
-    setRecipe(null); setPrompts(null); setVersions([]); setSelectedVersionId("");
+    setRecipe(null); setPrompts(null); setVersions([]); setSelectedVersionId(""); setAdjustments(neutralAdjustments);
     if (asset) void refreshVersions(asset);
   }, [asset?.id]);
   const selectedVersion = versions.find((item) => item.id === selectedVersionId) ?? versions[0];
@@ -93,6 +110,23 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   };
   const recipeLines = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean);
   const copy = async () => { if (!prompts) return; await onCopy(prompts[provider]); setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
+  const setAdjustment = (key: keyof BasicAdjustments, value: number) => setAdjustments((current) => ({ ...current, [key]: value }));
+  const autoAdjust = async () => {
+    if (!asset) return;
+    setAdjusting("auto");
+    try { setAdjustments(await onAutoAdjustments(asset.id)); } finally { setAdjusting(null); }
+  };
+  const applyAdjustments = async () => {
+    if (!asset) return;
+    setAdjusting("apply");
+    try {
+      const version = await onApplyAdjustments(asset, adjustments);
+      await refreshVersions(asset);
+      setSelectedVersionId(version.id);
+    } finally { setAdjusting(null); }
+  };
+  const previewFilter = `brightness(${2 ** adjustments.exposure}) contrast(${1 + adjustments.dynamicRange / 250}) saturate(${1 + adjustments.colourBoost / 100})`;
+  const temperatureColour = adjustments.lightBalance >= 0 ? `rgba(255, 152, 72, ${adjustments.lightBalance / 500})` : `rgba(77, 151, 255, ${Math.abs(adjustments.lightBalance) / 500})`;
 
   return (
     <main className="view workshop-view">
@@ -101,7 +135,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
         {!asset ? <div className="empty-state"><Sparkles size={42} /><h2>Select a photograph</h2><p>Choose a frame in the Library or Triage view first.</p></div> : (
           <>
             <div className="workbench">
-              <div className="source-preview"><img src={asset.preferredVersionUrl ?? asset.previewUrl} alt={asset.filename} /><span>{asset.preferredVersionUrl ? "Preferred derived version" : "Protected original"}</span></div>
+              <div className="source-preview"><img style={{ filter: previewFilter }} src={asset.preferredVersionUrl ?? asset.previewUrl} alt={asset.filename} /><i className="tone-preview-overlay" style={{ background: temperatureColour }} aria-hidden="true" /><span>{asset.preferredVersionUrl ? "Preferred derived version" : "Protected original"} · live adjustment preview</span></div>
               <div className="workbench-controls">
                 <label><span>What should change?</span><div className="select-wrap"><select value={intent} onChange={(event) => setIntent(event.target.value as EditIntent)}>{intents.map((item) => <option key={item} value={item}>{displayIntent(item)}</option>)}</select><ChevronDown size={15} /></div></label>
                 <label><span>Your brief</span><textarea value={brief} onChange={(event) => setBrief(event.target.value)} rows={4} /></label>
@@ -109,6 +143,17 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
                 <small className={serviceHealth.analysisAvailable ? "privacy-line" : "local-warning"}><Cpu size={13} /> {serviceHealth.analysisAvailable ? "Vision analysis is local; no photograph is uploaded." : serviceHealth.analysisDetail}</small>
               </div>
             </div>
+            <section className="adjustment-panel" aria-labelledby="adjustments-heading">
+              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => setAdjustments(neutralAdjustments)}><RotateCcw size={15} /> Reset</button></div>
+              <div className="adjustment-controls">
+                <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
+                <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />
+                <AdjustmentSlider label="Dynamic range" value={adjustments.dynamicRange} min={-100} max={100} step={1} low="Softer" high="Wider" onChange={(value) => setAdjustment("dynamicRange", value)} />
+                <AdjustmentSlider label="Colour boost" value={adjustments.colourBoost} min={-50} max={50} step={1} low="Muted" high="Richer" onChange={(value) => setAdjustment("colourBoost", value)} />
+              </div>
+              <div className="auto-range"><SunMedium size={20} /><div><strong>Protected maximum range</strong><span>Balances the useful shadows and highlights, retains extreme tonal tails and adds only a slight adaptive colour boost.</span></div><button className="primary-button" disabled={adjusting !== null} onClick={autoAdjust}>{adjusting === "auto" ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />} Maximise range</button></div>
+              <div className="adjustment-actions"><span>Live preview is approximate. The saved PNG uses the full-resolution colour-managed source.</span><button className="primary-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />} Save candidate version</button></div>
+            </section>
             <section className="version-panel" aria-labelledby="versions-heading">
               <div className="version-heading"><div><span className="step-number">V</span><div><h2 id="versions-heading">Versions & comparison</h2><p>Changing the displayed version never changes the photograph’s date, GPS, tags or decision.</p></div></div><button className="quiet-button" onClick={async () => { await onReplace(asset); await refreshVersions(asset); }}><Upload size={15} /> Replace with image</button></div>
               <div className="comparison-grid">

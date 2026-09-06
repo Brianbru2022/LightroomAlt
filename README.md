@@ -11,8 +11,9 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 3. Browse the timeline, tags and OpenStreetMap-backed map; click the map to place an unlocated photograph.
 4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
-6. Create and edit a provider-specific recipe for local Qwen editing, ChatGPT or Gemini.
-7. Export a full-resolution sRGB PNG for an external service and import the returned image as a traceable candidate version.
+6. Make simple non-destructive exposure, light-balance, dynamic-range and colour adjustments, including a protected automatic range option.
+7. Create and edit a provider-specific recipe for local Qwen editing, ChatGPT or Gemini.
+8. Export a full-resolution sRGB PNG for an external service and import the returned image as a traceable candidate version.
 
 Catalogue, triage and manual external-edit workflows work without either optional AI service. Keepframe does not submit to ChatGPT or Gemini APIs and stores no cloud API keys.
 

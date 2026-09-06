@@ -113,6 +113,13 @@ export type EditRecipe = {
 
 export type PromptSet = { local: string; chatgpt: string; gemini: string; negative: string };
 
+export type BasicAdjustments = {
+  exposure: number;
+  lightBalance: number;
+  dynamicRange: number;
+  colourBoost: number;
+};
+
 export type JobAttempt = {
   attemptNumber: number;
   state: "running" | "succeeded" | "failed" | "cancelled";

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
-use image::{ImageDecoder, ImageFormat};
+use image::{ImageDecoder, ImageFormat, RgbImage};
 use reqwest::multipart;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -135,6 +135,40 @@ struct AssetVersion {
     is_preferred: bool,
     source_hash: Option<String>,
     output_hash: Option<String>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct BasicAdjustments {
+    exposure: f32,
+    light_balance: f32,
+    dynamic_range: f32,
+    colour_boost: f32,
+}
+
+impl BasicAdjustments {
+    fn validate(self) -> Result<Self> {
+        let valid = self.exposure.is_finite()
+            && (-2.0..=2.0).contains(&self.exposure)
+            && self.light_balance.is_finite()
+            && (-100.0..=100.0).contains(&self.light_balance)
+            && self.dynamic_range.is_finite()
+            && (-100.0..=100.0).contains(&self.dynamic_range)
+            && self.colour_boost.is_finite()
+            && (-50.0..=50.0).contains(&self.colour_boost);
+        if !valid {
+            return Err(KeepframeError::Message(
+                "One or more adjustment values are outside the supported range.".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+struct AdjustmentInput {
+    path: PathBuf,
+    source_hash: String,
+    captured_at: String,
+    expected_dimensions: Option<(u32, u32)>,
 }
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1455,6 +1489,218 @@ fn encode_srgb_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
         encoder.write_header()?.write_image_data(rgb.as_raw())?;
     }
     Ok(bytes)
+}
+
+fn adjustment_input(connection: &Connection, asset_id: &str) -> Result<AdjustmentInput> {
+    let (captured, width, height, preferred): (String, Option<u32>, Option<u32>, Option<String>) = connection.query_row(
+        "SELECT captured_at,width,height,preferred_version_id FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if let Some(version_id) = preferred {
+        let (path, stored_hash): (String, Option<String>) = connection.query_row(
+            "SELECT path,output_hash FROM versions WHERE id=?1 AND asset_id=?2 AND state!='rejected'",
+            params![version_id, asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let path = PathBuf::from(path);
+        let source_hash = stored_hash.unwrap_or(hash_file(&path)?);
+        return Ok(AdjustmentInput {
+            path,
+            source_hash,
+            captured_at: captured,
+            expected_dimensions: None,
+        });
+    }
+    let (path, source_hash): (String, String) = connection.query_row(
+        "SELECT path,sha256 FROM representations WHERE asset_id=?1 ORDER BY CASE WHEN lower(extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN is_raw=1 THEN 1 ELSE 2 END,path LIMIT 1",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(AdjustmentInput {
+        path: PathBuf::from(path),
+        source_hash,
+        captured_at: captured,
+        expected_dimensions: width.zip(height),
+    })
+}
+
+fn protected_endpoints(image: &RgbImage) -> (f32, f32) {
+    let mut histogram = [0_u64; 256];
+    for pixel in image.pixels() {
+        for channel in pixel.0 {
+            histogram[channel as usize] += 1;
+        }
+    }
+    let total = image.width() as u64 * image.height() as u64 * 3;
+    let tail = ((total as f64 * 0.0005).round() as u64).max(1);
+    let percentile = |target: u64| {
+        let mut seen = 0_u64;
+        for (index, count) in histogram.iter().enumerate() {
+            seen += count;
+            if seen >= target {
+                return index as f32 / 255.0;
+            }
+        }
+        1.0
+    };
+    (percentile(tail), percentile(total.saturating_sub(tail)))
+}
+
+fn protected_expand(value: f32, low: f32, high: f32) -> f32 {
+    if high - low < 0.02 {
+        return value;
+    }
+    if value < low && low > 0.0 {
+        return 0.01 * value / low;
+    }
+    if value > high && high < 1.0 {
+        return 0.99 + 0.01 * (value - high) / (1.0 - high);
+    }
+    0.01 + 0.98 * (value - low) / (high - low)
+}
+
+fn apply_adjustments_to_image(
+    image: &image::DynamicImage,
+    adjustments: BasicAdjustments,
+) -> RgbImage {
+    let adjustments = adjustments.validate().expect("validated adjustment values");
+    let mut output = image.to_rgb8();
+    let (low, high) = protected_endpoints(&output);
+    let range_amount = (adjustments.dynamic_range / 100.0).clamp(-1.0, 1.0);
+    let temperature = adjustments.light_balance / 100.0 * 0.18;
+    let exposure = 2_f32.powf(adjustments.exposure);
+    let colour = adjustments.colour_boost / 100.0;
+    for pixel in output.pixels_mut() {
+        let mut values = [
+            pixel[0] as f32 / 255.0 * (1.0 + temperature),
+            pixel[1] as f32 / 255.0,
+            pixel[2] as f32 / 255.0 * (1.0 - temperature),
+        ];
+        for value in &mut values {
+            let current = value.clamp(0.0, 1.0);
+            *value = if range_amount >= 0.0 {
+                current + (protected_expand(current, low, high) - current) * range_amount
+            } else {
+                0.5 + (current - 0.5) * (1.0 + range_amount * 0.5)
+            };
+            *value = (*value * exposure).clamp(0.0, 1.0);
+        }
+        let maximum = values.iter().copied().fold(0.0_f32, f32::max);
+        let minimum = values.iter().copied().fold(1.0_f32, f32::min);
+        let luminance = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
+        let saturation = if maximum > 0.0 {
+            (maximum - minimum) / maximum
+        } else {
+            0.0
+        };
+        let mut colour_factor = if colour >= 0.0 {
+            1.0 + colour * 1.2 * (1.0 - saturation)
+        } else {
+            1.0 + colour
+        };
+        if maximum > luminance {
+            colour_factor = colour_factor.min((1.0 - luminance) / (maximum - luminance));
+        }
+        if minimum < luminance {
+            colour_factor = colour_factor.min(luminance / (luminance - minimum));
+        }
+        for (index, value) in values.iter().enumerate() {
+            pixel[index] = ((luminance + (*value - luminance) * colour_factor).clamp(0.0, 1.0)
+                * 255.0)
+                .round() as u8;
+        }
+    }
+    output
+}
+
+fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments {
+    let rgb = image.to_rgb8();
+    let step = ((rgb.width() as usize * rgb.height() as usize) / 250_000).max(1);
+    let mut saturation_total = 0.0_f64;
+    let mut samples = 0_u64;
+    for pixel in rgb.pixels().step_by(step) {
+        let maximum = *pixel.0.iter().max().unwrap_or(&0) as f64 / 255.0;
+        let minimum = *pixel.0.iter().min().unwrap_or(&0) as f64 / 255.0;
+        saturation_total += if maximum > 0.0 {
+            (maximum - minimum) / maximum
+        } else {
+            0.0
+        };
+        samples += 1;
+    }
+    let average_saturation = if samples > 0 {
+        saturation_total / samples as f64
+    } else {
+        0.0
+    };
+    BasicAdjustments {
+        exposure: 0.0,
+        light_balance: 0.0,
+        dynamic_range: 100.0,
+        colour_boost: if average_saturation < 0.2 {
+            12.0
+        } else if average_saturation < 0.4 {
+            9.0
+        } else {
+            6.0
+        },
+    }
+}
+
+#[tauri::command]
+async fn auto_basic_adjustments(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<BasicAdjustments> {
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<BasicAdjustments> {
+        let connection = open_db(&root)?;
+        let input = adjustment_input(&connection, &asset_id)?;
+        let image = prepare_full_resolution_image(
+            &input.path,
+            input.expected_dimensions,
+            &root.join(".keepframe/staging/working"),
+        )?;
+        Ok(suggested_basic_adjustments(&image))
+    })
+    .await
+    .map_err(|error| {
+        KeepframeError::Message(format!("Automatic adjustment analysis failed: {error}"))
+    })?
+}
+
+#[tauri::command]
+async fn apply_basic_adjustments(
+    asset_id: String,
+    adjustments: BasicAdjustments,
+    state: State<'_, AppState>,
+) -> Result<AssetVersion> {
+    let adjustments = adjustments.validate()?;
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<AssetVersion> {
+        let mut connection = open_db(&root)?;
+        let input = adjustment_input(&connection, &asset_id)?;
+        let image = prepare_full_resolution_image(&input.path, input.expected_dimensions, &root.join(".keepframe/staging/working"))?;
+        let adjusted = image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, adjustments));
+        let captured = DateTime::parse_from_rfc3339(&input.captured_at).map(|value| value.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
+        let version_id = Uuid::new_v4().to_string();
+        let output_dir = root.join("Edits").join(format!("{:04}", captured.year())).join(format!("{:02}", captured.month())).join(format!("{:02}", captured.day())).join(&asset_id);
+        fs::create_dir_all(&output_dir)?;
+        let output = output_dir.join(format!("adjusted-{}-{}.png", Local::now().format("%H%M%S"), &version_id[..8]));
+        let temporary = output.with_extension("png.tmp");
+        fs::write(&temporary, encode_srgb_png(&adjusted)?)?;
+        fs::rename(&temporary, &output)?;
+        let output_hash = hash_file(&output)?;
+        let now = Utc::now().to_rfc3339();
+        let summary = format!("Exposure {:+.2} EV; light balance {:+.0}; dynamic range {:+.0}; colour boost {:+.0}", adjustments.exposure, adjustments.light_balance, adjustments.dynamic_range, adjustments.colour_boost);
+        let recipe_json = serde_json::to_string(&adjustments)?;
+        let tx = connection.transaction()?;
+        tx.execute("INSERT INTO versions(id,asset_id,kind,path,provider,prompt,recipe_json,source_hash,output_hash,state,created_at)VALUES(?1,?2,'adjusted',?3,'keepframe-controls',?4,?5,?6,?7,'candidate',?8)", params![version_id,asset_id,output.to_string_lossy(),summary,recipe_json,input.source_hash,output_hash,now])?;
+        tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,new_json,created_at)VALUES('version',?1,'create_adjusted_version',?2,?3)", params![version_id,recipe_json,now])?;
+        tx.commit()?;
+        Ok(AssetVersion { id: version_id, kind: "adjusted".into(), provider: Some("keepframe-controls".into()), created_at: now, state: "candidate".into(), image_url: output.to_string_lossy().into(), prompt: Some(summary), is_preferred: false, source_hash: Some(input.source_hash), output_hash: Some(output_hash) })
+    }).await.map_err(|error| KeepframeError::Message(format!("Saving adjusted version failed: {error}")))?
 }
 
 #[tauri::command]
@@ -3806,6 +4052,8 @@ pub fn run() {
             approve_jobs,
             list_versions,
             set_preferred_version,
+            auto_basic_adjustments,
+            apply_basic_adjustments,
             import_replacement,
             export_external_edit,
             prepare_cloud_export,
@@ -3836,6 +4084,57 @@ mod tests {
         assert_eq!(len, values.len());
         assert!(SUPPORTED.contains(&"cr3"));
         assert!(SUPPORTED.contains(&"heic"));
+    }
+
+    #[test]
+    fn adjustment_ranges_are_validated() {
+        let neutral = BasicAdjustments {
+            exposure: 0.0,
+            light_balance: 0.0,
+            dynamic_range: 0.0,
+            colour_boost: 0.0,
+        };
+        assert_eq!(neutral.validate().unwrap(), neutral);
+        assert!(BasicAdjustments {
+            exposure: 2.1,
+            ..neutral
+        }
+        .validate()
+        .is_err());
+        assert!(BasicAdjustments {
+            dynamic_range: f32::NAN,
+            ..neutral
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn protected_range_expansion_retains_tonal_tails() {
+        let mut source = RgbImage::new(256, 1);
+        for (index, pixel) in source.pixels_mut().enumerate() {
+            *pixel = image::Rgb([index as u8, index as u8, index as u8]);
+        }
+        let settings = BasicAdjustments {
+            exposure: 0.0,
+            light_balance: 0.0,
+            dynamic_range: 100.0,
+            colour_boost: 10.0,
+        };
+        let output = apply_adjustments_to_image(&image::DynamicImage::ImageRgb8(source), settings);
+        assert!(output.get_pixel(0, 0)[0] > 0);
+        assert!(output.get_pixel(255, 0)[0] < 255);
+        assert!(output.get_pixel(128, 0)[0] > output.get_pixel(64, 0)[0]);
+    }
+
+    #[test]
+    fn automatic_range_uses_a_restrained_colour_boost() {
+        let source =
+            image::DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 8, image::Rgb([90, 92, 94])));
+        let settings = suggested_basic_adjustments(&source);
+        assert_eq!(settings.exposure, 0.0);
+        assert_eq!(settings.dynamic_range, 100.0);
+        assert!((6.0..=12.0).contains(&settings.colour_boost));
     }
 
     #[test]
