@@ -22,6 +22,7 @@ type Props = {
   onSetPreferred: (assetId: string, versionId?: string) => Promise<void>;
   onReplace: (asset: Asset) => Promise<void>;
   onAutoAdjustments: (assetId: string) => Promise<BasicAdjustments>;
+  onPreviewAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<string>;
   onApplyAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<AssetVersion>;
   onEnqueue: (assetIds: string[], brief: string) => Promise<void>;
   onRunLocal: (assetId: string, recipe: EditRecipe, prompt: string) => Promise<void>;
@@ -62,7 +63,7 @@ function BatchRecipeReview({ job, onSave }: { job: BatchJob; onSave: Props["onSa
 
 const neutralAdjustments: BasicAdjustments = { exposure: 0, lightBalance: 0, dynamicRange: 0, colourBoost: 0 };
 
-export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onReplace, onAutoAdjustments, onApplyAdjustments, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
+export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onReplace, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
   const [intent, setIntent] = useState<EditIntent>("restoration");
   const [brief, setBrief] = useState("Restore naturally, retain character and make no unrequested changes.");
   const [recipe, setRecipe] = useState<EditRecipe | null>(null);
@@ -74,13 +75,14 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   const [selectedVersionId, setSelectedVersionId] = useState<string>("");
   const [adjustments, setAdjustments] = useState<BasicAdjustments>(neutralAdjustments);
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
+  const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
   const refreshVersions = async (current: Asset) => {
     const next = await onLoadVersions(current);
     setVersions(next);
     setSelectedVersionId((selected) => next.some((item) => item.id === selected) ? selected : next.find((item) => item.isPreferred)?.id ?? next[0]?.id ?? "");
   };
   useEffect(() => {
-    setRecipe(null); setPrompts(null); setVersions([]); setSelectedVersionId(""); setAdjustments(neutralAdjustments);
+    setRecipe(null); setPrompts(null); setVersions([]); setSelectedVersionId(""); setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null);
     if (asset) void refreshVersions(asset);
   }, [asset?.id]);
   const selectedVersion = versions.find((item) => item.id === selectedVersionId) ?? versions[0];
@@ -100,11 +102,15 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   };
   const recipeLines = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean);
   const copy = async () => { if (!prompts) return; await onCopy(prompts[provider]); setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
-  const setAdjustment = (key: keyof BasicAdjustments, value: number) => setAdjustments((current) => ({ ...current, [key]: value }));
+  const setAdjustment = (key: keyof BasicAdjustments, value: number) => { setAdjustmentPreviewUrl(null); setAdjustments((current) => ({ ...current, [key]: value })); };
   const autoAdjust = async () => {
     if (!asset) return;
     setAdjusting("auto");
-    try { setAdjustments(await onAutoAdjustments(asset.id)); } finally { setAdjusting(null); }
+    try {
+      const next = await onAutoAdjustments(asset.id);
+      setAdjustments(next);
+      setAdjustmentPreviewUrl(await onPreviewAdjustments(asset, next));
+    } finally { setAdjusting(null); }
   };
   const applyAdjustments = async () => {
     if (!asset) return;
@@ -125,7 +131,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
         {!asset ? <div className="empty-state"><Sparkles size={42} /><h2>Select a photograph</h2><p>Choose a frame in the Library or Triage view first.</p></div> : (
           <>
             <div className="workbench">
-              <div className="source-preview"><img style={{ filter: previewFilter }} src={asset.preferredVersionUrl ?? asset.previewUrl} alt={asset.filename} /><i className="tone-preview-overlay" style={{ background: temperatureColour }} aria-hidden="true" /><span>{asset.preferredVersionUrl ? "Preferred derived version" : "Protected original"} · live adjustment preview</span></div>
+              <div className="source-preview"><img style={{ filter: adjustmentPreviewUrl ? undefined : previewFilter }} src={adjustmentPreviewUrl || asset.preferredVersionUrl || asset.previewUrl} alt={asset.filename} /><i className="tone-preview-overlay" style={{ background: adjustmentPreviewUrl ? "transparent" : temperatureColour }} aria-hidden="true" /><span>{asset.preferredVersionUrl ? "Preferred derived version" : "Protected original"} · live adjustment preview</span></div>
               <div className="workbench-controls">
                 <label><span>What should change?</span><div className="select-wrap"><select value={intent} onChange={(event) => setIntent(event.target.value as EditIntent)}>{intents.map((item) => <option key={item} value={item}>{displayIntent(item)}</option>)}</select><ChevronDown size={15} /></div></label>
                 <label><span>Your brief</span><textarea value={brief} onChange={(event) => setBrief(event.target.value)} rows={4} /></label>
@@ -134,7 +140,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
               </div>
             </div>
             <section className="adjustment-panel" aria-labelledby="adjustments-heading">
-              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => setAdjustments(neutralAdjustments)}><RotateCcw size={15} /> Reset</button></div>
+              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => { setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={15} /> Reset</button></div>
               <div className="adjustment-controls">
                 <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
                 <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />

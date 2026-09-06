@@ -1551,13 +1551,7 @@ fn protected_expand(value: f32, low: f32, high: f32) -> f32 {
     if high - low < 0.02 {
         return value;
     }
-    if value < low && low > 0.0 {
-        return 0.01 * value / low;
-    }
-    if value > high && high < 1.0 {
-        return 0.99 + 0.01 * (value - high) / (1.0 - high);
-    }
-    0.01 + 0.98 * (value - low) / (high - low)
+    ((value - low) / (high - low)).clamp(0.0, 1.0)
 }
 
 fn apply_adjustments_to_image(
@@ -1656,18 +1650,57 @@ async fn auto_basic_adjustments(
     let root = root_from(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<BasicAdjustments> {
         let connection = open_db(&root)?;
-        let input = adjustment_input(&connection, &asset_id)?;
-        let image = prepare_full_resolution_image(
-            &input.path,
-            input.expected_dimensions,
-            &root.join(".keepframe/staging/working"),
+        let preview: String = connection.query_row(
+            "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",
+            [&asset_id],
+            |row| row.get(0),
         )?;
+        let image = image::open(preview)?;
         Ok(suggested_basic_adjustments(&image))
     })
     .await
     .map_err(|error| {
         KeepframeError::Message(format!("Automatic adjustment analysis failed: {error}"))
     })?
+}
+
+#[tauri::command]
+async fn preview_basic_adjustments(
+    asset_id: String,
+    adjustments: BasicAdjustments,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let adjustments = adjustments.validate()?;
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<String> {
+        let connection = open_db(&root)?;
+        let preview: String = connection.query_row(
+            "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",
+            [&asset_id],
+            |row| row.get(0),
+        )?;
+        let image = image::open(preview)?;
+        let adjusted =
+            image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, adjustments));
+        let settings = serde_json::to_vec(&adjustments)?;
+        let mut digest = Sha256::new();
+        digest.update(asset_id.as_bytes());
+        digest.update(settings);
+        let key = format!("{:x}", digest.finalize());
+        let output = root.join(".keepframe/previews").join(format!(
+            "adjustment-{}-{}.png",
+            asset_id,
+            &key[..12]
+        ));
+        if !output.exists() {
+            let temporary = output.with_extension("png.tmp");
+            fs::write(&temporary, encode_srgb_png(&adjusted)?)?;
+            fs::rename(&temporary, &output)?;
+        }
+        Ok(output.to_string_lossy().into())
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Adjustment preview failed: {error}")))?
 }
 
 #[tauri::command]
@@ -4053,6 +4086,7 @@ pub fn run() {
             list_versions,
             set_preferred_version,
             auto_basic_adjustments,
+            preview_basic_adjustments,
             apply_basic_adjustments,
             import_replacement,
             export_external_edit,
@@ -4110,10 +4144,17 @@ mod tests {
     }
 
     #[test]
-    fn protected_range_expansion_retains_tonal_tails() {
-        let mut source = RgbImage::new(256, 1);
+    fn protected_range_expansion_reaches_black_and_white_with_minimal_tail_clipping() {
+        let mut source = RgbImage::new(4_000, 1);
         for (index, pixel) in source.pixels_mut().enumerate() {
-            *pixel = image::Rgb([index as u8, index as u8, index as u8]);
+            let value = if index == 0 {
+                0
+            } else if index == 3_999 {
+                255
+            } else {
+                20 + ((index - 1) * 210 / 3_997) as u8
+            };
+            *pixel = image::Rgb([value, value, value]);
         }
         let settings = BasicAdjustments {
             exposure: 0.0,
@@ -4122,9 +4163,9 @@ mod tests {
             colour_boost: 10.0,
         };
         let output = apply_adjustments_to_image(&image::DynamicImage::ImageRgb8(source), settings);
-        assert!(output.get_pixel(0, 0)[0] > 0);
-        assert!(output.get_pixel(255, 0)[0] < 255);
-        assert!(output.get_pixel(128, 0)[0] > output.get_pixel(64, 0)[0]);
+        assert_eq!(output.get_pixel(1, 0)[0], 0);
+        assert_eq!(output.get_pixel(3_998, 0)[0], 255);
+        assert!(output.get_pixel(2_000, 0)[0] > output.get_pixel(1_000, 0)[0]);
     }
 
     #[test]

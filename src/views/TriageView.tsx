@@ -18,19 +18,21 @@ type Props = {
   onMap: () => void;
   onTags: (asset: Asset) => void;
   onAutoAdjustments: (assetId: string) => Promise<BasicAdjustments>;
+  onPreviewAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<string>;
   onApplyAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<AssetVersion>;
   onAdjustmentSaved: () => void;
 };
 
 const neutralAdjustments: BasicAdjustments = { exposure: 0, lightBalance: 0, dynamicRange: 0, colourBoost: 0 };
 
-export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags, onAutoAdjustments, onApplyAdjustments, onAdjustmentSaved }: Props) {
+export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onAdjustmentSaved }: Props) {
   const [zoomed, setZoomed] = useState(false);
   const [reviewUrl, setReviewUrl] = useState<string | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [adjustments, setAdjustments] = useState<BasicAdjustments>(neutralAdjustments);
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
+  const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
   const selectedId = selected?.id;
   const decisionRef = useRef(onDecision); decisionRef.current = onDecision;
   const selectRef = useRef(onSelect); selectRef.current = onSelect;
@@ -42,7 +44,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const selectedIndex = Math.max(0, assets.findIndex((asset) => asset.id === selectedId));
   const filmstripStart = Math.max(0, selectedIndex - 30);
   const filmstripAssets = assets.slice(filmstripStart, selectedIndex + 31);
-  useEffect(() => { setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); }, [selectedId]);
+  useEffect(() => { setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); setAdjustmentPreviewUrl(null); }, [selectedId]);
   const toggleZoom = () => {
     if (zoomed) { setZoomed(false); return; }
     if (!selected) return;
@@ -74,11 +76,15 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [selectedId]);
 
-  const setAdjustment = (key: keyof BasicAdjustments, value: number) => setAdjustments((current) => ({ ...current, [key]: value }));
+  const setAdjustment = (key: keyof BasicAdjustments, value: number) => { setAdjustmentPreviewUrl(null); setAdjustments((current) => ({ ...current, [key]: value })); };
   const autoAdjust = async () => {
     if (!selected) return;
     setAdjusting("auto"); setAdjustmentError(null);
-    try { setAdjustments(await onAutoAdjustments(selected.id)); } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
+    try {
+      const next = await onAutoAdjustments(selected.id);
+      setAdjustments(next);
+      setAdjustmentPreviewUrl(await onPreviewAdjustments(selected, next));
+    } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
   };
   const applyAdjustments = async () => {
     if (!selected) return;
@@ -92,7 +98,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   return (
     <main className="view triage-view">
       <div className="triage-stage">
-        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img style={{ filter: previewFilter }} src={zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl} alt={selected.filename} /><i className="tone-preview-overlay" style={{ background: temperatureColour }} aria-hidden="true" />{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
+        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img style={{ filter: adjustmentPreviewUrl ? undefined : previewFilter }} src={adjustmentPreviewUrl || (zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl)} alt={selected.filename} /><i className="tone-preview-overlay" style={{ background: adjustmentPreviewUrl ? "transparent" : temperatureColour }} aria-hidden="true" />{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
         <div className="triage-actions">
           <button className={`triage-button discard ${selected.decision === "discard" ? "active" : ""}`} onClick={() => onDecision(selected.id, "discard")}><X size={20} /><span>Discard</span><kbd>←</kbd></button>
           <button className={`triage-button undecided ${selected.decision === "undecided" ? "active" : ""}`} onClick={() => onDecision(selected.id, "undecided")}><CircleHelp size={20} /><span>Undecided</span><kbd>↑</kbd></button>
@@ -114,7 +120,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
         </dl>
         <div className="tag-list">{selected.tags.map((tag) => <span key={tag}>{tag}</span>)}<button onClick={() => onTags(selected)}><Tag size={13} /> Edit <kbd>T</kbd></button></div>
         <section className="triage-adjustments" aria-labelledby="triage-adjustments-heading">
-          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => setAdjustments(neutralAdjustments)}><RotateCcw size={14} /></button></div>
+          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></div>
           <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
           <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />
           <AdjustmentSlider label="Dynamic range" value={adjustments.dynamicRange} min={-100} max={100} step={1} low="Softer" high="Wider" onChange={(value) => setAdjustment("dynamicRange", value)} />

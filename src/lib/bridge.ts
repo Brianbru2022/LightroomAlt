@@ -199,6 +199,10 @@ export const api = {
     if (tauri()) return invoke("auto_basic_adjustments", { assetId });
     return { exposure: 0, lightBalance: 0, dynamicRange: 100, colourBoost: 10 };
   },
+  async previewBasicAdjustments(asset: Asset, adjustments: BasicAdjustments): Promise<string> {
+    if (tauri()) return convertFileSrc(await invoke<string>("preview_basic_adjustments", { assetId: asset.id, adjustments }));
+    return "";
+  },
   async applyBasicAdjustments(asset: Asset, adjustments: BasicAdjustments): Promise<AssetVersion> {
     if (tauri()) return withVersionUrl(await invoke<AssetVersion>("apply_basic_adjustments", { assetId: asset.id, adjustments }));
     return { id: crypto.randomUUID(), kind: "adjusted", provider: "keepframe-controls", createdAt: new Date().toISOString(), state: "candidate", imageUrl: asset.preferredVersionUrl ?? asset.previewUrl, isPreferred: false };
