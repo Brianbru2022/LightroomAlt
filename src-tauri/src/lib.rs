@@ -1528,11 +1528,13 @@ fn adjustment_input(connection: &Connection, asset_id: &str) -> Result<Adjustmen
 fn protected_endpoints(image: &RgbImage) -> (f32, f32) {
     let mut histogram = [0_u64; 256];
     for pixel in image.pixels() {
-        for channel in pixel.0 {
-            histogram[channel as usize] += 1;
-        }
+        let luminance =
+            (pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722)
+                .round()
+                .clamp(0.0, 255.0) as usize;
+        histogram[luminance] += 1;
     }
-    let total = image.width() as u64 * image.height() as u64 * 3;
+    let total = image.width() as u64 * image.height() as u64;
     let tail = ((total as f64 * 0.0005).round() as u64).max(1);
     let percentile = |target: u64| {
         let mut seen = 0_u64;
@@ -1547,37 +1549,33 @@ fn protected_endpoints(image: &RgbImage) -> (f32, f32) {
     (percentile(tail), percentile(total.saturating_sub(tail)))
 }
 
-fn adaptive_midtone_gamma(image: &RgbImage, low: f32, high: f32) -> f32 {
-    if high - low < 0.02 {
-        return 1.0;
-    }
-    let mut histogram = [0_u64; 256];
-    for pixel in image.pixels() {
-        let luminance =
-            (pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722)
-                .round()
-                .clamp(0.0, 255.0) as usize;
-        histogram[luminance] += 1;
-    }
-    let target = image.width() as u64 * image.height() as u64 / 2;
-    let mut seen = 0_u64;
-    let median = histogram
-        .iter()
-        .enumerate()
-        .find_map(|(index, count)| {
-            seen += count;
-            (seen >= target).then_some(index as f32 / 255.0)
-        })
-        .unwrap_or(0.5);
-    let normalised = ((median - low) / (high - low)).clamp(0.01, 0.99);
-    (0.45_f32.ln() / normalised.ln()).clamp(0.55, 1.8)
-}
-
 fn protected_expand(value: f32, low: f32, high: f32) -> f32 {
     if high - low < 0.02 {
         return value;
     }
     ((value - low) / (high - low)).clamp(0.0, 1.0)
+}
+
+fn automatic_tone_luminance(value: f32, low: f32, high: f32) -> f32 {
+    let expanded = protected_expand(value, low, high);
+    let wave = (std::f32::consts::PI * expanded).sin();
+    let shadow_lift = 0.40 * wave * (1.0 - expanded).powf(1.4);
+    let highlight_recovery = 0.22 * wave * expanded.powf(1.4);
+    (expanded + shadow_lift - highlight_recovery).clamp(0.0, 1.0)
+}
+
+fn remap_luminance(values: &mut [f32; 3], current: f32, target: f32) {
+    if target >= current {
+        let amount = (target - current) / (1.0 - current).max(0.000_001);
+        for value in values {
+            *value += (1.0 - *value) * amount;
+        }
+    } else {
+        let amount = target / current.max(0.000_001);
+        for value in values {
+            *value *= amount;
+        }
+    }
 }
 
 fn apply_adjustments_to_image(
@@ -1587,7 +1585,6 @@ fn apply_adjustments_to_image(
     let adjustments = adjustments.validate().expect("validated adjustment values");
     let mut output = image.to_rgb8();
     let (low, high) = protected_endpoints(&output);
-    let midtone_gamma = adaptive_midtone_gamma(&output, low, high);
     let range_amount = (adjustments.dynamic_range / 100.0).clamp(-1.0, 1.0);
     let temperature = adjustments.light_balance / 100.0 * 0.18;
     let exposure = 2_f32.powf(adjustments.exposure);
@@ -1599,14 +1596,17 @@ fn apply_adjustments_to_image(
             pixel[2] as f32 / 255.0 * (1.0 - temperature),
         ];
         for value in &mut values {
-            let current = value.clamp(0.0, 1.0);
-            *value = if range_amount >= 0.0 {
-                let expanded = protected_expand(current, low, high);
-                let toned = expanded.powf(1.0 + (midtone_gamma - 1.0) * range_amount);
-                current + (toned - current) * range_amount
-            } else {
-                0.5 + (current - 0.5) * (1.0 + range_amount * 0.5)
-            };
+            *value = value.clamp(0.0, 1.0);
+        }
+        let current_luminance = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
+        let target_luminance = if range_amount >= 0.0 {
+            let automatic = automatic_tone_luminance(current_luminance, low, high);
+            current_luminance + (automatic - current_luminance) * range_amount
+        } else {
+            0.5 + (current_luminance - 0.5) * (1.0 + range_amount * 0.5)
+        };
+        remap_luminance(&mut values, current_luminance, target_luminance);
+        for value in &mut values {
             *value = (*value * exposure).clamp(0.0, 1.0);
         }
         let maximum = values.iter().copied().fold(0.0_f32, f32::max);
@@ -1713,7 +1713,7 @@ async fn preview_basic_adjustments(
             image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, adjustments));
         let settings = serde_json::to_vec(&adjustments)?;
         let mut digest = Sha256::new();
-        digest.update(b"dynamic-range-v2");
+        digest.update(b"dynamic-range-v3");
         digest.update(asset_id.as_bytes());
         digest.update(settings);
         let key = format!("{:x}", digest.finalize());
@@ -4226,7 +4226,40 @@ mod tests {
         };
         let output = apply_adjustments_to_image(&image::DynamicImage::ImageRgb8(source), settings);
         assert_eq!(output.get_pixel(0, 0)[0], 0);
-        assert!(output.get_pixel(100, 0)[0] >= 105);
+        assert!(output.get_pixel(100, 0)[0] >= 85);
+        assert_eq!(output.get_pixel(3_999, 0)[0], 255);
+    }
+
+    #[test]
+    fn automatic_range_lifts_shadows_and_restrains_highlights() {
+        let mut source = RgbImage::new(4_000, 1);
+        for (index, pixel) in source.pixels_mut().enumerate() {
+            let value = match index {
+                0..=1 => 0,
+                2..=999 => 35,
+                1_000..=2_999 => 125,
+                3_000..=3_897 => 185,
+                3_898..=3_997 => 240,
+                _ => 255,
+            };
+            *pixel = image::Rgb([value, value, value]);
+        }
+        let output = apply_adjustments_to_image(
+            &image::DynamicImage::ImageRgb8(source),
+            BasicAdjustments {
+                exposure: 0.0,
+                light_balance: 0.0,
+                dynamic_range: 100.0,
+                colour_boost: 0.0,
+            },
+        );
+        assert_eq!(output.get_pixel(0, 0)[0], 0);
+        assert!(output.get_pixel(100, 0)[0] > 55);
+        assert!(
+            output.get_pixel(3_100, 0)[0] < 185,
+            "highlight value was {}",
+            output.get_pixel(3_100, 0)[0]
+        );
         assert_eq!(output.get_pixel(3_999, 0)[0], 255);
     }
 
