@@ -87,6 +87,11 @@ export type AssetFilter = {
   search: string;
   year?: number;
   tag?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  camera?: string;
+  tagged?: boolean;
+  located?: boolean;
   trashed?: boolean;
 };
 
@@ -133,6 +138,12 @@ export type BasicAdjustments = {
   curveLights: number;
   curveDarks: number;
   curveShadows: number;
+  cropLeft: number;
+  cropTop: number;
+  cropWidth: number;
+  cropHeight: number;
+  rotateQuadrants: number;
+  straighten: number;
 };
 
 export const neutralAdjustments: BasicAdjustments = {
@@ -140,6 +151,8 @@ export const neutralAdjustments: BasicAdjustments = {
   whites: 0, blacks: 0, dynamicRange: 0, texture: 0, clarity: 0, dehaze: 0,
   colourBoost: 0, saturation: 0, curveHighlights: 0, curveLights: 0,
   curveDarks: 0, curveShadows: 0,
+  cropLeft: 0, cropTop: 0, cropWidth: 1, cropHeight: 1,
+  rotateQuadrants: 0, straighten: 0,
 };
 
 export type JobAttempt = {

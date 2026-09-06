@@ -149,6 +149,12 @@ struct BasicAdjustments {
     curve_lights: f32,
     curve_darks: f32,
     curve_shadows: f32,
+    crop_left: f32,
+    crop_top: f32,
+    crop_width: f32,
+    crop_height: f32,
+    rotate_quadrants: i8,
+    straighten: f32,
 }
 
 impl BasicAdjustments {
@@ -172,17 +178,34 @@ impl BasicAdjustments {
             self.curve_darks,
             self.curve_shadows,
         ];
+        let crop_width = if self.crop_width == 0.0 { 1.0 } else { self.crop_width };
+        let crop_height = if self.crop_height == 0.0 { 1.0 } else { self.crop_height };
         let valid = self.exposure.is_finite()
             && (-3.0..=3.0).contains(&self.exposure)
             && unit_values
                 .iter()
-                .all(|value| value.is_finite() && (-100.0..=100.0).contains(value));
+                .all(|value| value.is_finite() && (-100.0..=100.0).contains(value))
+            && self.crop_left.is_finite()
+            && self.crop_top.is_finite()
+            && self.straighten.is_finite()
+            && (0.0..=0.95).contains(&self.crop_left)
+            && (0.0..=0.95).contains(&self.crop_top)
+            && (0.05..=1.0).contains(&crop_width)
+            && (0.05..=1.0).contains(&crop_height)
+            && self.crop_left + crop_width <= 1.0001
+            && self.crop_top + crop_height <= 1.0001
+            && (-45.0..=45.0).contains(&self.straighten)
+            && (0..=3).contains(&self.rotate_quadrants);
         if !valid {
             return Err(KeepframeError::Message(
                 "One or more adjustment values are outside the supported range.".into(),
             ));
         }
         Ok(self)
+    }
+
+    fn normalised_crop(self) -> (f32, f32, f32, f32) {
+        (self.crop_left, self.crop_top, if self.crop_width == 0.0 { 1.0 } else { self.crop_width }, if self.crop_height == 0.0 { 1.0 } else { self.crop_height })
     }
 }
 
@@ -199,6 +222,11 @@ struct AssetFilter {
     search: String,
     year: Option<i32>,
     tag: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    camera: Option<String>,
+    tagged: Option<bool>,
+    located: Option<bool>,
     trashed: Option<bool>,
 }
 #[derive(Debug, Serialize, Clone)]
@@ -1751,7 +1779,42 @@ fn apply_adjustments_to_image(
     apply_protected_local_contrast(&mut output, adjustments.texture / 100.0 * 0.28, 220.0);
     apply_protected_local_contrast(&mut output, adjustments.clarity / 100.0 * 0.42, 75.0);
     apply_protected_local_contrast(&mut output, dehaze * 0.18, 48.0);
-    output
+    apply_geometry(&output, adjustments)
+}
+
+fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage {
+    let mut image = source.clone();
+    for _ in 0..adjustments.rotate_quadrants {
+        image = image::imageops::rotate90(&image);
+    }
+    if adjustments.straighten.abs() >= 0.01 {
+        let angle = adjustments.straighten.to_radians();
+        let (width, height) = image.dimensions();
+        let centre_x = (width as f32 - 1.0) / 2.0;
+        let centre_y = (height as f32 - 1.0) / 2.0;
+        let (sin, cos) = angle.sin_cos();
+        let mut rotated = RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - centre_x;
+                let dy = y as f32 - centre_y;
+                let source_x = (cos * dx + sin * dy + centre_x).round() as i32;
+                let source_y = (-sin * dx + cos * dy + centre_y).round() as i32;
+                if source_x >= 0 && source_y >= 0 && source_x < width as i32 && source_y < height as i32 {
+                    *rotated.get_pixel_mut(x, y) = *image.get_pixel(source_x as u32, source_y as u32);
+                }
+            }
+        }
+        image = rotated;
+    }
+    let (left, top, crop_width, crop_height) = adjustments.normalised_crop();
+    let width = image.width();
+    let height = image.height();
+    let x = (left * width as f32).round() as u32;
+    let y = (top * height as f32).round() as u32;
+    let crop_w = ((crop_width * width as f32).round() as u32).clamp(1, width.saturating_sub(x).max(1));
+    let crop_h = ((crop_height * height as f32).round() as u32).clamp(1, height.saturating_sub(y).max(1));
+    image::imageops::crop_imm(&image, x.min(width - 1), y.min(height - 1), crop_w, crop_h).to_image()
 }
 
 fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments {
@@ -1811,6 +1874,12 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
         curve_lights: 3.0,
         curve_darks: -2.0,
         curve_shadows: 0.0,
+        crop_left: 0.0,
+        crop_top: 0.0,
+        crop_width: 1.0,
+        crop_height: 1.0,
+        rotate_quadrants: 0,
+        straighten: 0.0,
     }
 }
 
@@ -2340,6 +2409,24 @@ fn asset_where(filter: &AssetFilter) -> (String, Vec<SqlValue>) {
     if let Some(tag) = filter.tag.as_ref().filter(|tag| !tag.trim().is_empty()) {
         clauses.push("EXISTS (SELECT 1 FROM asset_tags fat JOIN tags ft ON ft.id=fat.tag_id WHERE fat.asset_id=a.id AND ft.name=? COLLATE NOCASE)");
         values.push(SqlValue::Text(tag.trim().to_string()));
+    }
+    if let Some(date_from) = filter.date_from.as_ref().filter(|date| !date.trim().is_empty()) {
+        clauses.push("a.captured_at >= ?");
+        values.push(SqlValue::Text(date_from.trim().to_string()));
+    }
+    if let Some(date_to) = filter.date_to.as_ref().filter(|date| !date.trim().is_empty()) {
+        clauses.push("a.captured_at < datetime(?,'+1 day')");
+        values.push(SqlValue::Text(date_to.trim().to_string()));
+    }
+    if let Some(camera) = filter.camera.as_ref().filter(|camera| !camera.trim().is_empty()) {
+        clauses.push("a.camera = ? COLLATE NOCASE");
+        values.push(SqlValue::Text(camera.trim().to_string()));
+    }
+    if let Some(tagged) = filter.tagged {
+        clauses.push(if tagged { "EXISTS (SELECT 1 FROM asset_tags ata WHERE ata.asset_id=a.id)" } else { "NOT EXISTS (SELECT 1 FROM asset_tags ata WHERE ata.asset_id=a.id)" });
+    }
+    if let Some(located) = filter.located {
+        clauses.push(if located { "a.latitude IS NOT NULL AND a.longitude IS NOT NULL" } else { "a.latitude IS NULL OR a.longitude IS NULL" });
     }
     if !filter.search.trim().is_empty() {
         clauses.push("(lower(a.filename) LIKE ? OR lower(COALESCE(a.camera,'')) LIKE ? OR EXISTS (SELECT 1 FROM asset_tags sat JOIN tags st ON st.id=sat.tag_id WHERE sat.asset_id=a.id AND lower(st.name) LIKE ?))");
@@ -4397,6 +4484,23 @@ mod tests {
     }
 
     #[test]
+    fn geometry_adjustments_crop_and_rotate_the_same_rendered_image() {
+        let mut source = RgbImage::new(3, 2);
+        source.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        source.put_pixel(1, 0, image::Rgb([0, 255, 0]));
+        source.put_pixel(2, 0, image::Rgb([0, 0, 255]));
+        source.put_pixel(0, 1, image::Rgb([255, 255, 0]));
+        source.put_pixel(1, 1, image::Rgb([0, 255, 255]));
+        source.put_pixel(2, 1, image::Rgb([255, 0, 255]));
+        let rotated = apply_geometry(&source, BasicAdjustments { rotate_quadrants: 1, ..BasicAdjustments::default() });
+        assert_eq!(rotated.dimensions(), (2, 3));
+        assert_eq!(rotated.get_pixel(1, 0), &image::Rgb([255, 0, 0]));
+        let cropped = apply_geometry(&source, BasicAdjustments { crop_left: 1.0 / 3.0, crop_width: 2.0 / 3.0, crop_height: 1.0, ..BasicAdjustments::default() });
+        assert_eq!(cropped.dimensions(), (2, 2));
+        assert_eq!(cropped.get_pixel(0, 0), &image::Rgb([0, 255, 0]));
+    }
+
+    #[test]
     fn protected_range_expansion_reaches_black_and_white_with_minimal_tail_clipping() {
         let mut source = RgbImage::new(4_000, 1);
         for (index, pixel) in source.pixels_mut().enumerate() {
@@ -4666,6 +4770,11 @@ mod tests {
             search: String::new(),
             year: None,
             tag: None,
+            date_from: None,
+            date_to: None,
+            camera: None,
+            tagged: None,
+            located: None,
             trashed: Some(true),
         };
         let normal = AssetFilter {
@@ -4673,6 +4782,11 @@ mod tests {
             search: String::new(),
             year: None,
             tag: None,
+            date_from: None,
+            date_to: None,
+            camera: None,
+            tagged: None,
+            located: None,
             trashed: Some(false),
         };
         let (trash_where, _) = asset_where(&trashed);
@@ -5029,6 +5143,11 @@ mod tests {
             search: String::new(),
             year: None,
             tag: None,
+            date_from: None,
+            date_to: None,
+            camera: None,
+            tagged: None,
+            located: None,
             trashed: None,
         };
         let first = query_assets_in(&connection, &keep, 0, 1).unwrap();
@@ -5044,6 +5163,11 @@ mod tests {
             search: "coast".into(),
             year: Some(2026),
             tag: Some("COAST".into()),
+            date_from: None,
+            date_to: None,
+            camera: None,
+            tagged: None,
+            located: None,
             trashed: None,
         };
         let result = query_assets_in(&connection, &tag_search, 0, 50).unwrap();

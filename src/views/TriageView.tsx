@@ -1,9 +1,12 @@
-import { Check, CircleHelp, Download, Info, LoaderCircle, MapPin, Maximize2, RotateCcw, SlidersHorizontal, Sparkles, Tag, Upload, WandSparkles, X } from "lucide-react";
+import { Check, CircleHelp, Crop, Download, Info, LoaderCircle, MapPin, Maximize2, RotateCcw, SlidersHorizontal, Sparkles, Tag, Upload, WandSparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { neutralAdjustments, type Asset, type AssetVersion, type BasicAdjustments, type Decision } from "../types";
 import { formatDate } from "../lib/format";
 import { api } from "../lib/bridge";
 import { PhotoAdjustmentControls } from "../components/PhotoAdjustmentControls";
+import { Histogram } from "../components/Histogram";
+import { CropOverlay } from "../components/CropOverlay";
+import { adjustmentPresets, applyAdjustmentPreset } from "../lib/adjustmentPresets";
 import { useAdjustmentPreview } from "../hooks/useAdjustmentPreview";
 
 type Props = {
@@ -34,6 +37,8 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
   const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
+  const [showOriginal, setShowOriginal] = useState(false);
+  const [cropping, setCropping] = useState(false);
   const adjustmentsRef = useRef(neutralAdjustments);
   adjustmentsRef.current = adjustments;
   const selectedId = selected?.id;
@@ -51,7 +56,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   useEffect(() => {
     cancelAdjustmentPreview();
     adjustmentsRef.current = neutralAdjustments;
-    setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); setAdjustmentPreviewUrl(null);
+    setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); setAdjustmentPreviewUrl(null); setShowOriginal(false); setCropping(false);
   }, [selectedId, cancelAdjustmentPreview]);
   const toggleZoom = () => {
     if (zoomed) { setZoomed(false); return; }
@@ -77,6 +82,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
       if (key === "e") { event.preventDefault(); workshopRef.current(); return; }
       if (key === "m") { event.preventDefault(); mapRef.current(); return; }
       if (key === "t" && selectedRef.current) { event.preventDefault(); tagsRef.current(selectedRef.current); return; }
+      if (event.code === "Backslash") { event.preventDefault(); setShowOriginal((current) => !current); return; }
       const decision = event.key === "ArrowRight" || key === "k" ? "keep" : event.key === "ArrowLeft" || key === "x" ? "discard" : event.key === "ArrowUp" || key === "u" ? "undecided" : null;
       if (decision) { event.preventDefault(); decisionRef.current(selectedId, decision); }
       if (event.code === "Space") { event.preventDefault(); toggleZoom(); }
@@ -92,6 +98,10 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
     setAdjustmentError(null);
     requestAdjustmentPreview(selected, next);
   };
+  const replaceAdjustments = (next: BasicAdjustments) => {
+    if (!selected) return;
+    adjustmentsRef.current = next; setAdjustments(next); setAdjustmentError(null); requestAdjustmentPreview(selected, next);
+  };
   const autoAdjust = async () => {
     if (!selected) return;
     setAdjusting("auto"); setAdjustmentError(null);
@@ -104,6 +114,12 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
       setAdjustmentPreviewUrl(url);
     } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
   };
+  const choosePreset = (presetId: string) => {
+    if (!selected) return;
+    const preset = adjustmentPresets.find((entry) => entry.id === presetId); if (!preset) return;
+    const next = applyAdjustmentPreset(adjustmentsRef.current, preset);
+    adjustmentsRef.current = next; setAdjustments(next); setAdjustmentError(null); requestAdjustmentPreview(selected, next);
+  };
   const applyAdjustments = async () => {
     if (!selected) return;
     setAdjusting("apply"); setAdjustmentError(null);
@@ -113,7 +129,8 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   return (
     <main className="view triage-view">
       <div className="triage-stage">
-        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img src={adjustmentPreviewUrl || (zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl)} alt={selected.filename} />{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
+        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img src={showOriginal ? selected.previewUrl : adjustmentPreviewUrl || (zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl)} alt={selected.filename} />{cropping && !zoomed ? <CropOverlay value={adjustments} onChange={(change) => replaceAdjustments({ ...adjustmentsRef.current, ...change })} /> : null}{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
+        <button className="before-after-button" onPointerDown={() => setShowOriginal(true)} onPointerUp={() => setShowOriginal(false)} onPointerLeave={() => setShowOriginal(false)} onClick={() => setShowOriginal((current) => !current)}>Hold original <kbd>\\</kbd></button>
         <div className="triage-actions">
           <button className={`triage-button discard ${selected.decision === "discard" ? "active" : ""}`} onClick={() => onDecision(selected.id, "discard")}><X size={20} /><span>Discard</span><kbd>←</kbd></button>
           <button className={`triage-button undecided ${selected.decision === "undecided" ? "active" : ""}`} onClick={() => onDecision(selected.id, "undecided")}><CircleHelp size={20} /><span>Undecided</span><kbd>↑</kbd></button>
@@ -132,11 +149,14 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
           <div><dt>Camera</dt><dd>{selected.camera ?? "Unknown"}</dd></div>
           <div><dt>Dimensions</dt><dd>{selected.width} × {selected.height}</dd></div>
           <div><dt>Files</dt><dd>{selected.representationCount > 1 ? `${selected.representationCount} paired representations` : "1 original"}</dd></div>
+          <div><dt>Format</dt><dd>{selected.filename.split(".").pop()?.toUpperCase() ?? "Unknown"}{selected.latitude !== null && selected.longitude !== null ? " · location available" : ""}</dd></div>
         </dl>
+        <Histogram src={adjustmentPreviewUrl || selected.previewUrl} />
         <div className="tag-list">{selected.tags.map((tag) => <span key={tag}>{tag}</span>)}<button onClick={() => onTags(selected)}><Tag size={13} /> Edit <kbd>T</kbd></button></div>
         <section className="triage-adjustments" aria-labelledby="triage-adjustments-heading">
-          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { cancelAdjustmentPreview(); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></div>
-          <PhotoAdjustmentControls compact value={adjustments} onChange={setAdjustment} />
+          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><span><button title="Crop image" aria-label="Crop image" onClick={() => setCropping((current) => !current)}><Crop size={14} /></button><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { cancelAdjustmentPreview(); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></span></div>
+          <label className="preset-picker">Preset<select aria-label="Adjustment preset" defaultValue="" onChange={(event) => { choosePreset(event.target.value); event.currentTarget.value = ""; }}><option value="" disabled>Choose a look…</option>{adjustmentPresets.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}</select></label>
+          <PhotoAdjustmentControls compact value={adjustments} onChange={setAdjustment} onReplace={replaceAdjustments} />
           <button className="auto-range-button" disabled={adjusting !== null} onClick={autoAdjust}>{adjusting === "auto" ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />} Maximise range</button>
           <button className="save-adjustment-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Save as candidate</button>
           {adjustmentError ? <p role="alert">Could not apply adjustments: {adjustmentError}</p> : <small>Original remains protected. Saved adjustments appear in Versions.</small>}
