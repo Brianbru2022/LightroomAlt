@@ -1,4 +1,4 @@
-import { Check, CircleHelp, Info, LoaderCircle, MapPin, Maximize2, RotateCcw, SlidersHorizontal, Sparkles, Tag, WandSparkles, X } from "lucide-react";
+import { Check, CircleHelp, Download, Info, LoaderCircle, MapPin, Maximize2, RotateCcw, SlidersHorizontal, Sparkles, Tag, Upload, WandSparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { neutralAdjustments, type Asset, type AssetVersion, type BasicAdjustments, type Decision } from "../types";
 import { formatDate } from "../lib/format";
@@ -18,13 +18,15 @@ type Props = {
   onWorkshop: () => void;
   onMap: () => void;
   onTags: (asset: Asset) => void;
+  onExport: (asset: Asset) => Promise<void>;
+  onReplace: (asset: Asset) => Promise<void>;
   onAutoAdjustments: (assetId: string) => Promise<BasicAdjustments>;
   onPreviewAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<string>;
   onApplyAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<AssetVersion>;
   onAdjustmentSaved: () => void;
 };
 
-export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onAdjustmentSaved }: Props) {
+export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags, onExport, onReplace, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onAdjustmentSaved }: Props) {
   const [zoomed, setZoomed] = useState(false);
   const [reviewUrl, setReviewUrl] = useState<string | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
@@ -140,6 +142,8 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
           {adjustmentError ? <p role="alert">Could not apply adjustments: {adjustmentError}</p> : <small>Original remains protected. Saved adjustments appear in Versions.</small>}
         </section>
         <div className="inspector-actions">
+          <button onClick={() => void onExport(selected)}><Download size={17} /> Export image</button>
+          <button onClick={() => void onReplace(selected)}><Upload size={17} /> Import replacement</button>
           <button onClick={onWorkshop}><Sparkles size={17} /> Edit with AI <kbd>E</kbd></button>
           <button onClick={onMap}><MapPin size={17} /> Show on map <kbd>M</kbd></button>
           <button onClick={toggleZoom}><Maximize2 size={17} /> {zoomed ? "Fit image" : "Load full-resolution 100%"} <kbd>Space</kbd></button>

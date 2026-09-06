@@ -3975,12 +3975,18 @@ fn import_replacement_in(root: &Path, asset_id: &str, source: &Path) -> Result<A
     fs::copy(source, &output)?;
     let output_hash = hash_file(&output)?;
     let now = Utc::now().to_rfc3339();
+    let mut tags = asset_tags(&connection, asset_id)?;
+    if !tags.iter().any(|tag| tag.eq_ignore_ascii_case("replaced")) {
+        tags.push("replaced".into());
+    }
+    let tags = normalise_tags(tags);
     let tx = connection.transaction()?;
     tx.execute("INSERT INTO versions(id,asset_id,kind,path,provider,prompt,source_hash,output_hash,state,created_at)VALUES(?1,?2,'replacement',?3,'manual-replacement','User-selected replacement; catalogue metadata retained',?4,?5,'accepted',?6)", params![version_id,asset_id,output.to_string_lossy(),source_hash,output_hash,now])?;
     tx.execute(
         "UPDATE assets SET preferred_version_id=?2 WHERE id=?1",
         params![asset_id, version_id],
     )?;
+    replace_asset_tags(&tx, asset_id, &tags)?;
     tx.commit()?;
     Ok(AssetVersion {
         id: version_id,
@@ -4003,6 +4009,90 @@ fn import_replacement(
     state: State<'_, AppState>,
 ) -> Result<AssetVersion> {
     import_replacement_in(&root_from(&state)?, &asset_id, Path::new(&path))
+}
+
+fn unused_export_path(destination: &Path, stem: &str, extension: &str) -> PathBuf {
+    let first = destination.join(format!("{stem}-export.{extension}"));
+    if !first.exists() {
+        return first;
+    }
+    for number in 2..10_000 {
+        let candidate = destination.join(format!("{stem}-export-{number}.{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    destination.join(format!("{stem}-export-{}.{}", Uuid::new_v4(), extension))
+}
+
+fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Result<PathBuf> {
+    if !destination.is_dir() {
+        return Err(KeepframeError::Message("Choose an existing export folder.".into()));
+    }
+    let connection = open_db(root)?;
+    let (filename, width, height, preferred): (String, Option<u32>, Option<u32>, Option<String>) = connection.query_row(
+        "SELECT filename,width,height,preferred_version_id FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let stem = Path::new(&filename)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("photograph");
+
+    if let Some(version_id) = preferred {
+        let stored: String = connection.query_row(
+            "SELECT path FROM versions WHERE id=?1 AND asset_id=?2 AND state!='rejected'",
+            params![version_id, asset_id],
+            |row| row.get(0),
+        )?;
+        let source = contained_library_file(root, Path::new(&stored))?.ok_or_else(|| {
+            KeepframeError::Message("The preferred image is missing from the library.".into())
+        })?;
+        let extension = source.extension().and_then(OsStr::to_str).unwrap_or("png").to_ascii_lowercase();
+        let output = unused_export_path(destination, stem, &extension);
+        fs::copy(source, &output)?;
+        return Ok(output);
+    }
+
+    let (stored, is_raw): (String, bool) = connection.query_row(
+        "SELECT path,is_raw FROM representations WHERE asset_id=?1 ORDER BY is_raw DESC,path LIMIT 1",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let source = contained_library_file(root, Path::new(&stored))?.ok_or_else(|| {
+        KeepframeError::Message("The protected original is missing from the library.".into())
+    })?;
+    if is_raw {
+        let image = prepare_full_resolution_image(
+            &source,
+            width.zip(height),
+            &root.join(".keepframe/staging/working"),
+        )?;
+        let output = unused_export_path(destination, stem, "png");
+        fs::write(&output, encode_srgb_png(&image)?)?;
+        return Ok(output);
+    }
+    let extension = source.extension().and_then(OsStr::to_str).unwrap_or("png").to_ascii_lowercase();
+    let output = unused_export_path(destination, stem, &extension);
+    fs::copy(source, &output)?;
+    Ok(output)
+}
+
+#[tauri::command]
+async fn export_asset_image(
+    asset_id: String,
+    destination: String,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        export_asset_image_in(&root, &asset_id, Path::new(&destination))
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Image export failed: {error}")))?
 }
 
 fn prepare_external_export(
@@ -4256,6 +4346,7 @@ pub fn run() {
             preview_basic_adjustments,
             apply_basic_adjustments,
             import_replacement,
+            export_asset_image,
             export_external_edit,
             prepare_cloud_export,
             import_returned_edit
@@ -4943,11 +5034,36 @@ mod tests {
         assert_eq!(metadata.2.as_deref(), Some("Test Camera"));
         assert_eq!((metadata.3, metadata.4), (Some(56.2), Some(-2.9)));
         assert_eq!(metadata.5.as_deref(), Some(version.id.as_str()));
-        assert_eq!(asset_tags(&connection, "asset").unwrap(), vec!["Family"]);
+        assert_eq!(asset_tags(&connection, "asset").unwrap(), vec!["Family", "replaced"]);
         assert_eq!(hash_file(&original).unwrap(), original_hash);
         assert!(Path::new(&version.image_url).starts_with(root.join("Edits")));
 
         drop(connection);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn export_copies_a_non_raw_original_without_overwriting_an_existing_export() {
+        let root = std::env::temp_dir().join(format!("keepframe-export-test-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let original = root.join("Originals/2026/09/02/original.png");
+        let destination = root.join("Exports-test");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        image::DynamicImage::new_rgb8(3, 2).save(&original).unwrap();
+        let original_hash = hash_file(&original).unwrap();
+        let connection = open_db(&root).unwrap();
+        connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','original.png','2026-09-02T12:00:00Z',3,2,'thumb.png','2026-09-02T12:00:00Z')", []).unwrap();
+        connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','original',1,0)", params![original.to_string_lossy(),original_hash]).unwrap();
+        drop(connection);
+
+        let first = export_asset_image_in(&root, "asset", &destination).unwrap();
+        let second = export_asset_image_in(&root, "asset", &destination).unwrap();
+        assert_eq!(first.file_name().unwrap(), "original-export.png");
+        assert_eq!(second.file_name().unwrap(), "original-export-2.png");
+        assert_eq!(hash_file(&first).unwrap(), original_hash);
+        assert_eq!(hash_file(&second).unwrap(), original_hash);
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

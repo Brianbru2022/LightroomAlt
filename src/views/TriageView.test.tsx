@@ -11,7 +11,7 @@ describe("Triage adjustments", () => {
     const apply = vi.fn().mockResolvedValue({ id: "adjusted-one", kind: "adjusted", createdAt: new Date().toISOString(), state: "candidate", imageUrl: demoAssets[0].previewUrl, isPreferred: false });
     const saved = vi.fn();
     const preview = vi.fn().mockResolvedValueOnce("adjusted-preview.png").mockResolvedValueOnce("adjusted-preview-exposure.png");
-    render(<TriageView assets={demoAssets} total={demoAssets.length} hasMore={false} loading={false} onLoadMore={vi.fn()} selected={demoAssets[0]} onSelect={vi.fn()} onDecision={vi.fn()} onWorkshop={vi.fn()} onMap={vi.fn()} onTags={vi.fn()} onAutoAdjustments={auto} onPreviewAdjustments={preview} onApplyAdjustments={apply} onAdjustmentSaved={saved} />);
+    render(<TriageView assets={demoAssets} total={demoAssets.length} hasMore={false} loading={false} onLoadMore={vi.fn()} selected={demoAssets[0]} onSelect={vi.fn()} onDecision={vi.fn()} onWorkshop={vi.fn()} onMap={vi.fn()} onTags={vi.fn()} onExport={vi.fn()} onReplace={vi.fn()} onAutoAdjustments={auto} onPreviewAdjustments={preview} onApplyAdjustments={apply} onAdjustmentSaved={saved} />);
 
     expect(screen.getByRole("heading", { name: "Adjust" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Maximise range/ }));

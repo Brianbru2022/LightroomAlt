@@ -21,6 +21,7 @@ type Props = {
   onImportReturned: (assetId: string, provider: "chatgpt" | "gemini", prompt: string) => Promise<void>;
   onLoadVersions: (asset: Asset) => Promise<AssetVersion[]>;
   onSetPreferred: (assetId: string, versionId?: string) => Promise<void>;
+  onExport: (asset: Asset) => Promise<void>;
   onReplace: (asset: Asset) => Promise<void>;
   onAutoAdjustments: (assetId: string) => Promise<BasicAdjustments>;
   onPreviewAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<string>;
@@ -62,7 +63,7 @@ function BatchRecipeReview({ job, onSave }: { job: BatchJob; onSave: Props["onSa
   );
 }
 
-export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onReplace, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
+export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onExport, onReplace, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
   const [intent, setIntent] = useState<EditIntent>("restoration");
   const [brief, setBrief] = useState("Restore naturally, retain character and make no unrequested changes.");
   const [recipe, setRecipe] = useState<EditRecipe | null>(null);
@@ -156,7 +157,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
               <div className="adjustment-actions"><span>The preview and saved PNG use the same processing pipeline; the saved version is rendered from the full-resolution source.</span><button className="primary-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />} Save candidate version</button></div>
             </section>
             <section className="version-panel" aria-labelledby="versions-heading">
-              <div className="version-heading"><div><span className="step-number">V</span><div><h2 id="versions-heading">Versions & comparison</h2><p>Changing the displayed version never changes the photograph’s date, GPS, tags or decision.</p></div></div><button className="quiet-button" onClick={async () => { await onReplace(asset); await refreshVersions(asset); }}><Upload size={15} /> Replace with image</button></div>
+              <div className="version-heading"><div><span className="step-number">V</span><div><h2 id="versions-heading">Versions & comparison</h2><p>Changing the displayed version never changes the photograph’s date, GPS, tags or decision.</p></div></div><div className="version-heading-actions"><button className="quiet-button" onClick={() => void onExport(asset)}><Download size={15} /> Export image</button><button className="quiet-button" onClick={async () => { await onReplace(asset); await refreshVersions(asset); }}><Upload size={15} /> Import replacement</button></div></div>
               <div className="comparison-grid">
                 <figure><img src={asset.previewUrl} alt={`Protected original ${asset.filename}`} /><figcaption>Protected original</figcaption></figure>
                 <figure>{selectedVersion ? <img src={selectedVersion.imageUrl} alt={`${selectedVersion.kind} version of ${asset.filename}`} /> : <div className="comparison-empty">No derived version yet</div>}<figcaption>{selectedVersion ? `${displayIntent(selectedVersion.kind)} · ${selectedVersion.provider ?? "Keepframe"}` : "Select or import a version"}</figcaption></figure>

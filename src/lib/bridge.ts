@@ -213,6 +213,14 @@ export const api = {
     if (typeof path !== "string") return null;
     return withVersionUrl(await invoke<AssetVersion>("import_replacement", { assetId: asset.id, path }));
   },
+  async exportImage(asset: Asset): Promise<string | null> {
+    if (!tauri()) return null;
+    const destination = await open({ directory: true, multiple: false, title: "Choose where to export the photograph" });
+    if (typeof destination !== "string") return null;
+    const path = await invoke<string>("export_asset_image", { assetId: asset.id, destination });
+    await revealItemInDir(path);
+    return path;
+  },
   async importReturned(assetId: string, provider: "chatgpt" | "gemini", prompt: string): Promise<BatchJob | null> {
     if (!tauri()) {
       const asset = browserAssets.find((item) => item.id === assetId); if (!asset) return null;
