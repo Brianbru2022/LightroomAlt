@@ -1,5 +1,5 @@
 import { Check, ChevronDown, Clipboard, Cloud, Cpu, Download, FolderOutput, LoaderCircle, Play, RotateCcw, SlidersHorizontal, Sparkles, SunMedium, Upload, WandSparkles } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Asset, AssetVersion, BasicAdjustments, BatchJob, EditIntent, EditRecipe, PreserveConstraint, PromptSet, ServiceHealth } from "../types";
 import { displayIntent } from "../lib/format";
 import { AdjustmentSlider } from "../components/AdjustmentSlider";
@@ -76,15 +76,23 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   const [adjustments, setAdjustments] = useState<BasicAdjustments>(neutralAdjustments);
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
+  const previewRequestRef = useRef(0);
+  const adjustmentsRef = useRef(neutralAdjustments);
+  adjustmentsRef.current = adjustments;
   const refreshVersions = async (current: Asset) => {
     const next = await onLoadVersions(current);
     setVersions(next);
     setSelectedVersionId((selected) => next.some((item) => item.id === selected) ? selected : next.find((item) => item.isPreferred)?.id ?? next[0]?.id ?? "");
   };
   useEffect(() => {
+    previewRequestRef.current += 1;
+    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    adjustmentsRef.current = neutralAdjustments;
     setRecipe(null); setPrompts(null); setVersions([]); setSelectedVersionId(""); setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null);
     if (asset) void refreshVersions(asset);
   }, [asset?.id]);
+  useEffect(() => () => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); }, []);
   const selectedVersion = versions.find((item) => item.id === selectedVersionId) ?? versions[0];
 
   const analyse = async () => {
@@ -102,14 +110,34 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   };
   const recipeLines = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean);
   const copy = async () => { if (!prompts) return; await onCopy(prompts[provider]); setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
-  const setAdjustment = (key: keyof BasicAdjustments, value: number) => { setAdjustmentPreviewUrl(null); setAdjustments((current) => ({ ...current, [key]: value })); };
+  const requestAdjustmentPreview = (current: Asset, next: BasicAdjustments) => {
+    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    const request = ++previewRequestRef.current;
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      void onPreviewAdjustments(current, next).then((url) => {
+        if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
+      });
+    }, 120);
+  };
+  const setAdjustment = (key: keyof BasicAdjustments, value: number) => {
+    if (!asset) return;
+    const next = { ...adjustmentsRef.current, [key]: value };
+    adjustmentsRef.current = next;
+    setAdjustments(next);
+    requestAdjustmentPreview(asset, next);
+  };
   const autoAdjust = async () => {
     if (!asset) return;
     setAdjusting("auto");
     try {
       const next = await onAutoAdjustments(asset.id);
+      adjustmentsRef.current = next;
       setAdjustments(next);
-      setAdjustmentPreviewUrl(await onPreviewAdjustments(asset, next));
+      if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+      const request = ++previewRequestRef.current;
+      const url = await onPreviewAdjustments(asset, next);
+      if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
     } finally { setAdjusting(null); }
   };
   const applyAdjustments = async () => {
@@ -140,7 +168,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
               </div>
             </div>
             <section className="adjustment-panel" aria-labelledby="adjustments-heading">
-              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => { setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={15} /> Reset</button></div>
+              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={15} /> Reset</button></div>
               <div className="adjustment-controls">
                 <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
                 <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />

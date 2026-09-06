@@ -33,6 +33,10 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
   const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
+  const previewRequestRef = useRef(0);
+  const adjustmentsRef = useRef(neutralAdjustments);
+  adjustmentsRef.current = adjustments;
   const selectedId = selected?.id;
   const decisionRef = useRef(onDecision); decisionRef.current = onDecision;
   const selectRef = useRef(onSelect); selectRef.current = onSelect;
@@ -44,7 +48,13 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const selectedIndex = Math.max(0, assets.findIndex((asset) => asset.id === selectedId));
   const filmstripStart = Math.max(0, selectedIndex - 30);
   const filmstripAssets = assets.slice(filmstripStart, selectedIndex + 31);
-  useEffect(() => { setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); setAdjustmentPreviewUrl(null); }, [selectedId]);
+  useEffect(() => {
+    previewRequestRef.current += 1;
+    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    adjustmentsRef.current = neutralAdjustments;
+    setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); setAdjustmentPreviewUrl(null);
+  }, [selectedId]);
+  useEffect(() => () => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); }, []);
   const toggleZoom = () => {
     if (zoomed) { setZoomed(false); return; }
     if (!selected) return;
@@ -76,14 +86,37 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [selectedId]);
 
-  const setAdjustment = (key: keyof BasicAdjustments, value: number) => { setAdjustmentPreviewUrl(null); setAdjustments((current) => ({ ...current, [key]: value })); };
+  const requestAdjustmentPreview = (asset: Asset, next: BasicAdjustments) => {
+    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    const request = ++previewRequestRef.current;
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      void onPreviewAdjustments(asset, next).then((url) => {
+        if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
+      }).catch((error) => {
+        if (previewRequestRef.current === request) setAdjustmentError(String(error));
+      });
+    }, 120);
+  };
+  const setAdjustment = (key: keyof BasicAdjustments, value: number) => {
+    if (!selected) return;
+    const next = { ...adjustmentsRef.current, [key]: value };
+    adjustmentsRef.current = next;
+    setAdjustments(next);
+    setAdjustmentError(null);
+    requestAdjustmentPreview(selected, next);
+  };
   const autoAdjust = async () => {
     if (!selected) return;
     setAdjusting("auto"); setAdjustmentError(null);
     try {
       const next = await onAutoAdjustments(selected.id);
+      adjustmentsRef.current = next;
       setAdjustments(next);
-      setAdjustmentPreviewUrl(await onPreviewAdjustments(selected, next));
+      if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+      const request = ++previewRequestRef.current;
+      const url = await onPreviewAdjustments(selected, next);
+      if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
     } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
   };
   const applyAdjustments = async () => {
@@ -120,7 +153,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
         </dl>
         <div className="tag-list">{selected.tags.map((tag) => <span key={tag}>{tag}</span>)}<button onClick={() => onTags(selected)}><Tag size={13} /> Edit <kbd>T</kbd></button></div>
         <section className="triage-adjustments" aria-labelledby="triage-adjustments-heading">
-          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></div>
+          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></div>
           <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
           <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />
           <AdjustmentSlider label="Dynamic range" value={adjustments.dynamicRange} min={-100} max={100} step={1} low="Softer" high="Wider" onChange={(value) => setAdjustment("dynamicRange", value)} />

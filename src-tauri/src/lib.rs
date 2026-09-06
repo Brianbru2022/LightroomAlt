@@ -1578,6 +1578,34 @@ fn remap_luminance(values: &mut [f32; 3], current: f32, target: f32) {
     }
 }
 
+fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32) {
+    if amount <= 0.0 || image.width() < 8 || image.height() < 8 {
+        return;
+    }
+    let sigma = (image.width().min(image.height()) as f32 / 75.0).clamp(4.0, 32.0);
+    let blurred = image::imageops::blur(image, sigma);
+    for (pixel, blurred_pixel) in image.pixels_mut().zip(blurred.pixels()) {
+        let mut values = [
+            pixel[0] as f32 / 255.0,
+            pixel[1] as f32 / 255.0,
+            pixel[2] as f32 / 255.0,
+        ];
+        let current = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
+        let local_average = blurred_pixel[0] as f32 / 255.0 * 0.2126
+            + blurred_pixel[1] as f32 / 255.0 * 0.7152
+            + blurred_pixel[2] as f32 / 255.0 * 0.0722;
+        // Fade the local-contrast correction near pure black and white so it
+        // cannot turn the protected endpoint placement into broad clipping.
+        let endpoint_protection = (4.0 * current * (1.0 - current)).clamp(0.0, 1.0);
+        let target = (current + (current - local_average) * 0.45 * amount * endpoint_protection)
+            .clamp(0.0, 1.0);
+        remap_luminance(&mut values, current, target);
+        for (index, value) in values.iter().enumerate() {
+            pixel[index] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+}
+
 fn apply_adjustments_to_image(
     image: &image::DynamicImage,
     adjustments: BasicAdjustments,
@@ -1634,6 +1662,7 @@ fn apply_adjustments_to_image(
                 .round() as u8;
         }
     }
+    apply_protected_local_contrast(&mut output, range_amount.max(0.0));
     output
 }
 
@@ -1713,7 +1742,7 @@ async fn preview_basic_adjustments(
             image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, adjustments));
         let settings = serde_json::to_vec(&adjustments)?;
         let mut digest = Sha256::new();
-        digest.update(b"dynamic-range-v3");
+        digest.update(b"dynamic-range-v4");
         digest.update(asset_id.as_bytes());
         digest.update(settings);
         let key = format!("{:x}", digest.finalize());
@@ -4261,6 +4290,19 @@ mod tests {
             output.get_pixel(3_100, 0)[0]
         );
         assert_eq!(output.get_pixel(3_999, 0)[0], 255);
+    }
+
+    #[test]
+    fn protected_local_contrast_strengthens_detail_without_moving_flat_areas() {
+        let mut source = RgbImage::from_pixel(64, 64, image::Rgb([120, 120, 120]));
+        for y in 20..44 {
+            for x in 24..40 {
+                source.put_pixel(x, y, image::Rgb([100, 100, 100]));
+            }
+        }
+        apply_protected_local_contrast(&mut source, 1.0);
+        assert_eq!(source.get_pixel(2, 2)[0], 120);
+        assert!(source.get_pixel(23, 32)[0] - source.get_pixel(24, 32)[0] > 20);
     }
 
     #[test]
