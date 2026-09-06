@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { demoAssets, makeRecipe, renderPrompts } from "../lib/demo";
-import type { BatchJob } from "../types";
+import { neutralAdjustments, type BatchJob } from "../types";
 import { WorkshopView } from "./WorkshopView";
 
 describe("AI Workshop batch review", () => {
@@ -19,12 +19,12 @@ describe("AI Workshop batch review", () => {
     };
     const save = vi.fn().mockResolvedValue(undefined);
     const approve = vi.fn().mockResolvedValue(undefined);
-    const auto = vi.fn().mockResolvedValue({ exposure: 0, lightBalance: 0, dynamicRange: 100, colourBoost: 9 });
+    const auto = vi.fn().mockResolvedValue({ ...neutralAdjustments, dynamicRange: 100, highlights: -30, shadows: 20, colourBoost: 9 });
     render(<WorkshopView asset={demoAssets[0]} assets={demoAssets} jobs={[job]} serviceHealth={{ localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "Ready", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "Controls-only fallback" }} onAnalyse={vi.fn().mockResolvedValue(recipe)} onPrompts={vi.fn().mockResolvedValue(renderPrompts(recipe))} onCopy={vi.fn()} onPrepare={vi.fn()} onExportExternal={vi.fn()} onImportReturned={vi.fn()} onLoadVersions={vi.fn().mockResolvedValue([])} onSetPreferred={vi.fn()} onReplace={vi.fn()} onAutoAdjustments={auto} onPreviewAdjustments={vi.fn().mockResolvedValue("adjusted-preview.png")} onApplyAdjustments={vi.fn()} onEnqueue={vi.fn()} onRunLocal={vi.fn()} onJob={vi.fn()} onSaveJobReview={save} onApproveJobs={approve} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Maximise range" }));
-    await waitFor(() => expect(screen.getByLabelText("Dynamic range")).toHaveValue("100"));
-    expect(screen.getByLabelText("Colour boost")).toHaveValue("9");
+    await waitFor(() => expect(screen.getAllByLabelText("Highlights")[0]).toHaveValue("-30"));
+    expect(screen.getByRole("slider", { name: "Vibrance" })).toHaveValue("9");
     expect(auto).toHaveBeenCalledWith(demoAssets[0].id);
 
     fireEvent.click(screen.getByText("Review image-specific recipe"));

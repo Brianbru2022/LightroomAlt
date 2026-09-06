@@ -136,25 +136,55 @@ struct AssetVersion {
     source_hash: Option<String>,
     output_hash: Option<String>,
 }
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
 struct BasicAdjustments {
     exposure: f32,
     light_balance: f32,
+    tint: f32,
+    contrast: f32,
+    highlights: f32,
+    shadows: f32,
+    whites: f32,
+    blacks: f32,
     dynamic_range: f32,
+    texture: f32,
+    clarity: f32,
+    dehaze: f32,
     colour_boost: f32,
+    saturation: f32,
+    curve_highlights: f32,
+    curve_lights: f32,
+    curve_darks: f32,
+    curve_shadows: f32,
 }
 
 impl BasicAdjustments {
     fn validate(self) -> Result<Self> {
+        let unit_values = [
+            self.light_balance,
+            self.tint,
+            self.contrast,
+            self.highlights,
+            self.shadows,
+            self.whites,
+            self.blacks,
+            self.dynamic_range,
+            self.texture,
+            self.clarity,
+            self.dehaze,
+            self.colour_boost,
+            self.saturation,
+            self.curve_highlights,
+            self.curve_lights,
+            self.curve_darks,
+            self.curve_shadows,
+        ];
         let valid = self.exposure.is_finite()
-            && (-2.0..=2.0).contains(&self.exposure)
-            && self.light_balance.is_finite()
-            && (-100.0..=100.0).contains(&self.light_balance)
-            && self.dynamic_range.is_finite()
-            && (-100.0..=100.0).contains(&self.dynamic_range)
-            && self.colour_boost.is_finite()
-            && (-50.0..=50.0).contains(&self.colour_boost);
+            && (-3.0..=3.0).contains(&self.exposure)
+            && unit_values
+                .iter()
+                .all(|value| value.is_finite() && (-100.0..=100.0).contains(value));
         if !valid {
             return Err(KeepframeError::Message(
                 "One or more adjustment values are outside the supported range.".into(),
@@ -1557,11 +1587,46 @@ fn protected_expand(value: f32, low: f32, high: f32) -> f32 {
 }
 
 fn automatic_tone_luminance(value: f32, low: f32, high: f32) -> f32 {
-    let expanded = protected_expand(value, low, high);
-    let wave = (std::f32::consts::PI * expanded).sin();
-    let shadow_lift = 0.40 * wave * (1.0 - expanded).powf(1.4);
-    let highlight_recovery = 0.22 * wave * expanded.powf(1.4);
-    (expanded + shadow_lift - highlight_recovery).clamp(0.0, 1.0)
+    protected_expand(value, low, high)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let position = ((value - edge0) / (edge1 - edge0).max(0.000_001)).clamp(0.0, 1.0);
+    position * position * (3.0 - 2.0 * position)
+}
+
+fn tone_adjusted_luminance(value: f32, adjustments: BasicAdjustments) -> f32 {
+    let mut result = value;
+    let contrast = adjustments.contrast / 100.0;
+    result -= contrast * 0.11 * (std::f32::consts::TAU * result).sin();
+
+    let shadows = adjustments.shadows / 100.0;
+    let highlights = adjustments.highlights / 100.0;
+    result += shadows
+        * 0.30
+        * (1.0 - result).powi(2)
+        * (1.0 - smoothstep(0.48, 0.72, result))
+        * smoothstep(0.005, 0.10, result);
+    result += highlights
+        * 0.24
+        * result.powi(2)
+        * smoothstep(0.35, 0.75, result)
+        * (1.0 - smoothstep(0.90, 0.995, result));
+
+    let black_mask = 1.0 - smoothstep(0.02, 0.30, result);
+    let white_mask = smoothstep(0.70, 0.98, result);
+    result += adjustments.blacks / 100.0 * 0.13 * black_mask;
+    result += adjustments.whites / 100.0 * 0.13 * white_mask;
+
+    let region = |value: f32, centre: f32, width: f32| {
+        let distance = (value - centre) / width;
+        (-0.5 * distance * distance).exp()
+    };
+    result += adjustments.curve_shadows / 100.0 * 0.10 * region(result, 0.14, 0.14);
+    result += adjustments.curve_darks / 100.0 * 0.10 * region(result, 0.36, 0.18);
+    result += adjustments.curve_lights / 100.0 * 0.10 * region(result, 0.64, 0.18);
+    result += adjustments.curve_highlights / 100.0 * 0.10 * region(result, 0.86, 0.14);
+    result.clamp(0.0, 1.0)
 }
 
 fn remap_luminance(values: &mut [f32; 3], current: f32, target: f32) {
@@ -1578,11 +1643,11 @@ fn remap_luminance(values: &mut [f32; 3], current: f32, target: f32) {
     }
 }
 
-fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32) {
-    if amount <= 0.0 || image.width() < 8 || image.height() < 8 {
+fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32, radius_divisor: f32) {
+    if amount.abs() < f32::EPSILON || image.width() < 8 || image.height() < 8 {
         return;
     }
-    let sigma = (image.width().min(image.height()) as f32 / 75.0).clamp(4.0, 32.0);
+    let sigma = (image.width().min(image.height()) as f32 / radius_divisor).clamp(1.2, 48.0);
     let blurred = image::imageops::blur(image, sigma);
     for (pixel, blurred_pixel) in image.pixels_mut().zip(blurred.pixels()) {
         let mut values = [
@@ -1597,7 +1662,7 @@ fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32) {
         // Fade the local-contrast correction near pure black and white so it
         // cannot turn the protected endpoint placement into broad clipping.
         let endpoint_protection = (4.0 * current * (1.0 - current)).clamp(0.0, 1.0);
-        let target = (current + (current - local_average) * 0.45 * amount * endpoint_protection)
+        let target = (current + (current - local_average) * amount * endpoint_protection)
             .clamp(0.0, 1.0);
         remap_luminance(&mut values, current, target);
         for (index, value) in values.iter().enumerate() {
@@ -1615,13 +1680,16 @@ fn apply_adjustments_to_image(
     let (low, high) = protected_endpoints(&output);
     let range_amount = (adjustments.dynamic_range / 100.0).clamp(-1.0, 1.0);
     let temperature = adjustments.light_balance / 100.0 * 0.18;
+    let tint = adjustments.tint / 100.0 * 0.10;
     let exposure = 2_f32.powf(adjustments.exposure);
     let colour = adjustments.colour_boost / 100.0;
+    let saturation_adjustment = adjustments.saturation / 100.0;
+    let dehaze = adjustments.dehaze / 100.0;
     for pixel in output.pixels_mut() {
         let mut values = [
-            pixel[0] as f32 / 255.0 * (1.0 + temperature),
-            pixel[1] as f32 / 255.0,
-            pixel[2] as f32 / 255.0 * (1.0 - temperature),
+            pixel[0] as f32 / 255.0 * (1.0 + temperature + tint * 0.5),
+            pixel[1] as f32 / 255.0 * (1.0 - tint),
+            pixel[2] as f32 / 255.0 * (1.0 - temperature + tint * 0.5),
         ];
         for value in &mut values {
             *value = value.clamp(0.0, 1.0);
@@ -1637,6 +1705,10 @@ fn apply_adjustments_to_image(
         for value in &mut values {
             *value = (*value * exposure).clamp(0.0, 1.0);
         }
+        let exposed_luminance = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
+        let mut tonal_target = tone_adjusted_luminance(exposed_luminance, adjustments);
+        tonal_target = 0.5 + (tonal_target - 0.5) * (1.0 + dehaze * 0.20);
+        remap_luminance(&mut values, exposed_luminance, tonal_target.clamp(0.0, 1.0));
         let maximum = values.iter().copied().fold(0.0_f32, f32::max);
         let minimum = values.iter().copied().fold(1.0_f32, f32::min);
         let luminance = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
@@ -1650,6 +1722,7 @@ fn apply_adjustments_to_image(
         } else {
             1.0 + colour
         };
+        colour_factor *= (1.0 + saturation_adjustment).max(0.0);
         if maximum > luminance {
             colour_factor = colour_factor.min((1.0 - luminance) / (maximum - luminance));
         }
@@ -1662,7 +1735,9 @@ fn apply_adjustments_to_image(
                 .round() as u8;
         }
     }
-    apply_protected_local_contrast(&mut output, range_amount.max(0.0));
+    apply_protected_local_contrast(&mut output, adjustments.texture / 100.0 * 0.28, 220.0);
+    apply_protected_local_contrast(&mut output, adjustments.clarity / 100.0 * 0.42, 75.0);
+    apply_protected_local_contrast(&mut output, dehaze * 0.18, 48.0);
     output
 }
 
@@ -1670,6 +1745,7 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
     let rgb = image.to_rgb8();
     let step = ((rgb.width() as usize * rgb.height() as usize) / 250_000).max(1);
     let mut saturation_total = 0.0_f64;
+    let mut luminances = Vec::new();
     let mut samples = 0_u64;
     for pixel in rgb.pixels().step_by(step) {
         let maximum = *pixel.0.iter().max().unwrap_or(&0) as f64 / 255.0;
@@ -1679,17 +1755,37 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
         } else {
             0.0
         };
+        luminances.push((pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722) / 255.0);
         samples += 1;
     }
+    luminances.sort_by(|left, right| left.total_cmp(right));
+    let percentile = |fraction: f32| -> f32 {
+        if luminances.is_empty() { return 0.5; }
+        luminances[((luminances.len() - 1) as f32 * fraction).round() as usize]
+    };
+    let median = percentile(0.50);
+    let dark = percentile(0.01);
+    let bright = percentile(0.99);
     let average_saturation = if samples > 0 {
         saturation_total / samples as f64
     } else {
         0.0
     };
     BasicAdjustments {
-        exposure: 0.0,
+        // Do not darken an already bright photograph merely to centre its
+        // median: that would pull the measured white point away from white.
+        exposure: (0.45 / median.max(0.05)).log2().clamp(0.0, 0.75),
         light_balance: 0.0,
+        tint: 0.0,
+        contrast: if bright - dark < 0.65 { 10.0 } else { 5.0 },
+        highlights: (-18.0 - bright * 24.0).clamp(-45.0, -18.0),
+        shadows: (8.0 + (0.18 - dark).max(0.0) * 100.0).clamp(8.0, 28.0),
+        whites: ((0.98 - bright) * 80.0).clamp(2.0, 14.0),
+        blacks: (-4.0 - dark * 30.0).clamp(-12.0, -4.0),
         dynamic_range: 100.0,
+        texture: 4.0,
+        clarity: 7.0,
+        dehaze: 3.0,
         colour_boost: if average_saturation < 0.2 {
             12.0
         } else if average_saturation < 0.4 {
@@ -1697,6 +1793,11 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
         } else {
             6.0
         },
+        saturation: 2.0,
+        curve_highlights: 0.0,
+        curve_lights: 3.0,
+        curve_darks: -2.0,
+        curve_shadows: 0.0,
     }
 }
 
@@ -1742,7 +1843,7 @@ async fn preview_basic_adjustments(
             image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, adjustments));
         let settings = serde_json::to_vec(&adjustments)?;
         let mut digest = Sha256::new();
-        digest.update(b"dynamic-range-v4");
+        digest.update(b"photographic-controls-v5");
         digest.update(asset_id.as_bytes());
         digest.update(settings);
         let key = format!("{:x}", digest.finalize());
@@ -1785,7 +1886,14 @@ async fn apply_basic_adjustments(
         fs::rename(&temporary, &output)?;
         let output_hash = hash_file(&output)?;
         let now = Utc::now().to_rfc3339();
-        let summary = format!("Exposure {:+.2} EV; light balance {:+.0}; dynamic range {:+.0}; colour boost {:+.0}", adjustments.exposure, adjustments.light_balance, adjustments.dynamic_range, adjustments.colour_boost);
+        let summary = format!(
+            "Exposure {:+.2} EV; temperature {:+.0}; tint {:+.0}; contrast {:+.0}; highlights {:+.0}; shadows {:+.0}; whites {:+.0}; blacks {:+.0}; texture {:+.0}; clarity {:+.0}; dehaze {:+.0}; vibrance {:+.0}; saturation {:+.0}",
+            adjustments.exposure, adjustments.light_balance, adjustments.tint,
+            adjustments.contrast, adjustments.highlights, adjustments.shadows,
+            adjustments.whites, adjustments.blacks, adjustments.texture,
+            adjustments.clarity, adjustments.dehaze, adjustments.colour_boost,
+            adjustments.saturation
+        );
         let recipe_json = serde_json::to_string(&adjustments)?;
         let tx = connection.transaction()?;
         tx.execute("INSERT INTO versions(id,asset_id,kind,path,provider,prompt,recipe_json,source_hash,output_hash,state,created_at)VALUES(?1,?2,'adjusted',?3,'keepframe-controls',?4,?5,?6,?7,'candidate',?8)", params![version_id,asset_id,output.to_string_lossy(),summary,recipe_json,input.source_hash,output_hash,now])?;
@@ -4186,10 +4294,11 @@ mod tests {
             light_balance: 0.0,
             dynamic_range: 0.0,
             colour_boost: 0.0,
+            ..BasicAdjustments::default()
         };
         assert_eq!(neutral.validate().unwrap(), neutral);
         assert!(BasicAdjustments {
-            exposure: 2.1,
+            exposure: 3.1,
             ..neutral
         }
         .validate()
@@ -4220,6 +4329,7 @@ mod tests {
             light_balance: 0.0,
             dynamic_range: 100.0,
             colour_boost: 10.0,
+            ..BasicAdjustments::default()
         };
         let output = apply_adjustments_to_image(&image::DynamicImage::ImageRgb8(source), settings);
         assert_eq!(output.get_pixel(1, 0)[0], 0);
@@ -4232,9 +4342,12 @@ mod tests {
         let source =
             image::DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 8, image::Rgb([90, 92, 94])));
         let settings = suggested_basic_adjustments(&source);
-        assert_eq!(settings.exposure, 0.0);
+        assert!(settings.exposure.is_finite());
         assert_eq!(settings.dynamic_range, 100.0);
         assert!((6.0..=12.0).contains(&settings.colour_boost));
+        assert!(settings.highlights < 0.0);
+        assert!(settings.shadows > 0.0);
+        assert!(settings.blacks < 0.0);
     }
 
     #[test]
@@ -4247,12 +4360,7 @@ mod tests {
         source.put_pixel(1, 0, image::Rgb([0, 0, 0]));
         source.put_pixel(3_998, 0, image::Rgb([255, 255, 255]));
         source.put_pixel(3_999, 0, image::Rgb([255, 255, 255]));
-        let settings = BasicAdjustments {
-            exposure: 0.0,
-            light_balance: 0.0,
-            dynamic_range: 100.0,
-            colour_boost: 0.0,
-        };
+        let settings = suggested_basic_adjustments(&image::DynamicImage::ImageRgb8(source.clone()));
         let output = apply_adjustments_to_image(&image::DynamicImage::ImageRgb8(source), settings);
         assert_eq!(output.get_pixel(0, 0)[0], 0);
         assert!(output.get_pixel(100, 0)[0] >= 85);
@@ -4273,17 +4381,10 @@ mod tests {
             };
             *pixel = image::Rgb([value, value, value]);
         }
-        let output = apply_adjustments_to_image(
-            &image::DynamicImage::ImageRgb8(source),
-            BasicAdjustments {
-                exposure: 0.0,
-                light_balance: 0.0,
-                dynamic_range: 100.0,
-                colour_boost: 0.0,
-            },
-        );
+        let image = image::DynamicImage::ImageRgb8(source);
+        let output = apply_adjustments_to_image(&image, suggested_basic_adjustments(&image));
         assert_eq!(output.get_pixel(0, 0)[0], 0);
-        assert!(output.get_pixel(100, 0)[0] > 55);
+        assert!(output.get_pixel(100, 0)[0] > 35);
         assert!(
             output.get_pixel(3_100, 0)[0] < 185,
             "highlight value was {}",
@@ -4300,9 +4401,20 @@ mod tests {
                 source.put_pixel(x, y, image::Rgb([100, 100, 100]));
             }
         }
-        apply_protected_local_contrast(&mut source, 1.0);
+        apply_protected_local_contrast(&mut source, 1.0, 75.0);
         assert_eq!(source.get_pixel(2, 2)[0], 120);
         assert!(source.get_pixel(23, 32)[0] - source.get_pixel(24, 32)[0] > 20);
+    }
+
+    #[test]
+    fn old_adjustment_json_defaults_new_controls() {
+        let settings: BasicAdjustments = serde_json::from_str(
+            r#"{"exposure":0.25,"lightBalance":4,"dynamicRange":100,"colourBoost":8}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.exposure, 0.25);
+        assert_eq!(settings.contrast, 0.0);
+        assert_eq!(settings.curve_shadows, 0.0);
     }
 
     #[test]

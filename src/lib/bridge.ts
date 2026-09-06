@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { Asset, AssetFilter, AssetPage, AssetVersion, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, ImportSummary, LibraryStatus, PromptSet, ServiceHealth, TrashSummary } from "../types";
+import { neutralAdjustments, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type ImportOptions, type ImportSummary, type LibraryStatus, type PromptSet, type ServiceHealth, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -197,7 +197,7 @@ export const api = {
   },
   async autoBasicAdjustments(assetId: string): Promise<BasicAdjustments> {
     if (tauri()) return invoke("auto_basic_adjustments", { assetId });
-    return { exposure: 0, lightBalance: 0, dynamicRange: 100, colourBoost: 10 };
+    return { ...neutralAdjustments, dynamicRange: 100, contrast: 8, highlights: -30, shadows: 20, whites: 6, blacks: -7, clarity: 7, dehaze: 3, colourBoost: 9, saturation: 2 };
   },
   async previewBasicAdjustments(asset: Asset, adjustments: BasicAdjustments): Promise<string> {
     if (tauri()) return convertFileSrc(await invoke<string>("preview_basic_adjustments", { assetId: asset.id, adjustments }));

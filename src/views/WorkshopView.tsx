@@ -1,8 +1,8 @@
 import { Check, ChevronDown, Clipboard, Cloud, Cpu, Download, FolderOutput, LoaderCircle, Play, RotateCcw, SlidersHorizontal, Sparkles, SunMedium, Upload, WandSparkles } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { Asset, AssetVersion, BasicAdjustments, BatchJob, EditIntent, EditRecipe, PreserveConstraint, PromptSet, ServiceHealth } from "../types";
+import { neutralAdjustments, type Asset, type AssetVersion, type BasicAdjustments, type BatchJob, type EditIntent, type EditRecipe, type PreserveConstraint, type PromptSet, type ServiceHealth } from "../types";
 import { displayIntent } from "../lib/format";
-import { AdjustmentSlider } from "../components/AdjustmentSlider";
+import { PhotoAdjustmentControls } from "../components/PhotoAdjustmentControls";
 
 const intents: EditIntent[] = ["restoration", "scratch_repair", "denoise", "sharpen", "upscale", "lighting_correction", "object_removal", "sky_replacement", "colourisation", "custom"];
 const preservation: PreserveConstraint[] = ["identity_faces", "composition", "text", "period_detail", "skin_texture", "grain", "monochrome_tonality"];
@@ -60,8 +60,6 @@ function BatchRecipeReview({ job, onSave }: { job: BatchJob; onSave: Props["onSa
     </div>
   );
 }
-
-const neutralAdjustments: BasicAdjustments = { exposure: 0, lightBalance: 0, dynamicRange: 0, colourBoost: 0 };
 
 export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, onPrompts, onCopy, onPrepare, onExportExternal, onImportReturned, onLoadVersions, onSetPreferred, onReplace, onAutoAdjustments, onPreviewAdjustments, onApplyAdjustments, onEnqueue, onRunLocal, onJob, onSaveJobReview, onApproveJobs }: Props) {
   const [intent, setIntent] = useState<EditIntent>("restoration");
@@ -149,9 +147,6 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
       setSelectedVersionId(version.id);
     } finally { setAdjusting(null); }
   };
-  const previewFilter = `brightness(${2 ** adjustments.exposure}) contrast(${1 + adjustments.dynamicRange / 250}) saturate(${1 + adjustments.colourBoost / 100})`;
-  const temperatureColour = adjustments.lightBalance >= 0 ? `rgba(255, 152, 72, ${adjustments.lightBalance / 500})` : `rgba(77, 151, 255, ${Math.abs(adjustments.lightBalance) / 500})`;
-
   return (
     <main className="view workshop-view">
       <section className="workshop-main">
@@ -159,7 +154,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
         {!asset ? <div className="empty-state"><Sparkles size={42} /><h2>Select a photograph</h2><p>Choose a frame in the Library or Triage view first.</p></div> : (
           <>
             <div className="workbench">
-              <div className="source-preview"><img style={{ filter: adjustmentPreviewUrl ? undefined : previewFilter }} src={adjustmentPreviewUrl || asset.preferredVersionUrl || asset.previewUrl} alt={asset.filename} /><i className="tone-preview-overlay" style={{ background: adjustmentPreviewUrl ? "transparent" : temperatureColour }} aria-hidden="true" /><span>{asset.preferredVersionUrl ? "Preferred derived version" : "Protected original"} · live adjustment preview</span></div>
+              <div className="source-preview"><img src={adjustmentPreviewUrl || asset.preferredVersionUrl || asset.previewUrl} alt={asset.filename} /><span>{asset.preferredVersionUrl ? "Preferred derived version" : "Protected original"} · accurate adjustment preview</span></div>
               <div className="workbench-controls">
                 <label><span>What should change?</span><div className="select-wrap"><select value={intent} onChange={(event) => setIntent(event.target.value as EditIntent)}>{intents.map((item) => <option key={item} value={item}>{displayIntent(item)}</option>)}</select><ChevronDown size={15} /></div></label>
                 <label><span>Your brief</span><textarea value={brief} onChange={(event) => setBrief(event.target.value)} rows={4} /></label>
@@ -169,14 +164,9 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
             </div>
             <section className="adjustment-panel" aria-labelledby="adjustments-heading">
               <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={15} /> Reset</button></div>
-              <div className="adjustment-controls">
-                <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
-                <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />
-                <AdjustmentSlider label="Dynamic range" value={adjustments.dynamicRange} min={-100} max={100} step={1} low="Softer" high="Wider" onChange={(value) => setAdjustment("dynamicRange", value)} />
-                <AdjustmentSlider label="Colour boost" value={adjustments.colourBoost} min={-50} max={50} step={1} low="Muted" high="Richer" onChange={(value) => setAdjustment("colourBoost", value)} />
-              </div>
+              <PhotoAdjustmentControls value={adjustments} onChange={setAdjustment} />
               <div className="auto-range"><SunMedium size={20} /><div><strong>Protected maximum range</strong><span>Sets measured shadows and highlights near the clipping points, opens dark midtones and adds only a slight adaptive colour boost.</span></div><button className="primary-button" disabled={adjusting !== null} onClick={autoAdjust}>{adjusting === "auto" ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />} Maximise range</button></div>
-              <div className="adjustment-actions"><span>Live preview is approximate. The saved PNG uses the full-resolution colour-managed source.</span><button className="primary-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />} Save candidate version</button></div>
+              <div className="adjustment-actions"><span>The preview and saved PNG use the same processing pipeline; the saved version is rendered from the full-resolution source.</span><button className="primary-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />} Save candidate version</button></div>
             </section>
             <section className="version-panel" aria-labelledby="versions-heading">
               <div className="version-heading"><div><span className="step-number">V</span><div><h2 id="versions-heading">Versions & comparison</h2><p>Changing the displayed version never changes the photograph’s date, GPS, tags or decision.</p></div></div><button className="quiet-button" onClick={async () => { await onReplace(asset); await refreshVersions(asset); }}><Upload size={15} /> Replace with image</button></div>

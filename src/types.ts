@@ -116,8 +116,29 @@ export type PromptSet = { local: string; chatgpt: string; gemini: string; negati
 export type BasicAdjustments = {
   exposure: number;
   lightBalance: number;
+  tint: number;
+  contrast: number;
+  highlights: number;
+  shadows: number;
+  whites: number;
+  blacks: number;
   dynamicRange: number;
+  texture: number;
+  clarity: number;
+  dehaze: number;
   colourBoost: number;
+  saturation: number;
+  curveHighlights: number;
+  curveLights: number;
+  curveDarks: number;
+  curveShadows: number;
+};
+
+export const neutralAdjustments: BasicAdjustments = {
+  exposure: 0, lightBalance: 0, tint: 0, contrast: 0, highlights: 0, shadows: 0,
+  whites: 0, blacks: 0, dynamicRange: 0, texture: 0, clarity: 0, dehaze: 0,
+  colourBoost: 0, saturation: 0, curveHighlights: 0, curveLights: 0,
+  curveDarks: 0, curveShadows: 0,
 };
 
 export type JobAttempt = {
