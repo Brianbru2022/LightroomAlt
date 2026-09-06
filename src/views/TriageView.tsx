@@ -4,6 +4,7 @@ import { neutralAdjustments, type Asset, type AssetVersion, type BasicAdjustment
 import { formatDate } from "../lib/format";
 import { api } from "../lib/bridge";
 import { PhotoAdjustmentControls } from "../components/PhotoAdjustmentControls";
+import { useAdjustmentPreview } from "../hooks/useAdjustmentPreview";
 
 type Props = {
   assets: Asset[];
@@ -31,8 +32,6 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
   const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
-  const previewTimerRef = useRef<number | null>(null);
-  const previewRequestRef = useRef(0);
   const adjustmentsRef = useRef(neutralAdjustments);
   adjustmentsRef.current = adjustments;
   const selectedId = selected?.id;
@@ -46,13 +45,12 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const selectedIndex = Math.max(0, assets.findIndex((asset) => asset.id === selectedId));
   const filmstripStart = Math.max(0, selectedIndex - 30);
   const filmstripAssets = assets.slice(filmstripStart, selectedIndex + 31);
+  const { request: requestAdjustmentPreview, cancel: cancelAdjustmentPreview } = useAdjustmentPreview(onPreviewAdjustments, setAdjustmentPreviewUrl, (error) => setAdjustmentError(String(error)));
   useEffect(() => {
-    previewRequestRef.current += 1;
-    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    cancelAdjustmentPreview();
     adjustmentsRef.current = neutralAdjustments;
     setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); setAdjustmentPreviewUrl(null);
-  }, [selectedId]);
-  useEffect(() => () => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); }, []);
+  }, [selectedId, cancelAdjustmentPreview]);
   const toggleZoom = () => {
     if (zoomed) { setZoomed(false); return; }
     if (!selected) return;
@@ -84,18 +82,6 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [selectedId]);
 
-  const requestAdjustmentPreview = (asset: Asset, next: BasicAdjustments) => {
-    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
-    const request = ++previewRequestRef.current;
-    previewTimerRef.current = window.setTimeout(() => {
-      previewTimerRef.current = null;
-      void onPreviewAdjustments(asset, next).then((url) => {
-        if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
-      }).catch((error) => {
-        if (previewRequestRef.current === request) setAdjustmentError(String(error));
-      });
-    }, 120);
-  };
   const setAdjustment = (key: keyof BasicAdjustments, value: number) => {
     if (!selected) return;
     const next = { ...adjustmentsRef.current, [key]: value };
@@ -111,10 +97,9 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
       const next = await onAutoAdjustments(selected.id);
       adjustmentsRef.current = next;
       setAdjustments(next);
-      if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
-      const request = ++previewRequestRef.current;
+      cancelAdjustmentPreview();
       const url = await onPreviewAdjustments(selected, next);
-      if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
+      setAdjustmentPreviewUrl(url);
     } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
   };
   const applyAdjustments = async () => {
@@ -148,7 +133,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
         </dl>
         <div className="tag-list">{selected.tags.map((tag) => <span key={tag}>{tag}</span>)}<button onClick={() => onTags(selected)}><Tag size={13} /> Edit <kbd>T</kbd></button></div>
         <section className="triage-adjustments" aria-labelledby="triage-adjustments-heading">
-          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></div>
+          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => { cancelAdjustmentPreview(); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={14} /></button></div>
           <PhotoAdjustmentControls compact value={adjustments} onChange={setAdjustment} />
           <button className="auto-range-button" disabled={adjusting !== null} onClick={autoAdjust}>{adjusting === "auto" ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />} Maximise range</button>
           <button className="save-adjustment-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Save as candidate</button>

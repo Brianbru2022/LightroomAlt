@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { neutralAdjustments, type Asset, type AssetVersion, type BasicAdjustments, type BatchJob, type EditIntent, type EditRecipe, type PreserveConstraint, type PromptSet, type ServiceHealth } from "../types";
 import { displayIntent } from "../lib/format";
 import { PhotoAdjustmentControls } from "../components/PhotoAdjustmentControls";
+import { useAdjustmentPreview } from "../hooks/useAdjustmentPreview";
 
 const intents: EditIntent[] = ["restoration", "scratch_repair", "denoise", "sharpen", "upscale", "lighting_correction", "object_removal", "sky_replacement", "colourisation", "custom"];
 const preservation: PreserveConstraint[] = ["identity_faces", "composition", "text", "period_detail", "skin_texture", "grain", "monochrome_tonality"];
@@ -74,8 +75,6 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   const [adjustments, setAdjustments] = useState<BasicAdjustments>(neutralAdjustments);
   const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
   const [adjustmentPreviewUrl, setAdjustmentPreviewUrl] = useState<string | null>(null);
-  const previewTimerRef = useRef<number | null>(null);
-  const previewRequestRef = useRef(0);
   const adjustmentsRef = useRef(neutralAdjustments);
   adjustmentsRef.current = adjustments;
   const refreshVersions = async (current: Asset) => {
@@ -83,14 +82,13 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
     setVersions(next);
     setSelectedVersionId((selected) => next.some((item) => item.id === selected) ? selected : next.find((item) => item.isPreferred)?.id ?? next[0]?.id ?? "");
   };
+  const { request: requestAdjustmentPreview, cancel: cancelAdjustmentPreview } = useAdjustmentPreview(onPreviewAdjustments, setAdjustmentPreviewUrl);
   useEffect(() => {
-    previewRequestRef.current += 1;
-    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    cancelAdjustmentPreview();
     adjustmentsRef.current = neutralAdjustments;
     setRecipe(null); setPrompts(null); setVersions([]); setSelectedVersionId(""); setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null);
     if (asset) void refreshVersions(asset);
-  }, [asset?.id]);
-  useEffect(() => () => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); }, []);
+  }, [asset?.id, cancelAdjustmentPreview]);
   const selectedVersion = versions.find((item) => item.id === selectedVersionId) ?? versions[0];
 
   const analyse = async () => {
@@ -108,16 +106,6 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
   };
   const recipeLines = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean);
   const copy = async () => { if (!prompts) return; await onCopy(prompts[provider]); setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
-  const requestAdjustmentPreview = (current: Asset, next: BasicAdjustments) => {
-    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
-    const request = ++previewRequestRef.current;
-    previewTimerRef.current = window.setTimeout(() => {
-      previewTimerRef.current = null;
-      void onPreviewAdjustments(current, next).then((url) => {
-        if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
-      });
-    }, 120);
-  };
   const setAdjustment = (key: keyof BasicAdjustments, value: number) => {
     if (!asset) return;
     const next = { ...adjustmentsRef.current, [key]: value };
@@ -132,10 +120,9 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
       const next = await onAutoAdjustments(asset.id);
       adjustmentsRef.current = next;
       setAdjustments(next);
-      if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
-      const request = ++previewRequestRef.current;
+      cancelAdjustmentPreview();
       const url = await onPreviewAdjustments(asset, next);
-      if (previewRequestRef.current === request) setAdjustmentPreviewUrl(url);
+      setAdjustmentPreviewUrl(url);
     } finally { setAdjusting(null); }
   };
   const applyAdjustments = async () => {
@@ -163,7 +150,7 @@ export function WorkshopView({ asset, assets, jobs, serviceHealth, onAnalyse, on
               </div>
             </div>
             <section className="adjustment-panel" aria-labelledby="adjustments-heading">
-              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => { previewRequestRef.current += 1; if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={15} /> Reset</button></div>
+              <div className="adjustment-heading"><div><span className="step-number"><SlidersHorizontal size={15} /></span><div><h2 id="adjustments-heading">Simple adjustments</h2><p>Preview changes here, then save them as a separate candidate version.</p></div></div><button className="quiet-button" disabled={adjusting !== null} onClick={() => { cancelAdjustmentPreview(); adjustmentsRef.current = neutralAdjustments; setAdjustments(neutralAdjustments); setAdjustmentPreviewUrl(null); }}><RotateCcw size={15} /> Reset</button></div>
               <PhotoAdjustmentControls value={adjustments} onChange={setAdjustment} />
               <div className="auto-range"><SunMedium size={20} /><div><strong>Protected maximum range</strong><span>Sets measured shadows and highlights near the clipping points, opens dark midtones and adds only a slight adaptive colour boost.</span></div><button className="primary-button" disabled={adjusting !== null} onClick={autoAdjust}>{adjusting === "auto" ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />} Maximise range</button></div>
               <div className="adjustment-actions"><span>The preview and saved PNG use the same processing pipeline; the saved version is rendered from the full-resolution source.</span><button className="primary-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />} Save candidate version</button></div>
