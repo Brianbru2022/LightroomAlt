@@ -1,8 +1,9 @@
-import { Check, CircleHelp, Info, MapPin, Maximize2, Sparkles, Tag, X } from "lucide-react";
+import { Check, CircleHelp, Info, LoaderCircle, MapPin, Maximize2, RotateCcw, SlidersHorizontal, Sparkles, Tag, WandSparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { Asset, Decision } from "../types";
+import type { Asset, AssetVersion, BasicAdjustments, Decision } from "../types";
 import { formatDate } from "../lib/format";
 import { api } from "../lib/bridge";
+import { AdjustmentSlider } from "../components/AdjustmentSlider";
 
 type Props = {
   assets: Asset[];
@@ -16,12 +17,20 @@ type Props = {
   onWorkshop: () => void;
   onMap: () => void;
   onTags: (asset: Asset) => void;
+  onAutoAdjustments: (assetId: string) => Promise<BasicAdjustments>;
+  onApplyAdjustments: (asset: Asset, adjustments: BasicAdjustments) => Promise<AssetVersion>;
+  onAdjustmentSaved: () => void;
 };
 
-export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags }: Props) {
+const neutralAdjustments: BasicAdjustments = { exposure: 0, lightBalance: 0, dynamicRange: 0, colourBoost: 0 };
+
+export function TriageView({ assets, total, hasMore, loading, onLoadMore, selected, onSelect, onDecision, onWorkshop, onMap, onTags, onAutoAdjustments, onApplyAdjustments, onAdjustmentSaved }: Props) {
   const [zoomed, setZoomed] = useState(false);
   const [reviewUrl, setReviewUrl] = useState<string | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const [adjustments, setAdjustments] = useState<BasicAdjustments>(neutralAdjustments);
+  const [adjusting, setAdjusting] = useState<"auto" | "apply" | null>(null);
+  const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
   const selectedId = selected?.id;
   const decisionRef = useRef(onDecision); decisionRef.current = onDecision;
   const selectRef = useRef(onSelect); selectRef.current = onSelect;
@@ -33,7 +42,7 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
   const selectedIndex = Math.max(0, assets.findIndex((asset) => asset.id === selectedId));
   const filmstripStart = Math.max(0, selectedIndex - 30);
   const filmstripAssets = assets.slice(filmstripStart, selectedIndex + 31);
-  useEffect(() => { setZoomed(false); setReviewUrl(null); setReviewError(null); }, [selectedId]);
+  useEffect(() => { setZoomed(false); setReviewUrl(null); setReviewError(null); setAdjustments(neutralAdjustments); setAdjustmentError(null); }, [selectedId]);
   const toggleZoom = () => {
     if (zoomed) { setZoomed(false); return; }
     if (!selected) return;
@@ -65,11 +74,25 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [selectedId]);
 
+  const setAdjustment = (key: keyof BasicAdjustments, value: number) => setAdjustments((current) => ({ ...current, [key]: value }));
+  const autoAdjust = async () => {
+    if (!selected) return;
+    setAdjusting("auto"); setAdjustmentError(null);
+    try { setAdjustments(await onAutoAdjustments(selected.id)); } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
+  };
+  const applyAdjustments = async () => {
+    if (!selected) return;
+    setAdjusting("apply"); setAdjustmentError(null);
+    try { await onApplyAdjustments(selected, adjustments); onAdjustmentSaved(); } catch (error) { setAdjustmentError(String(error)); } finally { setAdjusting(null); }
+  };
+  const previewFilter = `brightness(${2 ** adjustments.exposure}) contrast(${1 + adjustments.dynamicRange / 250}) saturate(${1 + adjustments.colourBoost / 100})`;
+  const temperatureColour = adjustments.lightBalance >= 0 ? `rgba(255, 152, 72, ${adjustments.lightBalance / 500})` : `rgba(77, 151, 255, ${Math.abs(adjustments.lightBalance) / 500})`;
+
   if (!selected) return <main className="view empty-state"><CircleHelp size={42} /><h2>Nothing to triage</h2></main>;
   return (
     <main className="view triage-view">
       <div className="triage-stage">
-        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img src={zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl} alt={selected.filename} />{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
+        <div className={`hero-photo ${zoomed ? "zoomed" : ""}`}><img style={{ filter: previewFilter }} src={zoomed && reviewUrl ? reviewUrl : selected.preferredVersionUrl ?? selected.previewUrl} alt={selected.filename} /><i className="tone-preview-overlay" style={{ background: temperatureColour }} aria-hidden="true" />{reviewError ? <span className="review-error">Full-resolution review unavailable: {reviewError}</span> : null}</div>
         <div className="triage-actions">
           <button className={`triage-button discard ${selected.decision === "discard" ? "active" : ""}`} onClick={() => onDecision(selected.id, "discard")}><X size={20} /><span>Discard</span><kbd>←</kbd></button>
           <button className={`triage-button undecided ${selected.decision === "undecided" ? "active" : ""}`} onClick={() => onDecision(selected.id, "undecided")}><CircleHelp size={20} /><span>Undecided</span><kbd>↑</kbd></button>
@@ -90,6 +113,16 @@ export function TriageView({ assets, total, hasMore, loading, onLoadMore, select
           <div><dt>Files</dt><dd>{selected.representationCount > 1 ? `${selected.representationCount} paired representations` : "1 original"}</dd></div>
         </dl>
         <div className="tag-list">{selected.tags.map((tag) => <span key={tag}>{tag}</span>)}<button onClick={() => onTags(selected)}><Tag size={13} /> Edit <kbd>T</kbd></button></div>
+        <section className="triage-adjustments" aria-labelledby="triage-adjustments-heading">
+          <div className="triage-adjustment-heading"><h3 id="triage-adjustments-heading"><SlidersHorizontal size={16} /> Adjust</h3><button title="Reset adjustments" aria-label="Reset adjustments" disabled={adjusting !== null} onClick={() => setAdjustments(neutralAdjustments)}><RotateCcw size={14} /></button></div>
+          <AdjustmentSlider label="Exposure" value={adjustments.exposure} min={-2} max={2} step={0.05} suffix=" EV" onChange={(value) => setAdjustment("exposure", value)} />
+          <AdjustmentSlider label="Light balance" value={adjustments.lightBalance} min={-100} max={100} step={1} low="Cool" high="Warm" onChange={(value) => setAdjustment("lightBalance", value)} />
+          <AdjustmentSlider label="Dynamic range" value={adjustments.dynamicRange} min={-100} max={100} step={1} low="Softer" high="Wider" onChange={(value) => setAdjustment("dynamicRange", value)} />
+          <AdjustmentSlider label="Colour boost" value={adjustments.colourBoost} min={-50} max={50} step={1} low="Muted" high="Richer" onChange={(value) => setAdjustment("colourBoost", value)} />
+          <button className="auto-range-button" disabled={adjusting !== null} onClick={autoAdjust}>{adjusting === "auto" ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />} Maximise range</button>
+          <button className="save-adjustment-button" disabled={adjusting !== null} onClick={applyAdjustments}>{adjusting === "apply" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Save as candidate</button>
+          {adjustmentError ? <p role="alert">Could not apply adjustments: {adjustmentError}</p> : <small>Original remains protected. Saved adjustments appear in Versions.</small>}
+        </section>
         <div className="inspector-actions">
           <button onClick={onWorkshop}><Sparkles size={17} /> Edit with AI <kbd>E</kbd></button>
           <button onClick={onMap}><MapPin size={17} /> Show on map <kbd>M</kbd></button>

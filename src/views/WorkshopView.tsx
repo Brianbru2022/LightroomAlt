@@ -2,6 +2,7 @@ import { Check, ChevronDown, Clipboard, Cloud, Cpu, Download, FolderOutput, Load
 import { useEffect, useState } from "react";
 import type { Asset, AssetVersion, BasicAdjustments, BatchJob, EditIntent, EditRecipe, PreserveConstraint, PromptSet, ServiceHealth } from "../types";
 import { displayIntent } from "../lib/format";
+import { AdjustmentSlider } from "../components/AdjustmentSlider";
 
 const intents: EditIntent[] = ["restoration", "scratch_repair", "denoise", "sharpen", "upscale", "lighting_correction", "object_removal", "sky_replacement", "colourisation", "custom"];
 const preservation: PreserveConstraint[] = ["identity_faces", "composition", "text", "period_detail", "skin_texture", "grain", "monochrome_tonality"];
@@ -56,17 +57,6 @@ function BatchRecipeReview({ job, onSave }: { job: BatchJob; onSave: Props["onSa
       <label><span>Final local prompt</span><textarea rows={5} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
       <button className="quiet-button" disabled={saving || !observations.trim() || !constraints.trim() || !prompt.trim()} onClick={save}><Check size={14} /> {saving ? "Saving…" : "Save this recipe"}</button>
     </div>
-  );
-}
-
-function AdjustmentSlider({ label, value, min, max, step, suffix = "", low, high, onChange }: { label: string; value: number; min: number; max: number; step: number; suffix?: string; low?: string; high?: string; onChange: (value: number) => void }) {
-  const shown = `${value > 0 ? "+" : ""}${Number.isInteger(value) ? value : value.toFixed(2)}${suffix}`;
-  return (
-    <label className="adjustment-slider">
-      <span><strong>{label}</strong><output>{shown}</output></span>
-      <input aria-label={label} type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
-      {low && high ? <small><span>{low}</span><span>{high}</span></small> : null}
-    </label>
   );
 }
 
