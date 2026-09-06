@@ -11,7 +11,7 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 3. Browse the timeline, tags and OpenStreetMap-backed map; click the map to place an unlocated photograph.
 4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
-6. Make simple non-destructive exposure, light-balance, dynamic-range and colour adjustments, including a protected automatic range option.
+6. Make non-destructive basic exposure, white-balance, tonal-range, colour, texture/clarity/dehaze and point-curve adjustments, including a protected automatic range option.
 7. Create and edit a provider-specific recipe for local Qwen editing, ChatGPT or Gemini.
 8. Export a full-resolution sRGB PNG for an external service and import the returned image as a traceable candidate version.
 
@@ -21,12 +21,14 @@ Catalogue, triage and manual external-edit workflows work without either optiona
 
 - Copy and duplicate retention are always the import defaults.
 - A staged file and final managed file must match the source SHA-256 before catalogue registration.
-- Move removes a source only after managed placement, verification and catalogue commit, followed by an immediate source identity recheck.
+- Move removes a source only after managed placement, verification and catalogue commit, followed by an immediate recheck of both source and managed copy.
 - Unsupported, changed, missing or failed source files are retained.
 - Discard is only a catalogue decision. Trash is internal and reversible; Empty Trash uses the Windows Recycle Bin.
-- SQLite runs in WAL mode. Schema upgrades create and integrity-check a SQLite-consistent backup.
+- SQLite runs in WAL mode. Schema upgrades create and integrity-check a SQLite-consistent backup. Backups are written as partial files, verified, then promoted atomically.
 - Each library has a UUID marker and an exclusive lock. Missing/corrupt libraries open recovery rather than silent first-run setup.
 - Browser media access is restricted to generated previews and derived edits inside the current library. RAW files are not served to the WebView.
+
+If Keepframe restarts after an interrupted import, its import record is marked **needs attention** and all staged/managed files are retained. After interrupted Trash or Restore work, Keepframe reconciles only its catalogue state and tells you to inspect Trash or the Windows Recycle Bin. It does not delete files to make recovery appear complete.
 
 ## Clean-checkout validation
 
@@ -46,11 +48,23 @@ $env:KEEPFRAME_SETTINGS_DIR = "$PWD\.test-profile"
 pnpm tauri dev
 ```
 
-Build the invitation-only NSIS beta:
+Build the invitation-only NSIS beta and generate its matching checksum/provenance:
 
 ```powershell
-pnpm tauri build --bundles nsis
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1
 ```
+
+The current local installer is copied to `release\`; use only the filename and SHA-256 recorded in `release\BUILD_PROVENANCE.json` and `release\SHA256SUMS.txt`.
+
+## Test fixtures
+
+Rust tests generate disposable JPEG, PNG and TIFF image fixtures and verify metadata dimensions, thumbnail generation and corrupted-image rejection. Supported RAW extensions include CR2/CR3, NEF and ARW, but their decoder path depends on the bundled LibRaw tool and camera-specific files. We do not commit third-party camera originals without a clear redistribution licence. For pre-release camera coverage, place legally approved CR2/CR3, NEF and ARW samples in a private directory and run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-raw-fixtures.ps1 -FixtureRoot D:\Keepframe-private-fixtures
+```
+
+The fixture smoke test verifies EXIF dimensions/model and LibRaw inspection without modifying the originals. Then perform Copy import, thumbnail/review generation and malformed-file rejection against each fixture; record the camera model and LibRaw result in beta evidence. This is a residual beta gate, not a claim of universal RAW compatibility.
 
 ## Optional local AI
 
@@ -69,7 +83,7 @@ When the vision model is absent, Keepframe now labels the recipe as a determinis
 
 - Windows-only, single user.
 - HEIC catalogue previews depend on available decoding; full-resolution HEIC edit/export remains disabled unless decoding succeeds.
-- No exposure/curve/mask tools, conventional RAW development, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
+- No conventional RAW development, local masks, crop/straighten, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
 - The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
 
 See `BETA_TESTING.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

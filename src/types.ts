@@ -54,6 +54,7 @@ export type LibraryStatus = {
   configured: boolean;
   libraryRoot?: string;
   libraryIssue?: string;
+  recoveryNotice?: string;
   counts: Record<Decision, number> & { total: number };
 };
 

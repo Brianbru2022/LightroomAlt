@@ -1,3 +1,6 @@
+mod migrations;
+mod safety;
+
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
 use image::{ImageDecoder, ImageFormat, RgbImage};
@@ -38,19 +41,6 @@ fn hidden_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-fn remove_import_source(source: &Path, library_root: &Path) -> Result<()> {
-    let source = source
-        .canonicalize()
-        .unwrap_or_else(|_| source.to_path_buf());
-    let library_root = library_root
-        .canonicalize()
-        .unwrap_or_else(|_| library_root.to_path_buf());
-    if !source.starts_with(&library_root) && source.exists() {
-        fs::remove_file(source)?;
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct AnalysisWorker {
     url: Option<String>,
@@ -62,6 +52,7 @@ struct AppState {
     root: Mutex<Option<PathBuf>>,
     library_lock: Mutex<Option<fs::File>>,
     library_issue: Mutex<Option<String>>,
+    recovery_notice: Mutex<Option<String>>,
     local_ai_url: Mutex<String>,
     analysis_worker: Mutex<AnalysisWorker>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
@@ -108,6 +99,7 @@ struct LibraryStatus {
     configured: bool,
     library_root: Option<String>,
     library_issue: Option<String>,
+    recovery_notice: Option<String>,
     counts: Counts,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -488,14 +480,6 @@ struct LibraryMarker {
     format_version: i64,
 }
 
-fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(names.iter().any(|name| name == column))
-}
-
 fn database_integrity(connection: &Connection) -> Result<String> {
     connection
         .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
@@ -517,14 +501,22 @@ fn backup_database(root: &Path, label: &str) -> Result<PathBuf> {
         Local::now().format("%Y%m%d-%H%M%S"),
         &Uuid::new_v4().to_string()[..8]
     ));
-    connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
-    let verification = Connection::open(&backup)?;
+    let partial = backup.with_extension("sqlite.partial");
+    let vacuum_result = connection.execute("VACUUM INTO ?1", [partial.to_string_lossy().as_ref()]);
+    if let Err(error) = vacuum_result {
+        let _ = fs::remove_file(&partial);
+        return Err(KeepframeError::Database(error));
+    }
+    let verification = Connection::open(&partial)?;
     if database_integrity(&verification)? != "ok" {
-        let _ = fs::remove_file(&backup);
+        drop(verification);
+        let _ = fs::remove_file(&partial);
         return Err(KeepframeError::Message(
             "The catalogue backup failed its integrity check.".into(),
         ));
     }
+    drop(verification);
+    fs::rename(&partial, &backup)?;
     Ok(backup)
 }
 
@@ -597,47 +589,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY,operation_id TEXT NOT NULL REFERENCES trash_operations(id),asset_id TEXT NOT NULL REFERENCES assets(id),original_path TEXT NOT NULL,trash_path TEXT NOT NULL,state TEXT NOT NULL,error TEXT,UNIQUE(operation_id,original_path));
       CREATE INDEX IF NOT EXISTS idx_trash_items_asset ON trash_items(asset_id,state);
     "#)?;
-    if existed && version < 4 {
-        let additions = [
-            ("assets", "trashed_at", "ALTER TABLE assets ADD COLUMN trashed_at TEXT"),
-            ("imports", "state", "ALTER TABLE imports ADD COLUMN state TEXT NOT NULL DEFAULT 'completed'"),
-            ("imports", "mode", "ALTER TABLE imports ADD COLUMN mode TEXT NOT NULL DEFAULT 'move'"),
-            ("imports", "duplicate_policy", "ALTER TABLE imports ADD COLUMN duplicate_policy TEXT NOT NULL DEFAULT 'remove_after_verified_match'"),
-            ("imports", "cancel_requested", "ALTER TABLE imports ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"),
-            ("import_items", "staging_path", "ALTER TABLE import_items ADD COLUMN staging_path TEXT"),
-            ("import_items", "managed_path", "ALTER TABLE import_items ADD COLUMN managed_path TEXT"),
-            ("import_items", "source_hash", "ALTER TABLE import_items ADD COLUMN source_hash TEXT"),
-            ("import_items", "source_size", "ALTER TABLE import_items ADD COLUMN source_size INTEGER"),
-            ("import_items", "source_modified", "ALTER TABLE import_items ADD COLUMN source_modified TEXT"),
-            ("import_items", "source_action", "ALTER TABLE import_items ADD COLUMN source_action TEXT"),
-        ];
-        let missing = additions
-            .iter()
-            .map(|(table, column, sql)| Ok((*sql, !column_exists(&connection, table, column)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let tx = connection.transaction()?;
-        for (sql, should_add) in missing {
-            if should_add {
-                tx.execute(sql, [])?;
-            }
-        }
-        tx.execute(
-            "UPDATE imports SET state=CASE WHEN completed_at IS NULL THEN 'needs_attention' ELSE 'completed' END",
-            [],
-        )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(4,?1)",
-            [Utc::now().to_rfc3339()],
-        )?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tx.commit()?;
-    } else if !existed {
-        connection.execute(
-            "INSERT INTO schema_migrations(version,applied_at)VALUES(?1,?2)",
-            params![SCHEMA_VERSION, Utc::now().to_rfc3339()],
-        )?;
-        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    }
+    migrations::apply_v4(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -669,6 +621,58 @@ fn initialise_layout(root: &Path) -> Result<()> {
         [&recovered_at],
     )?;
     Ok(())
+}
+
+/// Reconcile only catalogue state after an unclean shutdown.  This routine never
+/// moves or deletes an image: uncertain import files stay in staging/Originals,
+/// and uncertain Trash entries remain recoverable for inspection.
+fn recover_interrupted_operations(root: &Path) -> Result<Option<String>> {
+    let connection = open_db(root)?;
+    let recovered_imports = connection.execute(
+        "UPDATE imports SET state='needs_attention',completed_at=?1 WHERE state='running'",
+        [Utc::now().to_rfc3339()],
+    )?;
+    let recovered_trash = connection.execute(
+        "UPDATE assets SET trashed_at=?1 WHERE id IN (
+            SELECT asset_id FROM trash_items GROUP BY asset_id
+            HAVING SUM(CASE WHEN state='moved' THEN 1 ELSE 0 END) > 0
+               AND SUM(CASE WHEN state IN ('planned','failed','restore_failed') THEN 1 ELSE 0 END) = 0
+        ) AND trashed_at IS NULL",
+        [Utc::now().to_rfc3339()],
+    )?;
+    let recovered_restores = connection.execute(
+        "UPDATE assets SET trashed_at=NULL WHERE id IN (
+            SELECT asset_id FROM trash_items GROUP BY asset_id
+            HAVING SUM(CASE WHEN state='restored' THEN 1 ELSE 0 END) > 0
+               AND SUM(CASE WHEN state <> 'restored' THEN 1 ELSE 0 END) = 0
+        ) AND trashed_at IS NOT NULL",
+        [],
+    )?;
+
+    let mut missing_trash = 0usize;
+    let mut statement = connection.prepare("SELECT id,trash_path FROM trash_items WHERE state='moved'")?;
+    let items = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (id, path) in items {
+        if !Path::new(&path).is_file() {
+            connection.execute(
+                "UPDATE trash_items SET state='empty_failed',error='Trash file was missing after an unclean shutdown; check the Windows Recycle Bin before taking further action.' WHERE id=?1",
+                [&id],
+            )?;
+            missing_trash += 1;
+        }
+    }
+
+    let mut details = Vec::new();
+    if recovered_imports > 0 {
+        details.push(format!("{recovered_imports} interrupted import(s) were found. Original source files were not deleted; staged or managed copies were retained for recovery."));
+    }
+    if recovered_trash > 0 || recovered_restores > 0 || missing_trash > 0 {
+        details.push("An interrupted Trash or Restore operation was reconciled without deleting files. Check Trash and the Windows Recycle Bin before retrying any affected action.".into());
+    }
+    Ok((!details.is_empty()).then(|| details.join(" ")))
 }
 
 fn parse_local_ai_health(value: &Value) -> ServiceHealth {
@@ -923,6 +927,11 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
         .lock()
         .map_err(|_| KeepframeError::Message("Library state lock failed".into()))?
         .clone();
+    let recovery_notice = state
+        .recovery_notice
+        .lock()
+        .map_err(|_| KeepframeError::Message("Recovery notice lock failed".into()))?
+        .clone();
     match root {
         Some(root) if db_path(&root).exists() => {
             let c = counts(&open_db(&root)?)?;
@@ -930,6 +939,7 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
                 configured: true,
                 library_root: Some(root.to_string_lossy().into()),
                 library_issue: issue,
+                recovery_notice,
                 counts: c,
             })
         }
@@ -937,6 +947,7 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
             configured: false,
             library_root: None,
             library_issue: issue,
+            recovery_notice,
             counts: Counts {
                 total: 0,
                 keep: 0,
@@ -1021,6 +1032,7 @@ async fn initialise_library(
         *state.library_issue.lock().unwrap() = Some(error.to_string());
         return Err(error);
     }
+    let recovery_notice = recover_interrupted_operations(&root)?;
     *state
         .root
         .lock()
@@ -1028,6 +1040,7 @@ async fn initialise_library(
         Some(root.clone());
     *state.library_lock.lock().unwrap() = Some(library_lock);
     *state.library_issue.lock().unwrap() = None;
+    *state.recovery_notice.lock().unwrap() = recovery_notice;
     allow_media_scope(&app, &root)?;
     let url = state.local_ai_url.lock().unwrap().clone();
     save_settings(&root, &url)?;
@@ -1185,7 +1198,7 @@ fn validate_local_output_path(output: &Path, intended_dir: &Path) -> Result<Path
     Ok(canonical_output)
 }
 
-fn has_verified_representation(connection: &Connection, sha256: &str) -> Result<bool> {
+fn verified_representation_path(connection: &Connection, sha256: &str) -> Result<Option<PathBuf>> {
     let mut statement = connection.prepare("SELECT path FROM representations WHERE sha256=?1")?;
     let paths = statement
         .query_map([sha256], |row| row.get::<_, String>(0))?
@@ -1193,10 +1206,10 @@ fn has_verified_representation(connection: &Connection, sha256: &str) -> Result<
     for path in paths {
         let path = PathBuf::from(path);
         if path.is_file() && hash_file(&path).is_ok_and(|managed_hash| managed_hash == sha256) {
-            return Ok(true);
+            return Ok(Some(path));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn path_is_catalogued(connection: &Connection, path: &Path) -> Result<bool> {
@@ -1989,13 +2002,7 @@ async fn import_photos(
         })
     })?;
     let available_bytes = fs2::available_space(&root)?;
-    let safety_margin = required_bytes / 20 + 256 * 1024 * 1024;
-    if available_bytes < required_bytes.saturating_add(safety_margin) {
-        return Err(KeepframeError::Message(format!(
-            "Not enough free space for a verified import. Required at least {} bytes including the safety margin; {} bytes are available.",
-            required_bytes.saturating_add(safety_margin), available_bytes
-        )));
-    }
+    safety::ensure_capacity(required_bytes, available_bytes)?;
     let items = files
         .into_iter()
         .map(|path| (Uuid::new_v4().to_string(), path))
@@ -2034,14 +2041,14 @@ async fn import_photos(
             "import-progress",
             json!({"importId":import_id,"current":index+1,"total":items.len(),"file":source}),
         );
-        let result = (|| -> Result<(bool, String, String)> {
+        let result = (|| -> Result<(bool, String, String, Option<PathBuf>)> {
             let source_hash = hash_file(source)?;
             let mut connection = open_db(&root)?;
-            if has_verified_representation(&connection, &source_hash)? {
+            if let Some(managed_path) = verified_representation_path(&connection, &source_hash)? {
                 let tx = connection.transaction()?;
                 tx.execute("UPDATE import_items SET state='duplicate',source_hash=?2,source_action='retained' WHERE id=?1",params![item_id,source_hash])?;
                 tx.commit()?;
-                return Ok((true, item_id.clone(), source_hash));
+                return Ok((true, item_id.clone(), source_hash, Some(managed_path)));
             }
             let meta = metadata(source);
             let captured = meta.captured.unwrap_or_else(Utc::now);
@@ -2052,16 +2059,7 @@ async fn import_photos(
                 .ok_or_else(|| KeepframeError::Message("Source has no filename".into()))?;
             let staged = stage_dir.join(format!("{}-{}", item_id, source_name.to_string_lossy()));
             connection.execute("UPDATE import_items SET state='staging',staging_path=?2,source_hash=?3,error=NULL WHERE id=?1",params![item_id,staged.to_string_lossy(),source_hash])?;
-            fs::copy(source, &staged)?;
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&staged)?
-                .sync_all()?;
-            if hash_file(&staged)? != source_hash {
-                return Err(KeepframeError::Message(
-                    "Staged copy did not match the source hash".into(),
-                ));
-            }
+            safety::copy_and_verify(source, &staged, &source_hash)?;
             connection.execute(
                 "UPDATE import_items SET state='verified' WHERE id=?1",
                 [&item_id],
@@ -2092,13 +2090,7 @@ async fn import_photos(
                     suffix += 1;
                 }
             }
-            fs::rename(&staged, &target)?;
-            if hash_file(&target)? != source_hash {
-                let _ = fs::remove_file(&target);
-                return Err(KeepframeError::Message(
-                    "Managed copy did not match the verified staged hash".into(),
-                ));
-            }
+            safety::promote_and_verify(&staged, &target, &source_hash)?;
             connection.execute(
                 "UPDATE import_items SET state='placed',managed_path=?2 WHERE id=?1",
                 params![item_id, target.to_string_lossy()],
@@ -2172,23 +2164,22 @@ async fn import_photos(
                 }
                 return Err(error);
             }
-            Ok((false, item_id.clone(), source_hash))
+            Ok((false, item_id.clone(), source_hash, Some(target)))
         })();
         match result {
-            Ok((is_duplicate, item_id, source_hash)) => {
+            Ok((is_duplicate, item_id, source_hash, managed_path)) => {
                 let remove_source = options.mode == "move"
                     && (!is_duplicate
                         || options.duplicate_source_policy == "remove_after_verified_match");
                 let source_action = if remove_source {
-                    match hash_file(source) {
-                        Ok(current_hash) if current_hash == source_hash => {
-                            remove_import_source(source, &root)
-                        }
-                        Ok(_) => Err(KeepframeError::Message(
-                            "Source changed after verification and was retained.".into(),
-                        )),
-                        Err(error) => Err(error),
-                    }
+                    safety::delete_verified_external_source(
+                        source,
+                        managed_path.as_deref().ok_or_else(|| KeepframeError::Message(
+                            "No verified managed copy was available; the source was retained.".into(),
+                        ))?,
+                        &source_hash,
+                        &root,
+                    )
                 } else {
                     Ok(())
                 };
@@ -4278,6 +4269,7 @@ pub fn run() {
             root: Mutex::new(None),
             library_lock: Mutex::new(None),
             library_issue: Mutex::new(None),
+            recovery_notice: Mutex::new(None),
             local_ai_url: Mutex::new("http://127.0.0.1:7868".into()),
             analysis_worker: Mutex::new(AnalysisWorker::default()),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -4290,9 +4282,11 @@ pub fn run() {
                         Ok(lock)
                     }) {
                         Ok(lock) => {
+                            let recovery_notice = recover_interrupted_operations(&root)?;
                             allow_media_scope(app.handle(), &root)?;
                             *app.state::<AppState>().root.lock().unwrap() = Some(root);
                             *app.state::<AppState>().library_lock.lock().unwrap() = Some(lock);
+                            *app.state::<AppState>().recovery_notice.lock().unwrap() = recovery_notice;
                         }
                         Err(error) => {
                             *app.state::<AppState>().library_issue.lock().unwrap() =
@@ -4551,10 +4545,107 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(database_integrity(&restored).unwrap(), "ok");
+        assert!(!backup.with_extension("sqlite.partial").exists());
 
         drop(restored);
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fresh_catalogue_records_the_current_immutable_migration() {
+        let root = std::env::temp_dir().join(format!("keepframe-migration-test-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let connection = open_db(&root).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let recorded: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=4", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(recorded, 1);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_import_is_marked_for_attention_without_removing_files() {
+        let root = std::env::temp_dir().join(format!("keepframe-import-recovery-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let staged = root.join(".keepframe/staging/import-1/photo.jpg");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"staged pixels").unwrap();
+        let connection = open_db(&root).unwrap();
+        connection.execute(
+            "INSERT INTO imports(id,source,started_at,state) VALUES('import-1','D:/camera','2026-09-06T12:00:00Z','running')",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO import_items(id,import_id,source_path,state,staging_path) VALUES('item-1','import-1','D:/camera/photo.jpg','staging',?1)",
+            [staged.to_string_lossy().as_ref()],
+        ).unwrap();
+        drop(connection);
+
+        let notice = recover_interrupted_operations(&root).unwrap().unwrap();
+        let connection = open_db(&root).unwrap();
+        let state: String = connection.query_row("SELECT state FROM imports WHERE id='import-1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(state, "needs_attention");
+        assert!(notice.contains("Original source files were not deleted"));
+        assert_eq!(fs::read(&staged).unwrap(), b"staged pixels");
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_trash_is_reconciled_without_deleting_the_managed_file() {
+        let root = std::env::temp_dir().join(format!("keepframe-trash-recovery-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let trashed = root.join(".keepframe/Trash/operation-1/item-1/photo.jpg");
+        fs::create_dir_all(trashed.parent().unwrap()).unwrap();
+        fs::write(&trashed, b"managed pixels").unwrap();
+        let connection = open_db(&root).unwrap();
+        connection.execute(
+            "INSERT INTO assets(id,filename,captured_at,thumbnail_path,created_at) VALUES('asset-1','photo.jpg','2026-09-06T12:00:00Z','thumb.jpg','2026-09-06T12:00:00Z')",
+            [],
+        ).unwrap();
+        connection.execute("INSERT INTO trash_operations(id,state,created_at) VALUES('operation-1','running','2026-09-06T12:00:00Z')", []).unwrap();
+        connection.execute(
+            "INSERT INTO trash_items(id,operation_id,asset_id,original_path,trash_path,state) VALUES('item-1','operation-1','asset-1',?1,?2,'moved')",
+            [root.join("Originals/photo.jpg").to_string_lossy().as_ref(), trashed.to_string_lossy().as_ref()],
+        ).unwrap();
+        drop(connection);
+
+        let notice = recover_interrupted_operations(&root).unwrap().unwrap();
+        let connection = open_db(&root).unwrap();
+        let is_trashed: Option<String> = connection.query_row("SELECT trashed_at FROM assets WHERE id='asset-1'", [], |row| row.get(0)).unwrap();
+        assert!(is_trashed.is_some());
+        assert!(notice.contains("without deleting files"));
+        assert_eq!(fs::read(&trashed).unwrap(), b"managed pixels");
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_jpeg_png_and_tiff_fixtures_produce_thumbnails_and_reject_corruption() {
+        let root = std::env::temp_dir().join(format!("keepframe-image-fixtures-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(24, 12, |x, y| {
+            image::Rgb([(x * 10) as u8, (y * 20) as u8, 90])
+        }));
+        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff)] {
+            let source = root.join(name);
+            let thumbnail = root.join(format!("{name}.thumbnail.jpg"));
+            image.save_with_format(&source, format).unwrap();
+            let info = metadata(&source);
+            assert_eq!((info.width, info.height), (Some(24), Some(12)));
+            thumbnail_from(&source, &thumbnail).unwrap();
+            assert!(thumbnail.is_file());
+        }
+        let malformed = root.join("malformed.jpg");
+        fs::write(&malformed, b"not an image").unwrap();
+        assert!(thumbnail_from(&malformed, &root.join("bad.thumbnail.jpg")).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4785,10 +4876,10 @@ mod tests {
         let external = base.join("camera.jpg");
         let managed = library.join("Originals/2026/09/02/managed.jpg");
         fs::create_dir_all(managed.parent().unwrap()).unwrap();
-        fs::write(&external, b"external").unwrap();
-        fs::write(&managed, b"managed").unwrap();
-        remove_import_source(&external, &library).unwrap();
-        remove_import_source(&managed, &library).unwrap();
+        fs::write(&external, b"verified pixels").unwrap();
+        fs::write(&managed, b"verified pixels").unwrap();
+        let digest = hash_file(&external).unwrap();
+        safety::delete_verified_external_source(&external, &managed, &digest, &library).unwrap();
         assert!(!external.exists());
         assert!(managed.exists());
         fs::remove_dir_all(&base).unwrap();
@@ -4807,11 +4898,11 @@ mod tests {
         connection.execute("INSERT INTO assets(id,filename,captured_at,thumbnail_path,created_at)VALUES('asset','managed.jpg','2026-09-02T12:00:00Z','thumb.jpg','2026-09-02T12:00:00Z')", []).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'jpg','managed',19,0)", params![managed.to_string_lossy(), hash]).unwrap();
 
-        assert!(has_verified_representation(&connection, &hash).unwrap());
+        assert!(verified_representation_path(&connection, &hash).unwrap().is_some());
         fs::write(&managed, b"damaged").unwrap();
-        assert!(!has_verified_representation(&connection, &hash).unwrap());
+        assert!(verified_representation_path(&connection, &hash).unwrap().is_none());
         fs::remove_file(&managed).unwrap();
-        assert!(!has_verified_representation(&connection, &hash).unwrap());
+        assert!(verified_representation_path(&connection, &hash).unwrap().is_none());
         assert!(path_is_catalogued(&connection, &managed).unwrap());
 
         drop(connection);

@@ -106,6 +106,9 @@ export function App() {
     return () => { active = false; };
   }, []);
   useEffect(() => {
+    if (status.configured && status.recoveryNotice) setNotice(status.recoveryNotice);
+  }, [status.configured, status.recoveryNotice]);
+  useEffect(() => {
     if (!api.isNative()) return;
     let active = true;
     const unlisteners: Array<() => void> = [];
