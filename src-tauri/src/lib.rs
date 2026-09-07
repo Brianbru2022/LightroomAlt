@@ -4753,6 +4753,35 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_png_and_tiff_full_resolution_geometry_matches_preview_renderer() {
+        let root = std::env::temp_dir().join(format!("keepframe-geometry-parity-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source_image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(30, 20, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8])
+        }));
+        let adjustments = BasicAdjustments { crop_left: 0.2, crop_top: 0.1, crop_width: 0.5, crop_height: 0.75, rotate_quadrants: 1, straighten: 3.0, ..BasicAdjustments::default() }.validate().unwrap();
+        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff)] {
+            let source = root.join(name);
+            source_image.save_with_format(&source, format).unwrap();
+            let before_hash = hash_file(&source).unwrap();
+            let preview = apply_adjustments_to_image(&image::open(&source).unwrap(), adjustments);
+            let full_resolution = prepare_full_resolution_image(&source, Some((30, 20)), &root.join("working")).unwrap();
+            let candidate = apply_adjustments_to_image(&full_resolution, adjustments);
+            assert_eq!(candidate.dimensions(), (10, 23), "{name}");
+            assert_eq!(candidate, preview, "{name}");
+            let output = root.join(format!("{name}.candidate.png"));
+            fs::write(&output, encode_srgb_png(&image::DynamicImage::ImageRgb8(candidate)).unwrap()).unwrap();
+            let rendered = image::open(&output).unwrap();
+            assert_eq!((rendered.width(), rendered.height()), (10, 23), "{name}");
+            assert_eq!(hash_file(&source).unwrap(), before_hash, "{name} source was modified");
+        }
+        let malformed = root.join("malformed.tiff");
+        fs::write(&malformed, b"not an image").unwrap();
+        assert!(prepare_full_resolution_image(&malformed, None, &root.join("working")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_library_rejects_a_second_writer() {
         let root = std::env::temp_dir().join(format!("keepframe-lock-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
