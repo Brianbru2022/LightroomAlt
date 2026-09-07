@@ -12,8 +12,8 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
 6. Make non-destructive basic exposure, white-balance, tonal-range, colour, texture/clarity/dehaze and point-curve adjustments, including a protected automatic range option.
-7. Create and edit a provider-specific recipe for local Qwen editing, ChatGPT or Gemini.
-8. Export a full-resolution sRGB PNG for an external service and import the returned image as a traceable candidate version.
+7. Choose a plain-language AI action such as **Improve photo**, **Improve lighting**, **Enhance colour**, **Restore old photo**, **Remove distraction** or **Custom instruction**.
+8. Choose a local edit when it is genuinely available, or prepare a manual ChatGPT/Gemini hand-off. Import the returned image as a traceable candidate version.
 
 Catalogue, triage and manual external-edit workflows work without either optional AI service. Keepframe does not submit to ChatGPT or Gemini APIs and stores no cloud API keys.
 
@@ -77,13 +77,21 @@ The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe r
 
 The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The model download is approximately 17.5 GB and requires explicit confirmation. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
 
-When the vision model is absent, Keepframe now labels the recipe as a deterministic controls-only fallback. Qwen-Image-Edit at port 7868 is a separate integration and is reported independently in Settings & Health.
+When the vision model is absent, Keepframe labels the recipe as a deterministic controls-only fallback. Qwen-Image-Edit at port 7868 is a separate integration and is reported independently in Settings & Health.
+
+## AI workflow and availability
+
+The AI Workshop records a small structured recipe behind each plain-language action: the goal, constraints to preserve, restrictions, edit strength and an optional custom instruction. Provider prompts are rendered deterministically from that recipe; the default workshop view does not require editing prompt text or JSON.
+
+Settings shows the loopback-only service address and a bounded health result: available, service not running, model missing, incompatible configuration or health-check failure. Health results are briefly cached; use **Refresh status** after changing a local service or model. Keepframe never marks local editing ready without the required Qwen image-edit capability.
+
+For ChatGPT and Gemini, **Prepare image and instruction** creates a local sRGB PNG, a provider-specific instruction and a persistent **waiting for external result** job. Keepframe never uploads the photograph. After you explicitly upload and edit it with the chosen provider, **Import returned image** validates that the file exists, decodes, has plausible dimensions and is not identical to the protected source. The result is stored under `Edits` as an AI-derived candidate with provider, prompt, recipe, hashes and time. You can compare it with, prefer it over, or return to the protected original at any time.
 
 ## Current beta boundaries
 
 - Windows-only, single user.
 - HEIC catalogue previews depend on available decoding; full-resolution HEIC edit/export remains disabled unless decoding succeeds.
-- No conventional RAW development, local masks, crop/straighten, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
+- No conventional RAW development, local masks, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
 - The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
 
 See `BETA_TESTING.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

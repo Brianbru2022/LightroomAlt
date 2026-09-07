@@ -3,7 +3,7 @@ mod safety;
 
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
-use image::{ImageDecoder, ImageFormat, RgbImage};
+use image::{GenericImageView, ImageDecoder, ImageFormat, RgbImage};
 use reqwest::multipart;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use thiserror::Error;
@@ -54,6 +55,7 @@ struct AppState {
     library_issue: Mutex<Option<String>>,
     recovery_notice: Mutex<Option<String>>,
     local_ai_url: Mutex<String>,
+    health_cache: Mutex<Option<(Instant, ServiceHealth)>>,
     analysis_worker: Mutex<AnalysisWorker>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -110,6 +112,8 @@ struct ServiceHealth {
     local_ai_busy: bool,
     local_ai_model: Option<String>,
     local_ai_detail: String,
+    local_ai_state: String,
+    local_ai_url: String,
     analysis_model_installed: bool,
     analysis_available: bool,
     analysis_detail: String,
@@ -317,6 +321,8 @@ struct EditRecipe {
     schema_version: u8,
     asset_id: String,
     common_brief: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
     observations: Vec<String>,
     intents: Vec<String>,
     preserve: Vec<String>,
@@ -747,6 +753,8 @@ fn parse_local_ai_health(value: &Value) -> ServiceHealth {
         local_ai_busy: busy,
         local_ai_model: model,
         local_ai_detail: detail,
+        local_ai_state: if available { "available" } else { "model_missing" }.into(),
+        local_ai_url: String::new(),
         analysis_model_installed: analysis_installed(),
         analysis_available: false,
         analysis_detail: analysis_installation_detail(),
@@ -761,6 +769,8 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
             local_ai_model: None,
             local_ai_detail:
                 "The configured AI service was blocked because it is not loopback-only.".into(),
+            local_ai_state: "incompatible".into(),
+            local_ai_url: String::new(),
             analysis_model_installed: analysis_installed(),
             analysis_available: false,
             analysis_detail: analysis_installation_detail(),
@@ -781,6 +791,8 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
                 local_ai_model: None,
                 local_ai_detail: "The service responded, but its capability report was invalid."
                     .into(),
+                local_ai_state: "health_check_failed".into(),
+                local_ai_url: url.clone(),
                 analysis_model_installed: analysis_installed(),
                 analysis_available: false,
                 analysis_detail: analysis_installation_detail(),
@@ -792,6 +804,8 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
             local_ai_busy: false,
             local_ai_model: None,
             local_ai_detail: format!("No local image service is responding at {url}."),
+            local_ai_state: "service_not_running".into(),
+            local_ai_url: url,
             analysis_model_installed: analysis_installed(),
             analysis_available: false,
             analysis_detail: analysis_installation_detail(),
@@ -986,7 +1000,16 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
     }
 }
 #[tauri::command]
-async fn get_service_health(state: State<'_, AppState>) -> Result<ServiceHealth> {
+async fn get_service_health(force: Option<bool>, state: State<'_, AppState>) -> Result<ServiceHealth> {
+    if !force.unwrap_or(false) {
+        if let Ok(cache) = state.health_cache.lock() {
+            if let Some((checked_at, health)) = cache.as_ref() {
+                if checked_at.elapsed() < Duration::from_secs(12) {
+                    return Ok(health.clone());
+                }
+            }
+        }
+    }
     start_analysis_worker(&state);
     let url = state
         .local_ai_url
@@ -994,6 +1017,7 @@ async fn get_service_health(state: State<'_, AppState>) -> Result<ServiceHealth>
         .map_err(|_| KeepframeError::Message("AI service setting lock failed".into()))?
         .clone();
     let mut health = local_ai_health(&url).await;
+    health.local_ai_url = url.clone();
     let worker_status = state.analysis_worker.lock().ok().map(|mut worker| {
         let running = worker
             .child
@@ -1046,7 +1070,22 @@ async fn get_service_health(state: State<'_, AppState>) -> Result<ServiceHealth>
             fallback_detail
         };
     }
+    if let Ok(mut cache) = state.health_cache.lock() {
+        *cache = Some((Instant::now(), health.clone()));
+    }
     Ok(health)
+}
+
+#[tauri::command]
+fn configure_local_ai(url: String, state: State<'_, AppState>) -> Result<()> {
+    let url = validated_loopback_url(&url)?;
+    let root = root_from(&state)?;
+    save_settings(&root, &url)?;
+    *state.local_ai_url.lock().map_err(|_| KeepframeError::Message("AI service setting lock failed".into()))? = url;
+    if let Ok(mut cache) = state.health_cache.lock() {
+        *cache = None;
+    }
+    Ok(())
 }
 #[tauri::command]
 async fn initialise_library(
@@ -1224,6 +1263,32 @@ fn validate_local_output_path(output: &Path, intended_dir: &Path) -> Result<Path
         KeepframeError::Message("The local editor returned an invalid image file.".into())
     })?;
     Ok(canonical_output)
+}
+
+/// Accept only a complete, decodable, plausibly-sized image that is distinct
+/// from the protected source. The caller owns any failed output and removes it.
+fn validate_ai_output(output: &Path, source_hash: &str, expected: Option<(u32, u32)>) -> Result<String> {
+    let metadata = fs::metadata(output).map_err(|_| KeepframeError::Message("The AI result file was not found.".into()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(KeepframeError::Message("The AI result is empty or incomplete.".into()));
+    }
+    let image = image::open(output).map_err(|_| KeepframeError::Message("The AI result is not a valid decodable image.".into()))?;
+    let (width, height) = image.dimensions();
+    if width < 64 || height < 64 {
+        return Err(KeepframeError::Message("The AI result dimensions are implausibly small.".into()));
+    }
+    if let Some((source_width, source_height)) = expected {
+        let source_pixels = u64::from(source_width) * u64::from(source_height);
+        let output_pixels = u64::from(width) * u64::from(height);
+        if output_pixels < source_pixels / 100 || output_pixels > source_pixels.saturating_mul(100) {
+            return Err(KeepframeError::Message("The AI result dimensions are implausible for this photograph.".into()));
+        }
+    }
+    let output_hash = hash_file(output)?;
+    if output_hash == source_hash {
+        return Err(KeepframeError::Message("The returned image is identical to the protected source; no edit was imported.".into()));
+    }
+    Ok(output_hash)
 }
 
 fn verified_representation_path(connection: &Connection, sha256: &str) -> Result<Option<PathBuf>> {
@@ -3044,6 +3109,7 @@ fn update_location(
 async fn create_edit_recipe(
     asset_id: String,
     intent: String,
+    action: Option<String>,
     common_brief: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<EditRecipe> {
@@ -3053,7 +3119,12 @@ async fn create_edit_recipe(
         .lock()
         .ok()
         .and_then(|value| Some((value.url.clone()?, value.token.clone()?)));
-    analyse_asset(&root, &asset_id, &intent, common_brief, worker).await
+    if let Some(action) = action.as_ref() {
+        if !AI_ACTIONS.contains(&action.as_str()) {
+            return Err(KeepframeError::Message("Unsupported AI action".into()));
+        }
+    }
+    analyse_asset(&root, &asset_id, &intent, action, common_brief, worker).await
 }
 
 async fn unload_analysis_worker(state: &State<'_, AppState>) -> Result<()> {
@@ -3087,6 +3158,10 @@ const EDIT_INTENTS: &[&str] = &[
     "colourisation",
     "custom",
 ];
+const AI_ACTIONS: &[&str] = &[
+    "improve_photo", "improve_lighting", "enhance_colour", "restore_old_photo",
+    "remove_distraction", "custom_instruction",
+];
 const PRESERVE_CONSTRAINTS: &[&str] = &[
     "identity_faces",
     "composition",
@@ -3114,6 +3189,7 @@ fn validate_recipe(recipe: &EditRecipe, asset_id: &str) -> Result<()> {
             .preserve
             .iter()
             .all(|value| PRESERVE_CONSTRAINTS.contains(&value.as_str()))
+        || recipe.action.as_ref().is_some_and(|value| !AI_ACTIONS.contains(&value.as_str()))
         || !["subtle", "balanced", "strong"].contains(&recipe.strength.as_str())
         || recipe.output.format != "png"
         || !recipe.output.preserve_dimensions
@@ -3130,6 +3206,7 @@ async fn analyse_asset(
     root: &Path,
     asset_id: &str,
     intent: &str,
+    action: Option<String>,
     common_brief: Option<String>,
     worker: Option<(String, String)>,
 ) -> Result<EditRecipe> {
@@ -3232,6 +3309,7 @@ async fn analyse_asset(
         schema_version: 1,
         asset_id: asset_id.to_string(),
         common_brief,
+        action,
         observations,
         intents: suggested,
         preserve,
@@ -3413,6 +3491,7 @@ async fn enqueue_batch(
                 &root,
                 &asset_id,
                 "restoration",
+                None,
                 Some(common_brief.clone()),
                 worker.clone(),
             )
@@ -3728,7 +3807,13 @@ async fn execute_job(root: PathBuf, url: String, job_id: String, app: AppHandle)
         .ok_or_else(|| KeepframeError::Message("Local AI service returned no output path".into()))?
         .to_string();
     let output = validate_local_output_path(Path::new(&returned_output), &output_dir)?;
-    let output_hash = hash_file(&output)?;
+    let output_hash = match validate_ai_output(&output, &hash, width.zip(height)) {
+        Ok(output_hash) => output_hash,
+        Err(error) => {
+            let _ = fs::remove_file(&output);
+            return Err(error);
+        }
+    };
     let output = output.to_string_lossy().into_owned();
     let connection = open_db(&root)?;
     let current_state: String =
@@ -3814,7 +3899,7 @@ fn transition_job_in(connection: &Connection, job_id: &str, action: &str) -> Res
         "cancel"
             if matches!(
                 current.as_str(),
-                "draft" | "analysing" | "review_required" | "queued" | "running"
+                "draft" | "analysing" | "review_required" | "queued" | "running" | "waiting_external"
             ) =>
         {
             "cancelled"
@@ -4266,7 +4351,7 @@ fn prepare_cloud_export(
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    let safe_provider = provider;
+    let safe_provider = provider.clone();
     let output = root.join("Exports").join(format!(
         "{}-{}-{}.png",
         Local::now().format("%Y%m%d-%H%M%S"),
@@ -4274,7 +4359,18 @@ fn prepare_cloud_export(
         safe_provider
     ));
     fs::write(&output, png)?;
-    fs::write(output.with_extension("prompt.txt"), prompt)?;
+    fs::write(output.with_extension("prompt.txt"), &prompt)?;
+    let now = Utc::now().to_rfc3339();
+    let batch_id = Uuid::new_v4().to_string();
+    let job_id = Uuid::new_v4().to_string();
+    connection.execute(
+        "INSERT INTO batches(id,common_brief,state,created_at)VALUES(?1,?2,'waiting_external',?3)",
+        params![batch_id, prompt, now],
+    )?;
+    connection.execute(
+        "INSERT INTO jobs(id,batch_id,asset_id,state,prompt,model,created_at,updated_at)VALUES(?1,?2,?3,'waiting_external',?4,?5,?6,?6)",
+        params![job_id, batch_id, asset_id, prompt, provider, now],
+    )?;
     Ok(output.to_string_lossy().into())
 }
 
@@ -4284,12 +4380,16 @@ fn import_returned_edit(
     path: String,
     provider: String,
     prompt: String,
+    recipe: Option<EditRecipe>,
     state: State<'_, AppState>,
 ) -> Result<BatchJob> {
     validated_provider(&provider)?;
     let root = root_from(&state)?;
     let mut connection = open_db(&root)?;
-    let (captured,source_hash,asset_name):(String,String,String)=connection.query_row("SELECT a.captured_at,r.sha256,a.filename FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 LIMIT 1",[&asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    if let Some(recipe) = recipe.as_ref() {
+        validate_recipe(recipe, &asset_id)?;
+    }
+    let (captured,source_hash,asset_name,width,height):(String,String,String,Option<u32>,Option<u32>)=connection.query_row("SELECT a.captured_at,r.sha256,a.filename,a.width,a.height FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 LIMIT 1",[&asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let date = DateTime::parse_from_rfc3339(&captured)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -4301,9 +4401,6 @@ fn import_returned_edit(
         .join(&asset_id);
     fs::create_dir_all(&output_dir)?;
     let source = PathBuf::from(path);
-    image::open(&source).map_err(|_| {
-        KeepframeError::Message("The returned edit is not a supported image".into())
-    })?;
     let extension = source
         .extension()
         .and_then(|e| e.to_str())
@@ -4321,17 +4418,37 @@ fn import_returned_edit(
         extension
     ));
     fs::copy(&source, &output)?;
-    let output_hash = hash_file(&output)?;
+    let output_hash = match validate_ai_output(&output, &source_hash, width.zip(height)) {
+        Ok(output_hash) => output_hash,
+        Err(error) => {
+            let _ = fs::remove_file(&output);
+            return Err(error);
+        }
+    };
     let now = Utc::now().to_rfc3339();
-    let batch_id = Uuid::new_v4().to_string();
-    let job_id = Uuid::new_v4().to_string();
+    let waiting: Option<(String, String)> = connection.query_row(
+        "SELECT id,batch_id FROM jobs WHERE asset_id=?1 AND state='waiting_external' AND model=?2 ORDER BY updated_at DESC LIMIT 1",
+        params![asset_id, provider],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let had_waiting = waiting.is_some();
+    let (batch_id, job_id) = waiting.unwrap_or_else(|| (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()));
     let tx = connection.transaction()?;
-    tx.execute(
-        "INSERT INTO batches(id,common_brief,state,created_at)VALUES(?1,?2,'succeeded',?3)",
-        params![batch_id, prompt, now],
-    )?;
-    tx.execute("INSERT INTO jobs(id,batch_id,asset_id,state,prompt,output_path,output_hash,created_at,updated_at)VALUES(?1,?2,?3,'succeeded',?4,?5,?6,?7,?7)",params![job_id,batch_id,asset_id,prompt,output.to_string_lossy(),output_hash,now])?;
-    tx.execute("INSERT INTO versions(id,asset_id,kind,path,provider,prompt,source_hash,output_hash,state,created_at)VALUES(?1,?2,'edited',?3,?4,?5,?6,?7,'candidate',?8)",params![Uuid::new_v4().to_string(),asset_id,output.to_string_lossy(),provider,prompt,source_hash,output_hash,now])?;
+    if !had_waiting {
+        tx.execute(
+            "INSERT INTO batches(id,common_brief,state,created_at)VALUES(?1,?2,'succeeded',?3)",
+            params![batch_id, prompt, now],
+        )?;
+    } else {
+        tx.execute("UPDATE batches SET state='succeeded' WHERE id=?1", [&batch_id])?;
+    }
+    let recipe_json = recipe.as_ref().map(serde_json::to_string).transpose()?;
+    if had_waiting {
+        tx.execute("UPDATE jobs SET state='succeeded',prompt=?2,recipe_json=?3,output_path=?4,output_hash=?5,updated_at=?6,error=NULL WHERE id=?1",params![job_id,prompt,recipe_json,output.to_string_lossy(),output_hash,now])?;
+    } else {
+        tx.execute("INSERT INTO jobs(id,batch_id,asset_id,state,prompt,recipe_json,output_path,output_hash,created_at,updated_at)VALUES(?1,?2,?3,'succeeded',?4,?5,?6,?7,?8,?8)",params![job_id,batch_id,asset_id,prompt,recipe_json,output.to_string_lossy(),output_hash,now])?;
+    }
+    tx.execute("INSERT INTO versions(id,asset_id,kind,path,provider,prompt,recipe_json,source_hash,output_hash,state,created_at)VALUES(?1,?2,'edited',?3,?4,?5,?6,?7,?8,'candidate',?9)",params![Uuid::new_v4().to_string(),asset_id,output.to_string_lossy(),provider,prompt,recipe_json,source_hash,output_hash,now])?;
     tx.commit()?;
     Ok(BatchJob {
         id: job_id,
@@ -4358,6 +4475,7 @@ pub fn run() {
             library_issue: Mutex::new(None),
             recovery_notice: Mutex::new(None),
             local_ai_url: Mutex::new("http://127.0.0.1:7868".into()),
+            health_cache: Mutex::new(None),
             analysis_worker: Mutex::new(AnalysisWorker::default()),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -4394,6 +4512,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_library_status,
             get_service_health,
+            configure_local_ai,
             initialise_library,
             prepare_review_preview,
             check_catalogue_integrity,
@@ -4831,6 +4950,7 @@ mod tests {
             schema_version: 1,
             asset_id: "a".into(),
             common_brief: Some("Restore".into()),
+            action: Some("restore_old_photo".into()),
             observations: vec!["Scratch".into()],
             intents: vec!["restoration".into()],
             preserve: vec!["identity_faces".into()],
@@ -4860,6 +4980,7 @@ mod tests {
             schema_version: 1,
             asset_id: asset_id.into(),
             common_brief: Some("Restore naturally".into()),
+            action: Some("restore_old_photo".into()),
             observations: vec!["Visible dust requires restrained repair.".into()],
             intents: vec!["restoration".into()],
             preserve: vec!["composition".into()],
@@ -5217,9 +5338,32 @@ mod tests {
         assert!(health.local_ai_available);
         assert!(health.local_ai_busy);
         assert_eq!(health.local_ai_model.as_deref(), Some("Qwen-Image-Edit"));
+        assert_eq!(health.local_ai_state, "available");
 
         let unavailable = parse_local_ai_health(&json!({ "edit_models": [] }));
         assert!(!unavailable.local_ai_available);
+        assert_eq!(unavailable.local_ai_state, "model_missing");
+    }
+
+    #[test]
+    fn ai_results_must_be_distinct_decodable_and_plausibly_sized() {
+        let root = std::env::temp_dir().join(format!("keepframe-ai-output-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.png");
+        let same = root.join("same.png");
+        let changed = root.join("changed.png");
+        let tiny = root.join("tiny.png");
+        image::DynamicImage::new_rgb8(128, 96).save(&source).unwrap();
+        fs::copy(&source, &same).unwrap();
+        let mut altered = image::RgbImage::new(128, 96);
+        altered.put_pixel(0, 0, image::Rgb([12, 34, 56]));
+        altered.save(&changed).unwrap();
+        image::DynamicImage::new_rgb8(4, 4).save(&tiny).unwrap();
+        let source_hash = hash_file(&source).unwrap();
+        assert!(validate_ai_output(&same, &source_hash, Some((128, 96))).is_err());
+        assert!(validate_ai_output(&tiny, &source_hash, Some((128, 96))).is_err());
+        assert!(validate_ai_output(&changed, &source_hash, Some((128, 96))).is_ok());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

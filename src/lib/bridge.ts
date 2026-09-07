@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type ImportOptions, type ImportSummary, type LibraryStatus, type PromptSet, type ServiceHealth, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type ImportOptions, type ImportSummary, type LibraryStatus, type PromptSet, type ServiceHealth, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -43,8 +43,11 @@ export const api = {
   async status(): Promise<LibraryStatus> {
     return tauri() ? invoke("get_library_status") : demoStatus(browserAssets);
   },
-  async serviceHealth(): Promise<ServiceHealth> {
-    return tauri() ? invoke("get_service_health") : { localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "The local Qwen image editor is ready.", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "Demo mode uses the deterministic controls-only fallback." };
+  async serviceHealth(force = false): Promise<ServiceHealth> {
+    return tauri() ? invoke("get_service_health", { force }) : { localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "The local Qwen image editor is ready.", localAiState: "available", localAiUrl: "http://127.0.0.1:7868", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "Demo mode uses the deterministic controls-only fallback." };
+  },
+  async configureLocalAi(url: string): Promise<void> {
+    if (tauri()) await invoke("configure_local_ai", { url });
   },
   async catalogueIntegrity(): Promise<string> {
     return tauri() ? invoke("check_catalogue_integrity") : "ok";
@@ -160,9 +163,9 @@ export const api = {
     if (tauri()) return invoke("update_location", { assetId: id, latitude, longitude });
     const asset = browserAssets.find((item) => item.id === id); if (asset) { history.push({ kind: "location", id, latitude: asset.latitude, longitude: asset.longitude }); asset.latitude = latitude; asset.longitude = longitude; }
   },
-  async analyse(asset: Asset, intent: EditIntent, commonBrief?: string): Promise<EditRecipe> {
-    if (tauri()) return invoke("create_edit_recipe", { assetId: asset.id, intent, commonBrief });
-    return { ...makeRecipe(asset, intent), commonBrief };
+  async analyse(asset: Asset, intent: EditIntent, action?: AiAction, commonBrief?: string): Promise<EditRecipe> {
+    if (tauri()) return invoke("create_edit_recipe", { assetId: asset.id, intent, action, commonBrief });
+    return { ...makeRecipe(asset, intent), action, commonBrief };
   },
   async prompts(recipe: EditRecipe): Promise<PromptSet> {
     return tauri() ? invoke("render_prompts", { recipe }) : renderPrompts(recipe);
@@ -221,7 +224,7 @@ export const api = {
     await revealItemInDir(path);
     return path;
   },
-  async importReturned(assetId: string, provider: "chatgpt" | "gemini", prompt: string): Promise<BatchJob | null> {
+  async importReturned(assetId: string, provider: "chatgpt" | "gemini", prompt: string, recipe?: EditRecipe): Promise<BatchJob | null> {
     if (!tauri()) {
       const asset = browserAssets.find((item) => item.id === assetId); if (!asset) return null;
       const job: BatchJob = { id: crypto.randomUUID(), batchId: crypto.randomUUID(), assetId, assetName: asset.filename, state: "succeeded", prompt, attempts: [], outputUrl: asset.previewUrl };
@@ -229,7 +232,7 @@ export const api = {
     }
     const path = await open({ multiple: false, directory: false, title: "Choose the returned edited image", filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "tif", "tiff"] }] });
     if (typeof path !== "string") return null;
-    return invoke("import_returned_edit", { assetId, path, provider, prompt });
+    return invoke("import_returned_edit", { assetId, path, provider, prompt, recipe });
   },
   async jobs(): Promise<BatchJob[]> {
     return tauri() ? (await invoke<BatchJob[]>("list_jobs")).map(withJobUrls) : browserJobs;

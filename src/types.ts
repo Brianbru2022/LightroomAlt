@@ -11,6 +11,13 @@ export type EditIntent =
   | "sky_replacement"
   | "colourisation"
   | "custom";
+export type AiAction =
+  | "improve_photo"
+  | "improve_lighting"
+  | "enhance_colour"
+  | "restore_old_photo"
+  | "remove_distraction"
+  | "custom_instruction";
 export type PreserveConstraint =
   | "identity_faces"
   | "composition"
@@ -25,6 +32,7 @@ export type JobState =
   | "review_required"
   | "queued"
   | "running"
+  | "waiting_external"
   | "succeeded"
   | "failed"
   | "cancelled"
@@ -64,6 +72,8 @@ export type ServiceHealth = {
   localAiBusy: boolean;
   localAiModel?: string;
   localAiDetail: string;
+  localAiState: "available" | "not_configured" | "unavailable" | "service_not_running" | "model_missing" | "incompatible" | "health_check_failed" | string;
+  localAiUrl: string;
   analysisModelInstalled: boolean;
   analysisAvailable: boolean;
   analysisDetail: string;
@@ -107,6 +117,7 @@ export type EditRecipe = {
   schemaVersion: 1;
   assetId: string;
   commonBrief?: string;
+  action?: AiAction;
   observations: string[];
   intents: EditIntent[];
   preserve: PreserveConstraint[];

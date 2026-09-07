@@ -19,8 +19,15 @@ describe("AI Workshop batch review", () => {
     };
     const save = vi.fn().mockResolvedValue(undefined);
     const approve = vi.fn().mockResolvedValue(undefined);
+    const analyse = vi.fn().mockResolvedValue(recipe);
     const auto = vi.fn().mockResolvedValue({ ...neutralAdjustments, dynamicRange: 100, highlights: -30, shadows: 20, colourBoost: 9 });
-    render(<WorkshopView asset={demoAssets[0]} assets={demoAssets} jobs={[job]} serviceHealth={{ localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "Ready", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "Controls-only fallback" }} onAnalyse={vi.fn().mockResolvedValue(recipe)} onPrompts={vi.fn().mockResolvedValue(renderPrompts(recipe))} onCopy={vi.fn()} onPrepare={vi.fn()} onExportExternal={vi.fn()} onImportReturned={vi.fn()} onLoadVersions={vi.fn().mockResolvedValue([])} onSetPreferred={vi.fn()} onExport={vi.fn()} onReplace={vi.fn()} onAutoAdjustments={auto} onPreviewAdjustments={vi.fn().mockResolvedValue("adjusted-preview.png")} onApplyAdjustments={vi.fn()} onEnqueue={vi.fn()} onRunLocal={vi.fn()} onJob={vi.fn()} onSaveJobReview={save} onApproveJobs={approve} />);
+    render(<WorkshopView asset={demoAssets[0]} assets={demoAssets} jobs={[job]} serviceHealth={{ localAiAvailable: true, serviceReachable: true, localAiBusy: false, localAiModel: "Qwen-Image-Edit", localAiDetail: "Ready", localAiState: "available", localAiUrl: "http://127.0.0.1:7868", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "Controls-only fallback" }} onAnalyse={analyse} onPrompts={vi.fn().mockResolvedValue(renderPrompts(recipe))} onCopy={vi.fn()} onPrepare={vi.fn()} onExportExternal={vi.fn()} onImportReturned={vi.fn()} onLoadVersions={vi.fn().mockResolvedValue([])} onSetPreferred={vi.fn()} onExport={vi.fn()} onReplace={vi.fn()} onAutoAdjustments={auto} onPreviewAdjustments={vi.fn().mockResolvedValue("adjusted-preview.png")} onApplyAdjustments={vi.fn()} onEnqueue={vi.fn()} onRunLocal={vi.fn()} onJob={vi.fn()} onSaveJobReview={save} onApproveJobs={approve} />);
+
+    expect(screen.getByRole("button", { name: /Improve photo/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Restore old photo/ })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /Improve lighting/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(analyse).toHaveBeenCalledWith(demoAssets[0], "lighting_correction", "improve_lighting", expect.stringContaining("lighting")));
 
     fireEvent.click(screen.getByRole("button", { name: "Maximise range" }));
     await waitFor(() => expect(screen.getAllByLabelText("Highlights")[0]).toHaveValue("-30"));
