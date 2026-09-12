@@ -3,15 +3,17 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchJob, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchJob, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
+export const defaultExportConfig = (changes: Partial<ExportConfig> = {}): ExportConfig => ({ schemaVersion: 1, format: "jpeg", jpegQuality: 90, pngCompression: "balanced", resizeMode: "original", width: 2400, height: 1600, percentage: 100, noEnlarge: true, ppi: 300, sharpening: "standard", metadata: "all", includeLocation: false, includeKeywords: true, includeRating: true, filenameTemplate: "{stem}-{sequence}", customText: "", sequenceStart: 1, sequencePadding: 3, collision: "unique", colourSpace: "srgb", ...changes });
 const intelligentMaskDemo = () => !tauri() && ["localhost", "127.0.0.1"].includes(window.location.hostname) && new URLSearchParams(window.location.search).has("intelligentMaskDemo");
 const browserMaskCoverage = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAYCAAAAAC+OKDoAAAAP0lEQVR4nGNgGAKAEZnzH4soEzZ5BgQLSe1/7EYjm4AVMOEwgOE/ySYMCQWMaBJEBxSyRqwxgGwCQhTdvgEGAKyOBxyY54qVAAAAAElFTkSuQmCC";
 let browserAssets = structuredClone(demoAssets);
 const browserDevelopRecipes = new Map<string, DevelopRecipe>();
 let browserDevelopPresets: DevelopPreset[] = [];
+let browserExportPresets: ExportPreset[] = [];
 const browserBuiltInDevelopPresets: DevelopPreset[] = [
   ["natural", "Natural", {}], ["clean", "Clean", { contrast: 4, clarity: 3, colourBoost: 3 }], ["warm", "Warm", { lightBalance: 14, tint: 2, colourBoost: 6 }], ["cool", "Cool", { lightBalance: -12, tint: -2, highlights: -8 }], ["high-contrast", "High Contrast", { contrast: 20, whites: 8, blacks: -10 }], ["soft-contrast", "Soft Contrast", { contrast: -14, highlights: -12, shadows: 12 }], ["vivid", "Vivid", { contrast: 8, colourBoost: 20, saturation: 5 }], ["muted", "Muted", { contrast: -4, colourBoost: -8, saturation: -22 }], ["portrait", "Portrait", { highlights: -10, shadows: 8, texture: -12, clarity: -5, colourBoost: 5 }], ["landscape", "Landscape", { contrast: 10, dehaze: 7, clarity: 8, colourBoost: 15 }], ["black-and-white", "Black & White", { contrast: 10, clarity: 4, saturation: -100 }], ["high-key-bw", "High-Key B&W", { exposure: .45, contrast: -8, shadows: 18, blacks: 10, saturation: -100 }], ["low-key-bw", "Low-Key B&W", { exposure: -.45, contrast: 18, highlights: -15, blacks: -18, saturation: -100 }],
 ].map(([id, name, changes]) => ({ schemaVersion: 1, id: id as string, name: name as string, categories: ["whiteBalance", "tone", "presence", "colour"], settings: { ...neutralAdjustments, ...(changes as Partial<BasicAdjustments>) }, builtIn: true }));
@@ -362,6 +364,27 @@ export const api = {
     await revealItemInDir(path);
     return path;
   },
+  async chooseExportFolder(): Promise<string | null> {
+    if (!tauri()) return "D:\\Exports";
+    const path = await open({ directory: true, multiple: false, title: "Choose the export folder" });
+    return typeof path === "string" ? path : null;
+  },
+  async startExportBatch(assetIds: string[], destination: string, config: ExportConfig): Promise<ExportBatchReport> {
+    if (tauri()) return invoke("start_export_batch", { request: { assetIds, destination, config } });
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+    return { batchId: crypto.randomUUID(), destination, requested: assetIds.length, complete: assetIds.length, failed: 0, cancelled: 0, skipped: 0, elapsedMs: 120, peakWorkingBytes: 18_000_000, concurrency: 1, items: assetIds.map((assetId) => { const asset=browserAssets.find((value)=>value.id===assetId); return { assetId, filename: asset?.filename ?? "Photograph", state: "complete", path: `${destination}\\${asset?.filename ?? assetId}.jpg`, width: asset?.width, height: asset?.height, bytes: 2_400_000, elapsedMs: 120 }; }) };
+  },
+  async cancelExportBatch(): Promise<void> { if (tauri()) await invoke("cancel_export_batch"); },
+  async onExportProgress(handler: (progress: ExportProgress) => void): Promise<() => void> { if (!tauri()) return () => undefined; return listen<ExportProgress>("export-progress", (event) => handler(event.payload)); },
+  async exportPresets(): Promise<ExportPreset[]> {
+    if (tauri()) return invoke("list_export_presets");
+    return [{ id: "web-jpeg", name: "Web JPEG", builtIn: true, config: defaultExportConfig({ resizeMode: "longedge", width: 2400, ppi: 96 }) }, { id: "full-jpeg", name: "Full-size JPEG", builtIn: true, config: defaultExportConfig() }, { id: "archive-tiff", name: "Archive TIFF", builtIn: true, config: defaultExportConfig({ format: "tiff", sharpening: "none" }) }, ...browserExportPresets];
+  },
+  async saveExportPreset(preset: ExportPreset): Promise<ExportPreset> { if (tauri()) return invoke("save_export_preset", { preset }); const next={...preset,builtIn:false};browserExportPresets=browserExportPresets.filter((value)=>value.id!==next.id).concat(next);return next; },
+  async deleteExportPreset(id: string): Promise<void> { if (tauri()) await invoke("delete_export_preset", { id }); else browserExportPresets=browserExportPresets.filter((value)=>value.id!==id); },
+  async exportExportPreset(id: string): Promise<void> { if (!tauri()) return; const path=await save({ title:"Export output preset",defaultPath:"keepframe-output.keepframe-export-preset",filters:[{name:"Keepframe output preset",extensions:["keepframe-export-preset"]}]});if(typeof path==="string")await invoke("export_export_preset",{id,path}); },
+  async importExportPreset(): Promise<ExportPreset | null> { if (!tauri()) return null;const path=await open({multiple:false,directory:false,title:"Import output preset",filters:[{name:"Keepframe output preset",extensions:["keepframe-export-preset"]}]});return typeof path==="string"?invoke("import_export_preset",{path}):null; },
+  async revealExport(destination: string): Promise<void> { if (tauri()) await revealItemInDir(destination); },
   async importReturned(assetId: string, provider: "chatgpt" | "gemini", prompt: string, recipe?: EditRecipe): Promise<BatchJob | null> {
     if (!tauri()) {
       const asset = browserAssets.find((item) => item.id === assetId); if (!asset) return null;

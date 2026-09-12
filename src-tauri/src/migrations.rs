@@ -234,6 +234,17 @@ pub(crate) fn apply_v9(connection: &mut Connection, _existed: bool, version: i64
     tx.commit()
 }
 
+/// Version 10 stores user-authored output presets only. Destinations and queue
+/// state are deliberately excluded so portable presets cannot disclose paths.
+pub(crate) fn apply_v10(connection: &mut Connection, _existed: bool, version: i64) -> rusqlite::Result<()> {
+    if version >= 10 { return Ok(()); }
+    let tx = connection.transaction()?;
+    tx.execute("CREATE TABLE IF NOT EXISTS export_presets(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,schema_version INTEGER NOT NULL,preset_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)", [])?;
+    tx.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(10,?1)", [Utc::now().to_rfc3339()])?;
+    tx.pragma_update(None, "user_version", 10)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +294,15 @@ mod tests {
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         let recipe: String = connection.query_row("SELECT recipe_json FROM develop_recipes WHERE asset_id='asset'", [], |row| row.get(0)).unwrap();
         assert_eq!(version, 9); assert_eq!(recipe, "{\"schemaVersion\":1,\"settings\":{}}");
+    }
+
+    #[test]
+    fn v10_migration_is_atomic_and_creates_export_presets() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);").unwrap();
+        apply_v10(&mut connection, true, 9).unwrap(); apply_v10(&mut connection, true, 10).unwrap();
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let records: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='export_presets'", [], |row| row.get(0)).unwrap();
+        assert_eq!((version, records), (10, 1));
     }
 }

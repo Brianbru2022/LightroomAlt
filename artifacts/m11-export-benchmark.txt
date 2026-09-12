@@ -1,0 +1,15 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.40s
+     Running unittests src\lib.rs (target\debug\deps\keepframe_lib-bb8f2a4a84ffb5b0.exe)
+
+running 1 test
+test professional_export::tests::milestone_11_export_performance_checkpoint has been running for over 60 seconds
+M11_EXPORT_BENCHMARK {"batch10":{"acceptedMasks":true,"averageMs":9981,"complete":10,"concurrency":1,"memoryScope":"retained source plus one developed RGB item; excludes allocator, encoder and process overhead","mixedDevelopStates":true,"peakTrackedRgbBytes":51840000,"totalMs":99815},"fixture":"3600x2400 deterministic developed RGB with accepted masks; resized variants are 2400x1600","formats":[{"bytes":7009777,"encodeAndStageWriteMs":10218,"finalPromotionMs":0,"format":"jpeg","height":2400,"metadataMs":435,"renderMs":427,"resizeMs":0,"sharpenMs":218,"totalMs":11298,"variant":"full","width":3600},{"bytes":3695622,"encodeAndStageWriteMs":5365,"finalPromotionMs":0,"format":"jpeg","height":1600,"metadataMs":452,"renderMs":427,"resizeMs":362,"sharpenMs":102,"totalMs":6708,"variant":"resized","width":2400},{"bytes":5051975,"encodeAndStageWriteMs":1089,"finalPromotionMs":0,"format":"png","height":2400,"metadataMs":808,"renderMs":427,"resizeMs":0,"sharpenMs":227,"totalMs":2551,"variant":"full","width":3600},{"bytes":4459292,"encodeAndStageWriteMs":636,"finalPromotionMs":0,"format":"png","height":1600,"metadataMs":784,"renderMs":427,"resizeMs":367,"sharpenMs":112,"totalMs":2326,"variant":"resized","width":2400},{"bytes":25923640,"encodeAndStageWriteMs":15,"finalPromotionMs":0,"format":"tiff","height":2400,"metadataMs":471,"renderMs":427,"resizeMs":0,"sharpenMs":235,"totalMs":1148,"variant":"full","width":3600}]}
+test professional_export::tests::milestone_11_export_performance_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 122.43s
+
+     Running unittests src\main.rs (target\debug\deps\keepframe-e304f9be85a61756.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

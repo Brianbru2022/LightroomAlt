@@ -1,4 +1,5 @@
 mod interoperability;mod migrations;
+mod professional_export;
 mod safety;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -30,7 +31,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
 const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
@@ -74,6 +75,7 @@ struct AppState {
     preview_generation: Arc<AtomicU64>,
     renderer_caches: Arc<Mutex<RendererCaches>>,
     mask_install_cancel: AtomicBool,
+    export_generation: Arc<AtomicU64>,
     folder_watcher: Mutex<Option<FolderWatcher>>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -1076,6 +1078,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v7(&mut connection, existed, version)?;
     migrations::apply_v8(&mut connection, existed, version)?;
     migrations::apply_v9(&mut connection, existed, version)?;
+    migrations::apply_v10(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -5740,6 +5743,60 @@ fn unused_export_path(destination: &Path, stem: &str, extension: &str) -> PathBu
     destination.join(format!("{stem}-export-{}.{}", Uuid::new_v4(), extension))
 }
 
+#[tauri::command]
+async fn start_export_batch(
+    request: professional_export::ExportRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<professional_export::ExportBatchReport> {
+    let root = root_from(&state)?;
+    let caches = Arc::clone(&state.renderer_caches);
+    let generation = Arc::clone(&state.export_generation);
+    let requested_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        professional_export::run_batch(
+            &root,
+            request,
+            &caches,
+            &generation,
+            requested_generation,
+            Some(&app),
+        )
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Export task failed: {error}")))?
+}
+
+#[tauri::command]
+fn cancel_export_batch(state: State<'_, AppState>) {
+    state.export_generation.fetch_add(1, Ordering::AcqRel);
+}
+
+#[tauri::command]
+fn list_export_presets(state: State<'_, AppState>) -> Result<Vec<professional_export::ExportPreset>> {
+    professional_export::list_presets(&root_from(&state)?)
+}
+
+#[tauri::command]
+fn save_export_preset(preset: professional_export::ExportPreset, state: State<'_, AppState>) -> Result<professional_export::ExportPreset> {
+    professional_export::save_preset(&root_from(&state)?, preset)
+}
+
+#[tauri::command]
+fn delete_export_preset(id: String, state: State<'_, AppState>) -> Result<()> {
+    professional_export::delete_preset(&root_from(&state)?, &id)
+}
+
+#[tauri::command]
+fn export_export_preset(id: String, path: String, state: State<'_, AppState>) -> Result<()> {
+    professional_export::export_preset(&root_from(&state)?, &id, Path::new(&path))
+}
+
+#[tauri::command]
+fn import_export_preset(path: String, state: State<'_, AppState>) -> Result<professional_export::ExportPreset> {
+    professional_export::import_preset(&root_from(&state)?, Path::new(&path))
+}
+
 fn export_asset_image_with_cache(root: &Path, asset_id: &str, destination: &Path, renderer_caches: Option<&Mutex<RendererCaches>>) -> Result<PathBuf> {
     if !destination.is_dir() {
         return Err(KeepframeError::Message("Choose an existing export folder.".into(),));
@@ -6089,6 +6146,7 @@ pub fn run() {
             preview_generation: Arc::new(AtomicU64::new(0)),
             renderer_caches: Arc::new(Mutex::new(RendererCaches::default())),
             mask_install_cancel: AtomicBool::new(false),
+            export_generation: Arc::new(AtomicU64::new(0)),
             folder_watcher: Mutex::new(None),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -6189,6 +6247,13 @@ pub fn run() {
             import_develop_preset,
             propose_develop_auto,
             import_replacement,
+            start_export_batch,
+            cancel_export_batch,
+            list_export_presets,
+            save_export_preset,
+            delete_export_preset,
+            export_export_preset,
+            import_export_preset,
             export_asset_image,
             export_external_edit,
             prepare_cloud_export,

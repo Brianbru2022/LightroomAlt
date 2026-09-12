@@ -269,6 +269,34 @@ export type TrashSummary = {
 
 export type SidecarExportSummary = { requested: number; written: number; preservedExisting: number; failed: string[] };
 export type SidecarImportResult = { tagsImported: boolean; locationImported: boolean; triageImported: boolean; conflicts: string[] };
+
+export type ExportConfig = {
+  schemaVersion: 1;
+  format: "jpeg" | "png" | "tiff";
+  jpegQuality: number;
+  pngCompression: "fast" | "balanced" | "best";
+  resizeMode: "original" | "bounds" | "longedge" | "shortedge" | "percentage";
+  width: number;
+  height: number;
+  percentage: number;
+  noEnlarge: boolean;
+  ppi: number;
+  sharpening: "none" | "low" | "standard" | "high";
+  metadata: "all" | "copyrightcontact" | "copyright" | "none";
+  includeLocation: boolean;
+  includeKeywords: boolean;
+  includeRating: boolean;
+  filenameTemplate: string;
+  customText: string;
+  sequenceStart: number;
+  sequencePadding: number;
+  collision: "ask" | "skip" | "replace" | "unique";
+  colourSpace: "srgb";
+};
+export type ExportPreset = { id: string; name: string; builtIn: boolean; config: ExportConfig };
+export type ExportProgress = { batchId: string; current: number; completed: number; total: number; phase: "Waiting" | "Rendering" | "Resizing and sharpening" | "Encoding" | "Writing" | "Complete" | string; file?: string; failures?: number; cancelled?: number; skipped?: number };
+export type ExportItemResult = { assetId: string; filename: string; state: "waiting" | "rendering" | "encoding" | "writing" | "complete" | "failed" | "cancelled" | "skipped" | string; path?: string; error?: string; width?: number; height?: number; bytes?: number; elapsedMs: number };
+export type ExportBatchReport = { batchId: string; destination: string; requested: number; complete: number; failed: number; cancelled: number; skipped: number; elapsedMs: number; peakWorkingBytes: number; concurrency: number; items: ExportItemResult[] };
 export type IntegrityFinding = { assetId?: string; filename?: string; kind: string; detail: string };
 export type IntegrityReport = { scannedAssets: number; missingOriginals: number; missingDerivedVersions: number; modifiedOriginals: number; untrackedManagedFiles: number; sidecarConflicts: number; findings: IntegrityFinding[] };
 export type RelinkCandidate = { path: string; sha256: string };
