@@ -296,11 +296,11 @@ export const api = {
     return { id: crypto.randomUUID(), kind: "adjusted", provider: "keepframe-controls", createdAt: new Date().toISOString(), state: "candidate", imageUrl: asset.preferredVersionUrl ?? asset.previewUrl, isPreferred: false };
   },
   async getDevelopRecipe(assetId: string): Promise<DevelopRecipe> {
-    return tauri() ? invoke("get_develop_recipe", { assetId }) : browserDevelopRecipes.get(assetId) ?? { schemaVersion: 1, settings: { ...neutralAdjustments } };
+    return tauri() ? invoke("get_develop_recipe", { assetId }) : browserDevelopRecipes.get(assetId) ?? { schemaVersion: 2, settings: { ...neutralAdjustments }, masks: [] };
   },
   async saveDevelopRecipe(assetId: string, recipe: DevelopRecipe): Promise<boolean> {
     if (tauri()) return invoke("save_develop_recipe", { assetId, recipe });
-    const edited = JSON.stringify(recipe.settings) !== JSON.stringify(neutralAdjustments);
+    const edited = JSON.stringify(recipe.settings) !== JSON.stringify(neutralAdjustments) || recipe.masks.length > 0;
     if (edited) browserDevelopRecipes.set(assetId, structuredClone(recipe)); else browserDevelopRecipes.delete(assetId);
     const asset = browserAssets.find((item) => item.id === assetId); if (asset) asset.hasEdits = edited;
     return edited;

@@ -224,6 +224,16 @@ pub(crate) fn apply_v8(connection: &mut Connection, existed: bool, version: i64)
     tx.commit()
 }
 
+/// Version 9 records support for Develop recipe v2. Existing v1 JSON is left
+/// byte-for-byte unchanged and upgraded in memory, so appearance cannot drift.
+pub(crate) fn apply_v9(connection: &mut Connection, _existed: bool, version: i64) -> rusqlite::Result<()> {
+    if version >= 9 { return Ok(()); }
+    let tx = connection.transaction()?;
+    tx.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(9,?1)", [Utc::now().to_rfc3339()])?;
+    tx.pragma_update(None, "user_version", 9)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +273,15 @@ mod tests {
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         let records: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='develop_presets'", [], |row| row.get(0)).unwrap();
         assert_eq!((version, records), (8, 1));
+    }
+
+    #[test]
+    fn v9_migration_preserves_existing_recipe_json() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE develop_recipes(asset_id TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,recipe_json TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO develop_recipes VALUES('asset',1,'{\"schemaVersion\":1,\"settings\":{}}','before');").unwrap();
+        apply_v9(&mut connection, true, 8).unwrap(); apply_v9(&mut connection, true, 9).unwrap();
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let recipe: String = connection.query_row("SELECT recipe_json FROM develop_recipes WHERE asset_id='asset'", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 9); assert_eq!(recipe, "{\"schemaVersion\":1,\"settings\":{}}");
     }
 }

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef } from "react";
-import type { Asset, BasicAdjustments } from "../types";
+import type { Asset } from "../types";
 
-type PendingPreview = { asset: Asset; adjustments: BasicAdjustments };
+type PendingPreview<T> = { asset: Asset; value: T };
 
-export function useAdjustmentPreview(
-  render: (asset: Asset, adjustments: BasicAdjustments) => Promise<string>,
+export function useAdjustmentPreview<T>(
+  render: (asset: Asset, value: T) => Promise<string>,
   onRendered: (url: string) => void,
   onError?: (error: unknown) => void,
 ) {
@@ -12,7 +12,7 @@ export function useAdjustmentPreview(
   const renderedRef = useRef(onRendered);
   const errorRef = useRef(onError);
   const timerRef = useRef<number | null>(null);
-  const pendingRef = useRef<PendingPreview | null>(null);
+  const pendingRef = useRef<PendingPreview<T> | null>(null);
   const inFlightRef = useRef(false);
   const generationRef = useRef(0);
   renderRef.current = render;
@@ -26,7 +26,7 @@ export function useAdjustmentPreview(
     pendingRef.current = null;
     const generation = generationRef.current;
     inFlightRef.current = true;
-    void renderRef.current(pending.asset, pending.adjustments)
+    void renderRef.current(pending.asset, pending.value)
       .then((url) => {
         if (generationRef.current === generation) renderedRef.current(url);
       })
@@ -41,8 +41,8 @@ export function useAdjustmentPreview(
       });
   }, []);
 
-  const request = useCallback((asset: Asset, adjustments: BasicAdjustments) => {
-    pendingRef.current = { asset, adjustments };
+  const request = useCallback((asset: Asset, value: T) => {
+    pendingRef.current = { asset, value };
     if (!inFlightRef.current && timerRef.current === null) {
       timerRef.current = window.setTimeout(runNext, 16);
     }

@@ -183,7 +183,25 @@ export const neutralAdjustments: BasicAdjustments = {
   rotateQuadrants: 0, straighten: 0, horizontalFlip: false, verticalFlip: false,
 };
 
-export type DevelopRecipe = { schemaVersion: 1; settings: BasicAdjustments };
+export type MaskPoint = { x: number; y: number };
+export type LocalAdjustments = {
+  exposure: number; contrast: number; highlights: number; shadows: number; whites: number; blacks: number;
+  lightBalance: number; tint: number; saturation: number; clarity: number; dehaze: number; texture: number;
+};
+export const neutralLocalAdjustments: LocalAdjustments = {
+  exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0,
+  lightBalance: 0, tint: 0, saturation: 0, clarity: 0, dehaze: 0, texture: 0,
+};
+export type BrushStroke = { points: MaskPoint[]; radius: number; feather: number; flow: number; erase: boolean };
+export type MaskGeometry =
+  | { kind: "linear"; start: MaskPoint; end: MaskPoint }
+  | { kind: "radial"; centre: MaskPoint; radiusX: number; radiusY: number; rotation: number }
+  | { kind: "brush"; strokes: BrushStroke[] };
+export type DevelopMask = {
+  id: string; name: string; enabled: boolean; inverted: boolean; opacity: number; feather: number;
+  geometry: MaskGeometry; adjustments: LocalAdjustments;
+};
+export type DevelopRecipe = { schemaVersion: 2; settings: BasicAdjustments; masks: DevelopMask[] };
 export type PresetCategory = "whiteBalance" | "tone" | "presence" | "colour";
 export type DevelopPreset = { schemaVersion: 1; id: string; name: string; categories: PresetCategory[]; settings: BasicAdjustments; builtIn: boolean };
 export type ImageStatistics = { luminanceBins: number[]; redBins: number[]; greenBins: number[]; blueBins: number[]; samples: number; averageLuminance: number; p01: number; p50: number; p99: number; shadowClipFraction: number; highlightClipFraction: number; averageSaturation: number; redGreenBlue: [number, number, number]; dynamicRange: number };

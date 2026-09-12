@@ -16,19 +16,29 @@ describe("useAdjustmentPreview", () => {
     const rendered = vi.fn();
     const { result } = renderHook(() => useAdjustmentPreview(renderPreview, rendered));
 
-    act(() => result.current.request(demoAssets[0], { ...neutralAdjustments, exposure: 0.1 }));
+    act(() => result.current.request(demoAssets[0], { schemaVersion: 2, settings: { ...neutralAdjustments, exposure: 0.1 }, masks: [] }));
     await act(async () => { await vi.advanceTimersByTimeAsync(16); });
     expect(renderPreview).toHaveBeenCalledTimes(1);
 
     act(() => {
-      result.current.request(demoAssets[0], { ...neutralAdjustments, exposure: 0.2 });
-      result.current.request(demoAssets[0], { ...neutralAdjustments, exposure: 0.3 });
+      result.current.request(demoAssets[0], { schemaVersion: 2, settings: { ...neutralAdjustments, exposure: 0.2 }, masks: [] });
+      result.current.request(demoAssets[0], { schemaVersion: 2, settings: { ...neutralAdjustments, exposure: 0.3 }, masks: [] });
       finishFirst("first.png");
     });
     await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(16); });
 
     expect(renderPreview).toHaveBeenCalledTimes(2);
-    expect(renderPreview).toHaveBeenLastCalledWith(demoAssets[0], { ...neutralAdjustments, exposure: 0.3 });
+    expect(renderPreview).toHaveBeenLastCalledWith(demoAssets[0], { schemaVersion: 2, settings: { ...neutralAdjustments, exposure: 0.3 }, masks: [] });
     expect(rendered).toHaveBeenLastCalledWith("latest.png");
+  });
+
+  it("drops an in-flight result after an asset switch cancellation", async () => {
+    vi.useFakeTimers(); let finish!: (url: string) => void;
+    const rendered = vi.fn(); const { result } = renderHook(() => useAdjustmentPreview(() => new Promise<string>((resolve) => { finish = resolve; }), rendered));
+    act(() => result.current.request(demoAssets[0], neutralAdjustments));
+    await act(async () => { await vi.advanceTimersByTimeAsync(16); });
+    act(() => { result.current.cancel(); finish("stale.png"); });
+    await act(async () => { await Promise.resolve(); });
+    expect(rendered).not.toHaveBeenCalled();
   });
 });
