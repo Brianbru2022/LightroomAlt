@@ -41,4 +41,23 @@ describe("useAdjustmentPreview", () => {
     await act(async () => { await Promise.resolve(); });
     expect(rendered).not.toHaveBeenCalled();
   });
+
+  it("starts one bounded superseding render and rejects the stale completion", async () => {
+    vi.useFakeTimers();
+    let finishFirst!: (url: string) => void; let finishSecond!: (url: string) => void;
+    const renderPreview=vi.fn()
+      .mockReturnValueOnce(new Promise<string>((resolve)=>{finishFirst=resolve;}))
+      .mockReturnValueOnce(new Promise<string>((resolve)=>{finishSecond=resolve;}));
+    const rendered=vi.fn();
+    const {result}=renderHook(()=>useAdjustmentPreview(renderPreview,rendered));
+    act(()=>result.current.request(demoAssets[0],{...neutralAdjustments,exposure:0.1}));
+    await act(async()=>{await vi.advanceTimersByTimeAsync(16);});
+    act(()=>result.current.request(demoAssets[0],{...neutralAdjustments,exposure:0.2}));
+    await act(async()=>{await vi.advanceTimersByTimeAsync(16);});
+    expect(renderPreview).toHaveBeenCalledTimes(2);
+    act(()=>{finishFirst("stale.png");finishSecond("latest.png");});
+    await act(async()=>{await Promise.resolve();});
+    expect(rendered).toHaveBeenCalledTimes(1);
+    expect(rendered).toHaveBeenCalledWith("latest.png");
+  });
 });

@@ -82,6 +82,8 @@ See `MILESTONE_6_DEVELOP_GUIDE.md` for Develop controls, render order, recipe pe
 
 See `MILESTONE_9_INTELLIGENT_MASKING_GUIDE.md` for the optional local segmentation model, explicit installation, accepted-mask format, privacy, provider behaviour, qualification and limitations.
 
+See `MILESTONE_10_RENDERER_PERFORMANCE_GUIDE.md` for reproducible cold/warm renderer benchmarks, profiling evidence, cache ownership and invalidation, CPU/GPU decisions, and the native acceptance checklist.
+
 ## Optional local AI
 
 The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.

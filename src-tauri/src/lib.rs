@@ -7,13 +7,14 @@ use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
 use image::{GenericImageView, ImageDecoder, ImageFormat, RgbImage};
 use notify::{EventKind, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use reqwest::multipart;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs,
     io::{Read, Write},
@@ -70,9 +71,80 @@ struct AppState {
     health_cache: Mutex<Option<(Instant, ServiceHealth)>>,
     analysis_worker: Mutex<AnalysisWorker>,
     mask_generation: AtomicU64,
+    preview_generation: Arc<AtomicU64>,
+    renderer_caches: Arc<Mutex<RendererCaches>>,
     mask_install_cancel: AtomicBool,
     folder_watcher: Mutex<Option<FolderWatcher>>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+const DECODE_CACHE_BYTES: usize = 96 * 1024 * 1024;
+const INTERMEDIATE_CACHE_BYTES: usize = 96 * 1024 * 1024;
+const MASK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const SEMANTIC_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CacheEntry<T> { key: String, value: Arc<T>, bytes: usize }
+
+#[derive(Debug)]
+struct BoundedCache<T> {
+    entries: VecDeque<CacheEntry<T>>,
+    used_bytes: usize,
+    limit_bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl<T> BoundedCache<T> {
+    fn new(limit_bytes: usize) -> Self {
+        Self { entries: VecDeque::new(), used_bytes: 0, limit_bytes, hits: 0, misses: 0, evictions: 0 }
+    }
+    fn get(&mut self, key: &str) -> Option<Arc<T>> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = self.entries.remove(index).expect("cache index remains valid");
+            let value = Arc::clone(&entry.value);
+            self.entries.push_back(entry);
+            self.hits += 1;
+            Some(value)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+    fn insert(&mut self, key: String, value: Arc<T>, bytes: usize) {
+        if bytes > self.limit_bytes { return; }
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let old = self.entries.remove(index).expect("cache index remains valid");
+            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+        }
+        while self.used_bytes.saturating_add(bytes) > self.limit_bytes {
+            let Some(old) = self.entries.pop_front() else { break; };
+            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+            self.evictions += 1;
+        }
+        self.used_bytes += bytes;
+        self.entries.push_back(CacheEntry { key, value, bytes });
+    }
+}
+
+#[derive(Debug)]
+struct RendererCaches {
+    decoded: BoundedCache<image::DynamicImage>,
+    intermediates: BoundedCache<RgbImage>,
+    masks: BoundedCache<Vec<f32>>,
+    semantics: BoundedCache<image::GrayImage>,
+}
+
+impl Default for RendererCaches {
+    fn default() -> Self {
+        Self {
+            decoded: BoundedCache::new(DECODE_CACHE_BYTES),
+            intermediates: BoundedCache::new(INTERMEDIATE_CACHE_BYTES),
+            masks: BoundedCache::new(MASK_CACHE_BYTES),
+            semantics: BoundedCache::new(SEMANTIC_CACHE_BYTES),
+        }
+    }
 }
 struct FolderWatcher {
     _watcher: notify::RecommendedWatcher,
@@ -2354,6 +2426,9 @@ fn encode_srgb_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        // Balanced remains lossless and avoids trading an excessive file-size
+        // increase for the last few milliseconds of encoder throughput.
+        encoder.set_compression(png::Compression::Balanced);
         encoder.write_header()?.write_image_data(rgb.as_raw())?;
     }
     Ok(bytes)
@@ -2500,7 +2575,7 @@ fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32, radius_divi
     } else {
         image::imageops::blur(image, sigma)
     };
-    for (pixel, blurred_pixel) in image.pixels_mut().zip(blurred.pixels()) {
+    image.as_mut().par_chunks_mut(3).zip(blurred.as_raw().par_chunks(3)).for_each(|(pixel, blurred_pixel)| {
         let mut values = [
             pixel[0] as f32 / 255.0,
             pixel[1] as f32 / 255.0,
@@ -2519,7 +2594,7 @@ fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32, radius_divi
         for (index, value) in values.iter().enumerate() {
             pixel[index] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
-    }
+    });
 }
 
 fn apply_colour_adjustments_to_image(
@@ -2536,7 +2611,7 @@ fn apply_colour_adjustments_to_image(
     let colour = adjustments.colour_boost / 100.0;
     let saturation_adjustment = adjustments.saturation / 100.0;
     let dehaze = adjustments.dehaze / 100.0;
-    for pixel in output.pixels_mut() {
+    output.as_mut().par_chunks_mut(3).for_each(|pixel| {
         let mut values = [
             pixel[0] as f32 / 255.0 * (1.0 + temperature + tint * 0.5),
             pixel[1] as f32 / 255.0 * (1.0 - tint),
@@ -2585,7 +2660,7 @@ fn apply_colour_adjustments_to_image(
                 * 255.0)
                 .round() as u8;
         }
-    }
+    });
     apply_protected_local_contrast(&mut output, adjustments.texture / 100.0 * 0.28, 220.0);
     apply_protected_local_contrast(&mut output, adjustments.clarity / 100.0 * 0.42, 75.0);
     apply_protected_local_contrast(&mut output, dehaze * 0.18, 48.0);
@@ -2662,6 +2737,41 @@ fn prepared_semantic_coverage(
     }))
 }
 
+fn digest_json(value: &impl Serialize) -> String {
+    format!("{:x}", Sha256::digest(serde_json::to_vec(value).expect("validated renderer values serialise")))
+}
+
+fn semantic_cache_key(mask: &DevelopMask, width: u32, height: u32) -> Option<String> {
+    let MaskGeometry::Semantic { checksum, .. } = &mask.geometry else { return None; };
+    Some(format!("{checksum}:{width}x{height}:{:08x}", mask.feather.to_bits()))
+}
+
+fn prepared_semantic_coverage_cached(
+    mask: &DevelopMask,
+    width: u32,
+    height: u32,
+    caches: &mut RendererCaches,
+) -> Result<Option<Arc<image::GrayImage>>> {
+    let Some(key) = semantic_cache_key(mask, width, height) else { return Ok(None); };
+    if let Some(coverage) = caches.semantics.get(&key) { return Ok(Some(coverage)); }
+    let coverage = Arc::new(prepared_semantic_coverage(mask, width, height)?.expect("semantic key requires semantic geometry"));
+    caches.semantics.insert(key, Arc::clone(&coverage), width as usize * height as usize);
+    Ok(Some(coverage))
+}
+
+fn mask_cache_key(mask: &DevelopMask, width: u32, height: u32) -> String {
+    #[derive(Serialize)]
+    struct CoverageIdentity<'a> {
+        geometry: &'a MaskGeometry,
+        inverted: bool,
+        opacity: f32,
+        feather: f32,
+        width: u32,
+        height: u32,
+    }
+    digest_json(&CoverageIdentity { geometry: &mask.geometry, inverted: mask.inverted, opacity: mask.opacity, feather: mask.feather, width, height })
+}
+
 fn mask_coverage_prepared(
     mask: &DevelopMask,
     semantic: Option<&image::GrayImage>,
@@ -2693,6 +2803,34 @@ fn mask_coverage_prepared(
     (coverage*mask.opacity).clamp(0.0,1.0)
 }
 
+fn prepared_mask_coverage(
+    mask: &DevelopMask,
+    width: u32,
+    height: u32,
+    semantic: Option<&image::GrayImage>,
+) -> Vec<f32> {
+    let count = width as usize * height as usize;
+    (0..count).into_par_iter().map(|index| {
+        let x = index as u32 % width;
+        let y = index as u32 / width;
+        mask_coverage_prepared(mask, semantic, x, y, width, height)
+    }).collect()
+}
+
+fn prepared_mask_coverage_cached(
+    mask: &DevelopMask,
+    width: u32,
+    height: u32,
+    caches: &mut RendererCaches,
+) -> Result<Arc<Vec<f32>>> {
+    let key = mask_cache_key(mask, width, height);
+    if let Some(coverage) = caches.masks.get(&key) { return Ok(coverage); }
+    let semantic = prepared_semantic_coverage_cached(mask, width, height, caches)?;
+    let coverage = Arc::new(prepared_mask_coverage(mask, width, height, semantic.as_deref()));
+    caches.masks.insert(key, Arc::clone(&coverage), coverage.len() * std::mem::size_of::<f32>());
+    Ok(coverage)
+}
+
 #[cfg(test)]
 fn mask_coverage(mask: &DevelopMask, x: u32, y: u32, width: u32, height: u32) -> f32 {
     let semantic = prepared_semantic_coverage(mask, width, height)
@@ -2705,13 +2843,60 @@ fn render_develop_recipe(image: &image::DynamicImage, recipe: &DevelopRecipe) ->
     // Deliberate order: EXIF-oriented source -> global colour/tone -> ordered local masks -> transform/crop.
     let mut output=apply_colour_adjustments_to_image(image,recipe.settings);let(width,height)=output.dimensions();
     for mask in recipe.masks.iter().filter(|mask|mask.enabled&&mask.opacity>0.0){
-        let semantic = prepared_semantic_coverage(mask, width, height)
-            .ok()
-            .flatten();
+        let semantic = prepared_semantic_coverage(mask, width, height).ok().flatten();
+        let coverage = prepared_mask_coverage(mask,width,height,semantic.as_ref());
         let adjusted=apply_colour_adjustments_to_image(&image::DynamicImage::ImageRgb8(output.clone()),mask.adjustments.as_basic(),);
-        for y in 0..height{for x in 0..width{let alpha= mask_coverage_prepared(mask, semantic.as_ref(),x,y,width,height);if alpha<=0.0{continue;}let source=*output.get_pixel(x,y);let target=*adjusted.get_pixel(x,y);let pixel=output.get_pixel_mut(x,y);for channel in 0..3{pixel[channel]=(source[channel] as f32+(target[channel] as f32-source[channel] as f32)*alpha).round().clamp(0.0,255.0) as u8;}}}
+        output.as_mut().par_chunks_mut(3).zip(adjusted.as_raw().par_chunks(3)).zip(coverage.par_iter()).for_each(|((pixel,target),alpha)| { if *alpha>0.0 { for channel in 0..3 { pixel[channel]=(pixel[channel] as f32+(target[channel] as f32-pixel[channel] as f32)*alpha).round().clamp(0.0,255.0) as u8; } } });
     }
     apply_geometry(&output,recipe.settings)
+}
+
+fn colour_identity(mut settings: BasicAdjustments) -> BasicAdjustments {
+    settings.crop_left=0.0; settings.crop_top=0.0; settings.crop_width=1.0; settings.crop_height=1.0;
+    settings.rotate_quadrants=0; settings.straighten=0.0; settings.horizontal_flip=false; settings.vertical_flip=false;
+    settings
+}
+
+fn render_develop_recipe_cached(
+    image: &image::DynamicImage,
+    source_key: &str,
+    recipe: &DevelopRecipe,
+    caches: &Mutex<RendererCaches>,
+    generation: Option<(&AtomicU64,u64)>,
+) -> Result<RgbImage> {
+    let cancelled=||generation.is_some_and(|(current,requested)|current.load(Ordering::Acquire)!=requested);
+    if cancelled(){return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
+    let global_key=format!("{source_key}:{}",digest_json(&colour_identity(recipe.settings)));
+    let cached_global=caches.lock().expect("renderer cache lock").intermediates.get(&global_key);
+    let mut output=if let Some(global)=cached_global{(*global).clone()}else{
+        let rendered=apply_colour_adjustments_to_image(image,recipe.settings);
+        caches.lock().expect("renderer cache lock").intermediates.insert(global_key,Arc::new(rendered.clone()),rendered.as_raw().len());
+        rendered
+    };
+    if cancelled(){return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
+    let(width,height)=output.dimensions();
+    for mask in recipe.masks.iter().filter(|mask|mask.enabled&&mask.opacity>0.0){
+        let coverage=prepared_mask_coverage_cached(mask,width,height,&mut caches.lock().expect("renderer cache lock"))?;
+        let adjusted=apply_colour_adjustments_to_image(&image::DynamicImage::ImageRgb8(output.clone()),mask.adjustments.as_basic());
+        output.as_mut().par_chunks_mut(3).zip(adjusted.as_raw().par_chunks(3)).zip(coverage.par_iter()).for_each(|((pixel,target),alpha)|{if *alpha>0.0{for channel in 0..3{pixel[channel]=(pixel[channel]as f32+(target[channel]as f32-pixel[channel]as f32)*alpha).round().clamp(0.0,255.0)as u8;}}});
+        if cancelled(){return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
+    }
+    Ok(apply_geometry(&output,recipe.settings))
+}
+
+fn decoded_source_key(path:&Path,width:u32,height:u32)->Result<String>{
+    let metadata=fs::metadata(path)?;
+    let modified=metadata.modified().ok().and_then(|value|value.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+    Ok(format!("{}:{}:{}:{}:{}x{}",path.to_string_lossy(),metadata.len(),modified.as_secs(),modified.subsec_nanos(),width,height))
+}
+
+fn decode_preview_cached(path:&Path,caches:&Mutex<RendererCaches>)->Result<(String,Arc<image::DynamicImage>)>{
+    let key=decoded_source_key(path,720,540)?;
+    if let Some(image)=caches.lock().expect("renderer cache lock").decoded.get(&key){return Ok((key,image));}
+    let image=Arc::new(image::open(path)?.thumbnail(720,540));
+    let bytes=image.width()as usize*image.height()as usize*4;
+    caches.lock().expect("renderer cache lock").decoded.insert(key.clone(),Arc::clone(&image),bytes);
+    Ok((key,image))
 }
 
 fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage {
@@ -2998,6 +3183,9 @@ fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_,
 async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>,) -> Result<String> {
     let recipe = recipe.validate()?;
     let root = root_from(&state)?;
+    let generation_counter=Arc::clone(&state.preview_generation);
+    let generation=generation_counter.fetch_add(1,Ordering::AcqRel)+1;
+    let caches=Arc::clone(&state.renderer_caches);
     tauri::async_runtime::spawn_blocking(move || -> Result<String> {
         let connection = open_db(&root)?;
         let _ = develop_recipe_in(&connection, &asset_id)?;
@@ -3006,11 +3194,13 @@ async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: 
         )?;
         // Keep interactive work bounded even when the browsing thumbnail cache
         // was built at a larger size. Export always decodes the original.
-        let image = image::open(preview)?.thumbnail(720, 540);
-        let adjusted = image::DynamicImage::ImageRgb8(render_develop_recipe(&image, &recipe));
+        let (source_key,image)=decode_preview_cached(Path::new(&preview),&caches)?;
+        let adjusted=image::DynamicImage::ImageRgb8(render_develop_recipe_cached(&image,&source_key,&recipe,&caches,Some((&generation_counter,generation)))?);
+        if generation_counter.load(Ordering::Acquire)!=generation{return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
         let mut digest = Sha256::new();
-        digest.update(b"keepframe-develop-preview-v2");
+        digest.update(b"keepframe-develop-preview-v3");
         digest.update(asset_id.as_bytes());
+        digest.update(source_key.as_bytes());
         digest.update(serde_json::to_vec(&recipe)?);
         let key = format!("{:x}", digest.finalize());
         let output = root.join(".keepframe/previews").join(format!("develop-{}-{}.png", asset_id, &key[..16]));
@@ -5550,7 +5740,7 @@ fn unused_export_path(destination: &Path, stem: &str, extension: &str) -> PathBu
     destination.join(format!("{stem}-export-{}.{}", Uuid::new_v4(), extension))
 }
 
-fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Result<PathBuf> {
+fn export_asset_image_with_cache(root: &Path, asset_id: &str, destination: &Path, renderer_caches: Option<&Mutex<RendererCaches>>) -> Result<PathBuf> {
     if !destination.is_dir() {
         return Err(KeepframeError::Message("Choose an existing export folder.".into(),));
     }
@@ -5572,12 +5762,19 @@ fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Res
     let recipe = develop_recipe_in(&connection, asset_id)?;
     if recipe.is_edited() {
         let input = original_adjustment_input(&connection, asset_id)?;
-        let image = prepare_full_resolution_image(
-            &input.path,
-            input.expected_dimensions,
-            &root.join(".keepframe/staging/working"),
-        )?;
-        let rendered = image::DynamicImage::ImageRgb8(render_develop_recipe(&image, &recipe));
+        let rendered=if let Some(caches)=renderer_caches{
+            let(expected_width,expected_height)=input.expected_dimensions.unwrap_or((0,0));
+            let source_key=format!("full:{}:{}",input.source_hash,decoded_source_key(&input.path,expected_width,expected_height)?);
+            let cached=caches.lock().expect("renderer cache lock").decoded.get(&source_key);
+            let image=if let Some(image)=cached{image}else{
+                let image=Arc::new(prepare_full_resolution_image(&input.path,input.expected_dimensions,&root.join(".keepframe/staging/working"))?);
+                let bytes=image.as_bytes().len();caches.lock().expect("renderer cache lock").decoded.insert(source_key.clone(),Arc::clone(&image),bytes);image
+            };
+            image::DynamicImage::ImageRgb8(render_develop_recipe_cached(&image,&source_key,&recipe,caches,None)?)
+        }else{
+            let image=prepare_full_resolution_image(&input.path,input.expected_dimensions,&root.join(".keepframe/staging/working"))?;
+            image::DynamicImage::ImageRgb8(render_develop_recipe(&image,&recipe))
+        };
         let output = unused_export_path(destination, stem, "png");
         fs::write(&output, encode_srgb_png(&rendered)?)?;
         return Ok(output);
@@ -5622,6 +5819,11 @@ fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Res
     Ok(output)
 }
 
+#[cfg(test)]
+fn export_asset_image_in(root:&Path,asset_id:&str,destination:&Path)->Result<PathBuf>{
+    export_asset_image_with_cache(root,asset_id,destination,None)
+}
+
 #[tauri::command]
 async fn export_asset_image(
     asset_id: String,
@@ -5629,8 +5831,9 @@ async fn export_asset_image(
     state: State<'_, AppState>,
 ) -> Result<String> {
     let root = root_from(&state)?;
+    let caches=Arc::clone(&state.renderer_caches);
     tauri::async_runtime::spawn_blocking(move || {
-        export_asset_image_in(&root, &asset_id, Path::new(&destination))
+        export_asset_image_with_cache(&root, &asset_id, Path::new(&destination),Some(&caches))
             .map(|path| path.to_string_lossy().into_owned())
     })
     .await
@@ -5883,6 +6086,8 @@ pub fn run() {
             health_cache: Mutex::new(None),
             analysis_worker: Mutex::new(AnalysisWorker::default()),
             mask_generation: AtomicU64::new(0),
+            preview_generation: Arc::new(AtomicU64::new(0)),
+            renderer_caches: Arc::new(Mutex::new(RendererCaches::default())),
             mask_install_cancel: AtomicBool::new(false),
             folder_watcher: Mutex::new(None),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -6322,6 +6527,156 @@ mod tests {
         let exported = export_asset_image_in(&root, "asset", &destination).unwrap();
         assert_eq!(image::open(exported).unwrap().dimensions(), (38, 64));
         assert_eq!(hash_file(&original).unwrap(), original_hash);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn renderer_cache_is_bounded_and_evicts_least_recently_used_entries() {
+        let mut cache=BoundedCache::new(8);
+        cache.insert("a".into(),Arc::new(vec![1_u8;4]),4);
+        cache.insert("b".into(),Arc::new(vec![2_u8;4]),4);
+        assert!(cache.get("a").is_some());
+        cache.insert("c".into(),Arc::new(vec![3_u8;4]),4);
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert!(cache.used_bytes<=cache.limit_bytes);
+        assert_eq!(cache.evictions,1);
+    }
+
+    #[test]
+    fn preview_decode_cache_reuses_unchanged_files_and_invalidates_source_changes() {
+        let root=std::env::temp_dir().join(format!("keepframe-render-cache-{}",Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path=root.join("preview.png");
+        image::DynamicImage::new_rgb8(32,24).save(&path).unwrap();
+        let original_hash=hash_file(&path).unwrap();
+        let caches=Mutex::new(RendererCaches::default());
+        let(first_key,first)=decode_preview_cached(&path,&caches).unwrap();
+        let(second_key,second)=decode_preview_cached(&path,&caches).unwrap();
+        assert_eq!(first_key,second_key);assert!(Arc::ptr_eq(&first,&second));
+        assert_eq!(hash_file(&path).unwrap(),original_hash);
+        image::DynamicImage::new_rgb8(33,24).save(&path).unwrap();
+        let(third_key,third)=decode_preview_cached(&path,&caches).unwrap();
+        assert_ne!(first_key,third_key);assert!(!Arc::ptr_eq(&first,&third));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn full_resolution_export_reuses_safe_source_and_intermediate_caches() {
+        let root=std::env::temp_dir().join(format!("keepframe-full-render-cache-{}",Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let original=root.join("Originals/2026/09/12/photo.png");fs::create_dir_all(original.parent().unwrap()).unwrap();
+        image::DynamicImage::ImageRgb8(RgbImage::from_fn(128,96,|x,y|image::Rgb([x as u8,y as u8,(x+y)as u8]))).save(&original).unwrap();
+        let original_hash=hash_file(&original).unwrap();let connection=open_db(&root).unwrap();
+        connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','photo.png','2026-09-12T12:00:00Z',128,96,?1,'2026-09-12T12:00:00Z')",[original.to_string_lossy().as_ref()]).unwrap();
+        connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)",params![original.to_string_lossy(),original_hash,fs::metadata(&original).unwrap().len()]).unwrap();
+        let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:Vec::new()};
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,'2026-09-12T12:00:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();drop(connection);
+        let caches=Mutex::new(RendererCaches::default());let destination=root.join("Exports");
+        let first=export_asset_image_with_cache(&root,"asset",&destination,Some(&caches)).unwrap();
+        let second=export_asset_image_with_cache(&root,"asset",&destination,Some(&caches)).unwrap();
+        assert_eq!(image::open(first).unwrap().to_rgb8(),image::open(second).unwrap().to_rgb8());
+        let cache=caches.lock().unwrap();assert!(cache.decoded.hits>=1);assert!(cache.intermediates.hits>=1);drop(cache);
+        assert_eq!(hash_file(&original).unwrap(),original_hash);fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intermediate_cache_invalidates_only_colour_dependencies() {
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(64,48,|x,y|image::Rgb([x as u8,y as u8,(x+y)as u8])));
+        let caches=Mutex::new(RendererCaches::default());
+        let base=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:Vec::new()};
+        render_develop_recipe_cached(&source,"source",&base,&caches,None).unwrap();
+        let mut crop=base.clone();crop.settings.crop_width=0.8;
+        render_develop_recipe_cached(&source,"source",&crop,&caches,None).unwrap();
+        let mut exposure=crop;exposure.settings.exposure=0.3;
+        render_develop_recipe_cached(&source,"source",&exposure,&caches,None).unwrap();
+        let cache=caches.lock().unwrap();
+        assert_eq!((cache.intermediates.hits,cache.intermediates.misses),(1,2));
+    }
+
+    #[test]
+    fn mask_and_semantic_caches_reuse_coverage_and_invalidate_geometry() {
+        let mut caches=RendererCaches::default();
+        let mut mask=semantic_mask("subject",0.3);
+        let first=prepared_mask_coverage_cached(&mask,72,48,&mut caches).unwrap();
+        let second=prepared_mask_coverage_cached(&mask,72,48,&mut caches).unwrap();
+        assert!(Arc::ptr_eq(&first,&second));assert_eq!(caches.masks.hits,1);
+        mask.opacity=0.5;
+        let third=prepared_mask_coverage_cached(&mask,72,48,&mut caches).unwrap();
+        assert!(!Arc::ptr_eq(&first,&third));assert_eq!(caches.masks.misses,2);
+        assert_eq!(caches.semantics.misses,1);assert_eq!(caches.semantics.hits,1);
+    }
+
+    #[test]
+    fn cached_parallel_renderer_matches_uncached_pixels_and_is_deterministic() {
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(96,64,|x,y|image::Rgb([(x*2)as u8,(y*3)as u8,(x+y)as u8])));
+        let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.25,clarity:12.0,crop_left:0.1,crop_width:0.8,..BasicAdjustments::neutral()},masks:vec![linear_mask("one",0.4),radial_mask("two",-0.2)]};
+        let expected=render_develop_recipe(&source,&recipe);
+        let caches=Mutex::new(RendererCaches::default());
+        let first=render_develop_recipe_cached(&source,"source",&recipe,&caches,None).unwrap();
+        let second=render_develop_recipe_cached(&source,"source",&recipe,&caches,None).unwrap();
+        assert_eq!(first,expected);assert_eq!(second,expected);
+        let expected=Arc::new(expected);
+        std::thread::scope(|scope|{for _ in 0..4{let source=&source;let recipe=&recipe;let expected=Arc::clone(&expected);scope.spawn(move||assert_eq!(render_develop_recipe(source,recipe),*expected));}});
+    }
+
+    #[test]
+    fn stale_preview_generation_is_rejected_before_rendering() {
+        let source=image::DynamicImage::new_rgb8(32,24);
+        let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:Vec::new()};
+        let caches=Mutex::new(RendererCaches::default());
+        let generation=AtomicU64::new(2);
+        let error=render_develop_recipe_cached(&source,"source",&recipe,&caches,Some((&generation,1))).unwrap_err();
+        assert_eq!(error.to_string(),"Superseded Develop preview.");
+        assert_eq!(caches.lock().unwrap().intermediates.misses,0);
+    }
+
+    #[test]
+    #[ignore = "opt-in Milestone 10 renderer benchmark; run scripts/benchmark-renderer.ps1"]
+    fn milestone_10_renderer_performance_checkpoint() {
+        let root=std::env::temp_dir().join(format!("keepframe-m10-benchmark-{}",Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let fixture=root.join("representative.jpg");
+        let source=RgbImage::from_fn(720,480,|x,y|image::Rgb([((x*7+y*3)%256)as u8,((x*2+y*5)%256)as u8,((x+y*11)%256)as u8]));
+        image::DynamicImage::ImageRgb8(source).save_with_format(&fixture,ImageFormat::Jpeg).unwrap();
+
+        let caches=Mutex::new(RendererCaches::default());
+        let started=Instant::now();let(_,cold_decoded)=decode_preview_cached(&fixture,&caches).unwrap();let jpeg_decode_cold=started.elapsed();
+        let started=Instant::now();let(source_key,warm_decoded)=decode_preview_cached(&fixture,&caches).unwrap();let jpeg_decode_warm=started.elapsed();
+        let started=Instant::now();let working=warm_decoded.to_rgb8();let working_buffer=started.elapsed();
+        let started=Instant::now();let oriented=decode_standard_with_orientation(&fixture).unwrap();let orientation_decode=started.elapsed();
+
+        let stage=|settings|{let started=Instant::now();let output=apply_colour_adjustments_to_image(&oriented,settings);(started.elapsed(),output)};
+        let(tone,_)=stage(BasicAdjustments{exposure:0.35,contrast:12.0,highlights:-20.0,shadows:18.0,..BasicAdjustments::neutral()});
+        let(white_balance,_)=stage(BasicAdjustments{light_balance:10.0,tint:-4.0,..BasicAdjustments::neutral()});
+        let(presence,_)=stage(BasicAdjustments{texture:10.0,clarity:8.0,dehaze:5.0,..BasicAdjustments::neutral()});
+        let(colour,_)=stage(BasicAdjustments{colour_boost:8.0,saturation:6.0,..BasicAdjustments::neutral()});
+        let global_settings=BasicAdjustments{exposure:0.35,highlights:-20.0,shadows:18.0,texture:10.0,clarity:8.0,saturation:6.0,..BasicAdjustments::neutral()};
+        let global_recipe=DevelopRecipe{schema_version:2,settings:global_settings,masks:Vec::new()};
+        let started=Instant::now();let global_cold=render_develop_recipe_cached(&warm_decoded,&source_key,&global_recipe,&caches,None).unwrap();let overall_cold=started.elapsed();
+        let started=Instant::now();let global_warm=render_develop_recipe_cached(&warm_decoded,&source_key,&global_recipe,&caches,None).unwrap();let overall_warm=started.elapsed();
+        assert_eq!(global_cold,global_warm);assert!(Arc::ptr_eq(&cold_decoded,&warm_decoded));
+
+        let mask=linear_mask("profile",0.25);let started=Instant::now();let mask_coverage=prepared_mask_coverage(&mask,720,480,None);let mask_raster=started.elapsed();
+        let mut mask_times=Vec::new();
+        for count in [1,5,10]{let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:(0..count).map(|index|linear_mask(&format!("mask-{index}"),0.12)).collect()};let started=Instant::now();let output=render_develop_recipe(&warm_decoded,&recipe);mask_times.push((count,started.elapsed(),output));}
+        let cached_mask_recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:vec![linear_mask("cached",0.12)]};
+        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&cached_mask_recipe,&caches,None).unwrap();let cached_mask_cold=started.elapsed();
+        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&cached_mask_recipe,&caches,None).unwrap();let cached_mask_warm=started.elapsed();
+        let semantic_recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![semantic_mask("subject",0.2)]};
+        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&semantic_recipe,&caches,None).unwrap();let semantic_cold=started.elapsed();
+        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&semantic_recipe,&caches,None).unwrap();let semantic_warm=started.elapsed();
+        let geometry=BasicAdjustments{crop_left:0.1,crop_top:0.1,crop_width:0.8,crop_height:0.8,rotate_quadrants:1,straighten:1.5,..BasicAdjustments::neutral()};
+        let started=Instant::now();let transformed=apply_geometry(&global_cold,geometry);let transform=started.elapsed();
+        let started=Instant::now();let resized=image::imageops::resize(&global_cold,360,240,image::imageops::FilterType::Triangle);let resize=started.elapsed();
+        let started=Instant::now();let encoded=encode_srgb_png(&image::DynamicImage::ImageRgb8(global_cold.clone())).unwrap();let png_encode=started.elapsed();
+        let full=image::DynamicImage::ImageRgb8(image::imageops::resize(&working,2400,1600,image::imageops::FilterType::Triangle));
+        let started=Instant::now();let full_render=apply_adjustments_to_image(&full,global_settings);let full_render_elapsed=started.elapsed();
+        let started=Instant::now();let full_png=encode_srgb_png(&image::DynamicImage::ImageRgb8(full_render)).unwrap();let full_png_elapsed=started.elapsed();
+        let cache=caches.lock().unwrap();
+        eprintln!("M10 benchmark 720x480: jpeg-decode cold={jpeg_decode_cold:?} warm={jpeg_decode_warm:?}; orientation+decode={orientation_decode:?}; working-buffer={working_buffer:?}; tone/exposure={tone:?}; white-balance={white_balance:?}; presence={presence:?}; colour={colour:?}; mask-raster={mask_raster:?}; masks 1={:?} 5={:?} 10={:?}; cached-mask cold={cached_mask_cold:?} warm={cached_mask_warm:?}; semantic cold={semantic_cold:?} warm={semantic_warm:?}; transform={transform:?}; resize={resize:?}; PNG={png_encode:?}; overall cold={overall_cold:?} warm={overall_warm:?}; full 2400x1600 render={full_render_elapsed:?} PNG={full_png_elapsed:?}; cache decoded={}B intermediate={}B mask={}B semantic={}B hits={}/{}/{}/{} evictions={}/{}/{}/{}; outputs={}+{}B coverage={} transformed={}x{} resized={}x{}",mask_times[0].1,mask_times[1].1,mask_times[2].1,cache.decoded.used_bytes,cache.intermediates.used_bytes,cache.masks.used_bytes,cache.semantics.used_bytes,cache.decoded.hits,cache.intermediates.hits,cache.masks.hits,cache.semantics.hits,cache.decoded.evictions,cache.intermediates.evictions,cache.masks.evictions,cache.semantics.evictions,encoded.len(),full_png.len(),mask_coverage.iter().sum::<f32>(),transformed.width(),transformed.height(),resized.width(),resized.height());
+        assert!(overall_cold<Duration::from_millis(250));assert!(mask_times[0].1<Duration::from_millis(300));assert!(mask_times[1].1<Duration::from_millis(800));assert!(mask_times[2].1<Duration::from_millis(1500));assert!(full_render_elapsed+full_png_elapsed<Duration::from_secs(3));
         fs::remove_dir_all(&root).unwrap();
     }
 

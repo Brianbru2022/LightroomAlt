@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import type { Asset } from "../types";
 
-type PendingPreview<T> = { asset: Asset; value: T };
+type PendingPreview<T> = { asset: Asset; value: T; generation: number };
 
 export function useAdjustmentPreview<T>(
   render: (asset: Asset, value: T) => Promise<string>,
@@ -13,7 +13,7 @@ export function useAdjustmentPreview<T>(
   const errorRef = useRef(onError);
   const timerRef = useRef<number | null>(null);
   const pendingRef = useRef<PendingPreview<T> | null>(null);
-  const inFlightRef = useRef(false);
+  const inFlightRef = useRef(0);
   const generationRef = useRef(0);
   renderRef.current = render;
   renderedRef.current = onRendered;
@@ -21,11 +21,11 @@ export function useAdjustmentPreview<T>(
 
   const runNext = useCallback(() => {
     timerRef.current = null;
-    if (inFlightRef.current || !pendingRef.current) return;
+    if (inFlightRef.current >= 2 || !pendingRef.current) return;
     const pending = pendingRef.current;
     pendingRef.current = null;
-    const generation = generationRef.current;
-    inFlightRef.current = true;
+    const generation = pending.generation;
+    inFlightRef.current += 1;
     void renderRef.current(pending.asset, pending.value)
       .then((url) => {
         if (generationRef.current === generation) renderedRef.current(url);
@@ -34,7 +34,7 @@ export function useAdjustmentPreview<T>(
         if (generationRef.current === generation) errorRef.current?.(error);
       })
       .finally(() => {
-        inFlightRef.current = false;
+        inFlightRef.current -= 1;
         if (pendingRef.current && timerRef.current === null) {
           timerRef.current = window.setTimeout(runNext, 16);
         }
@@ -42,8 +42,8 @@ export function useAdjustmentPreview<T>(
   }, []);
 
   const request = useCallback((asset: Asset, value: T) => {
-    pendingRef.current = { asset, value };
-    if (!inFlightRef.current && timerRef.current === null) {
+    pendingRef.current = { asset, value, generation: ++generationRef.current };
+    if (timerRef.current === null) {
       timerRef.current = window.setTimeout(runNext, 16);
     }
   }, [runNext]);
