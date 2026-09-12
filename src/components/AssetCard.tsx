@@ -1,4 +1,4 @@
-import { Check, CircleHelp, Layers3, MapPin, TriangleAlert, X } from "lucide-react";
+import { Check, CircleHelp, Layers3, MapPin, SlidersHorizontal, TriangleAlert, X } from "lucide-react";
 import type { Asset } from "../types";
 import { formatDate } from "../lib/format";
 
@@ -14,6 +14,7 @@ export function AssetCard({ asset, selected, onSelect, onOpen }: Props) {
         <img src={asset.preferredVersionUrl ?? asset.thumbnailUrl} alt={asset.filename} loading="lazy" />
         <span className={`decision-badge ${asset.decision}`} title={asset.decision}><Status size={14} /></span>
         {asset.missingState && asset.missingState !== "available" ? <span className="pair-badge missing-badge" title={asset.missingState.replaceAll("_", " ")}><TriangleAlert size={13} /> Missing</span> : null}
+        {asset.hasEdits ? <span className="pair-badge edited-badge" title="Non-destructive Develop settings applied"><SlidersHorizontal size={13} /> Edited</span> : null}
         {asset.representationCount > 1 ? <span className="pair-badge" title={`${asset.representationCount} paired files`}><Layers3 size={13} /> {asset.representationCount}</span> : null}
       </div>
       <div className="asset-card-copy">

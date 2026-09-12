@@ -1,8 +1,9 @@
-import { Aperture, Images, Map, ScanSearch, Settings, Sparkles, Trash2 } from "lucide-react";
+import { Aperture, Images, Map, ScanSearch, Settings, SlidersHorizontal, Sparkles, Trash2 } from "lucide-react";
 import type { LibraryStatus, ServiceHealth, ViewName } from "../types";
 
 const items: Array<{ id: ViewName; label: string; icon: typeof Images }> = [
   { id: "library", label: "Library", icon: Images },
+  { id: "develop", label: "Develop", icon: SlidersHorizontal },
   { id: "triage", label: "Triage", icon: ScanSearch },
   { id: "map", label: "Map", icon: Map },
   { id: "workshop", label: "AI Workshop", icon: Sparkles },

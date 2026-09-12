@@ -164,6 +164,35 @@ pub(crate) fn apply_v6(connection: &mut Connection, existed: bool, version: i64)
     tx.commit()
 }
 
+/// Version 7 introduces the single, authoritative non-destructive Develop
+/// recipe for an asset.  It contains settings only: no pixels, previews, or
+/// UI state are stored in the catalogue.
+pub(crate) fn apply_v7(connection: &mut Connection, existed: bool, version: i64) -> rusqlite::Result<()> {
+    if !existed {
+        connection.execute(
+            "INSERT INTO schema_migrations(version,applied_at)VALUES(?1,?2)",
+            params![7, Utc::now().to_rfc3339()],
+        )?;
+        connection.pragma_update(None, "user_version", 7)?;
+        return Ok(());
+    }
+    if version >= 7 {
+        return Ok(());
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS develop_recipes(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,schema_version INTEGER NOT NULL,recipe_json TEXT NOT NULL,updated_at TEXT NOT NULL)",
+        [],
+    )?;
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_develop_recipes_updated ON develop_recipes(updated_at DESC)", [])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(7,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.pragma_update(None, "user_version", 7)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +210,16 @@ mod tests {
         let sidecars: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sidecar_exports'", [], |row| row.get(0)).unwrap();
         let watches: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='watch_events'", [], |row| row.get(0)).unwrap();
         assert_eq!((sidecars, watches), (1, 1));
+    }
+
+    #[test]
+    fn v7_migration_is_atomic_and_creates_develop_recipes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE assets(id TEXT PRIMARY KEY);").unwrap();
+        apply_v7(&mut connection, true, 6).unwrap();
+        apply_v7(&mut connection, true, 7).unwrap();
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let records: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='develop_recipes'", [], |row| row.get(0)).unwrap();
+        assert_eq!((version, records), (7, 1));
     }
 }

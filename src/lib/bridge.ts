@@ -2,11 +2,12 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type DevelopRecipe, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
 let browserAssets = structuredClone(demoAssets);
+const browserDevelopRecipes = new Map<string, DevelopRecipe>();
 let browserJobs = structuredClone(demoJobs);
 const browserTrash = new Set<string>();
 type BrowserHistory =
@@ -289,6 +290,19 @@ export const api = {
   async applyBasicAdjustments(asset: Asset, adjustments: BasicAdjustments): Promise<AssetVersion> {
     if (tauri()) return withVersionUrl(await invoke<AssetVersion>("apply_basic_adjustments", { assetId: asset.id, adjustments }));
     return { id: crypto.randomUUID(), kind: "adjusted", provider: "keepframe-controls", createdAt: new Date().toISOString(), state: "candidate", imageUrl: asset.preferredVersionUrl ?? asset.previewUrl, isPreferred: false };
+  },
+  async getDevelopRecipe(assetId: string): Promise<DevelopRecipe> {
+    return tauri() ? invoke("get_develop_recipe", { assetId }) : browserDevelopRecipes.get(assetId) ?? { schemaVersion: 1, settings: { ...neutralAdjustments } };
+  },
+  async saveDevelopRecipe(assetId: string, recipe: DevelopRecipe): Promise<boolean> {
+    if (tauri()) return invoke("save_develop_recipe", { assetId, recipe });
+    const edited = JSON.stringify(recipe.settings) !== JSON.stringify(neutralAdjustments);
+    if (edited) browserDevelopRecipes.set(assetId, structuredClone(recipe)); else browserDevelopRecipes.delete(assetId);
+    const asset = browserAssets.find((item) => item.id === assetId); if (asset) asset.hasEdits = edited;
+    return edited;
+  },
+  async previewDevelopRecipe(assetId: string, recipe: DevelopRecipe): Promise<string> {
+    return tauri() ? convertFileSrc(await invoke<string>("preview_develop_recipe", { assetId, recipe })) : "";
   },
   async chooseReplacement(asset: Asset): Promise<AssetVersion | null> {
     if (!tauri()) return null;

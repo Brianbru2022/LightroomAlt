@@ -27,7 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SUPPORTED: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "heic", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf",
     "rw2",
@@ -148,7 +148,7 @@ struct AssetVersion {
     source_hash: Option<String>,
     output_hash: Option<String>,
 }
-#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 struct BasicAdjustments {
     exposure: f32,
@@ -175,9 +175,15 @@ struct BasicAdjustments {
     crop_height: f32,
     rotate_quadrants: i8,
     straighten: f32,
+    horizontal_flip: bool,
+    vertical_flip: bool,
 }
 
 impl BasicAdjustments {
+    fn neutral() -> Self {
+        Self { crop_width: 1.0, crop_height: 1.0, ..Self::default() }
+    }
+
     fn validate(self) -> Result<Self> {
         let unit_values = [
             self.light_balance,
@@ -229,6 +235,37 @@ impl BasicAdjustments {
     }
 }
 
+impl Default for BasicAdjustments {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0, light_balance: 0.0, tint: 0.0, contrast: 0.0, highlights: 0.0,
+            shadows: 0.0, whites: 0.0, blacks: 0.0, dynamic_range: 0.0, texture: 0.0,
+            clarity: 0.0, dehaze: 0.0, colour_boost: 0.0, saturation: 0.0,
+            curve_highlights: 0.0, curve_lights: 0.0, curve_darks: 0.0, curve_shadows: 0.0,
+            crop_left: 0.0, crop_top: 0.0, crop_width: 1.0, crop_height: 1.0,
+            rotate_quadrants: 0, straighten: 0.0, horizontal_flip: false, vertical_flip: false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DevelopRecipe {
+    schema_version: i64,
+    settings: BasicAdjustments,
+}
+
+impl DevelopRecipe {
+    fn neutral() -> Self { Self { schema_version: 1, settings: BasicAdjustments::neutral() } }
+    fn validate(self) -> Result<Self> {
+        if self.schema_version != 1 {
+            return Err(KeepframeError::Message("This Develop recipe version is not supported by this build.".into()));
+        }
+        Ok(Self { settings: self.settings.validate()?, ..self })
+    }
+    fn is_edited(self) -> bool { self.settings != BasicAdjustments::neutral() }
+}
+
 struct AdjustmentInput {
     path: PathBuf,
     source_hash: String,
@@ -270,6 +307,7 @@ struct Asset {
     tags: Vec<String>,
     representation_count: i64,
     preferred_version_url: Option<String>,
+    has_edits: bool,
 }
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -666,6 +704,8 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), source_path TEXT NOT NULL, representation_id TEXT, state TEXT NOT NULL, error TEXT, staging_path TEXT, managed_path TEXT, source_hash TEXT, source_size INTEGER, source_modified TEXT, source_action TEXT);
       CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, kind TEXT NOT NULL, path TEXT NOT NULL, provider TEXT, prompt TEXT, recipe_json TEXT, source_hash TEXT, output_hash TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS edit_recipes(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, schema_version INTEGER NOT NULL, recipe_json TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS develop_recipes(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,schema_version INTEGER NOT NULL,recipe_json TEXT NOT NULL,updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_develop_recipes_updated ON develop_recipes(updated_at DESC);
       CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, common_brief TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(id), asset_id TEXT NOT NULL REFERENCES assets(id), state TEXT NOT NULL, prompt TEXT NOT NULL, recipe_json TEXT, negative_prompt TEXT, model TEXT, seed INTEGER, settings_json TEXT, output_path TEXT, output_hash TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_attempts(id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, attempt_number INTEGER NOT NULL, state TEXT NOT NULL, source_hash TEXT NOT NULL, recipe_json TEXT NOT NULL, prompt TEXT NOT NULL, negative_prompt TEXT NOT NULL, model TEXT NOT NULL, seed INTEGER NOT NULL, settings_json TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, output_path TEXT, output_hash TEXT, error TEXT, UNIQUE(job_id,attempt_number));
@@ -678,6 +718,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v4(&mut connection, existed, version)?;
     migrations::apply_v5(&mut connection, existed, version)?;
     migrations::apply_v6(&mut connection, existed, version)?;
+    migrations::apply_v7(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -1811,7 +1852,20 @@ fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32, radius_divi
         return;
     }
     let sigma = (image.width().min(image.height()) as f32 / radius_divisor).clamp(1.2, 48.0);
-    let blurred = image::imageops::blur(image, sigma);
+    // Local contrast is intentionally evaluated on a bounded working image.
+    // It preserves the visual scale of the correction while avoiding a huge
+    // Gaussian blur on every interactive full-size preview request.
+    let largest = image.width().max(image.height());
+    let blurred = if largest > 640 {
+        let scale = 640.0 / largest as f32;
+        let width = (image.width() as f32 * scale).round().max(1.0) as u32;
+        let height = (image.height() as f32 * scale).round().max(1.0) as u32;
+        let working = image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle);
+        let small_blur = image::imageops::blur(&working, (sigma * scale).max(1.2));
+        image::imageops::resize(&small_blur, image.width(), image.height(), image::imageops::FilterType::Triangle)
+    } else {
+        image::imageops::blur(image, sigma)
+    };
     for (pixel, blurred_pixel) in image.pixels_mut().zip(blurred.pixels()) {
         let mut values = [
             pixel[0] as f32 / 255.0,
@@ -1906,6 +1960,12 @@ fn apply_adjustments_to_image(
 
 fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage {
     let mut image = source.clone();
+    if adjustments.horizontal_flip {
+        image = image::imageops::flip_horizontal(&image);
+    }
+    if adjustments.vertical_flip {
+        image = image::imageops::flip_vertical(&image);
+    }
     for _ in 0..adjustments.rotate_quadrants {
         image = image::imageops::rotate90(&image);
     }
@@ -1937,6 +1997,20 @@ fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage 
     let crop_w = ((crop_width * width as f32).round() as u32).clamp(1, width.saturating_sub(x).max(1));
     let crop_h = ((crop_height * height as f32).round() as u32).clamp(1, height.saturating_sub(y).max(1));
     image::imageops::crop_imm(&image, x.min(width - 1), y.min(height - 1), crop_w, crop_h).to_image()
+}
+
+fn original_adjustment_input(connection: &Connection, asset_id: &str) -> Result<AdjustmentInput> {
+    let (captured, width, height): (String, Option<u32>, Option<u32>) = connection.query_row(
+        "SELECT captured_at,width,height FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let (path, source_hash): (String, String) = connection.query_row(
+        "SELECT path,sha256 FROM representations WHERE asset_id=?1 ORDER BY CASE WHEN lower(extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN is_raw=1 THEN 1 ELSE 2 END,path LIMIT 1",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(AdjustmentInput { path: PathBuf::from(path), source_hash, captured_at: captured, expected_dimensions: width.zip(height) })
 }
 
 fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments {
@@ -2002,6 +2076,8 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
         crop_height: 1.0,
         rotate_quadrants: 0,
         straighten: 0.0,
+        horizontal_flip: false,
+        vertical_flip: false,
     }
 }
 
@@ -2018,7 +2094,9 @@ async fn auto_basic_adjustments(
             [&asset_id],
             |row| row.get(0),
         )?;
-        let image = image::open(preview)?;
+        // A bounded preview keeps slider feedback independent of the size of
+        // the cached browse image. Full-resolution export uses a separate path.
+        let image = image::open(preview)?.thumbnail(720, 540);
         Ok(suggested_basic_adjustments(&image))
     })
     .await
@@ -2065,6 +2143,81 @@ async fn preview_basic_adjustments(
     })
     .await
     .map_err(|error| KeepframeError::Message(format!("Adjustment preview failed: {error}")))?
+}
+
+fn develop_recipe_in(connection: &Connection, asset_id: &str) -> Result<DevelopRecipe> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND trashed_at IS NULL)",
+        [asset_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(KeepframeError::Message("That photograph is no longer available for Develop.".into()));
+    }
+    let recipe_json: Option<String> = connection.query_row(
+        "SELECT recipe_json FROM develop_recipes WHERE asset_id=?1",
+        [asset_id],
+        |row| row.get(0),
+    ).optional()?;
+    match recipe_json {
+        Some(json) => serde_json::from_str::<DevelopRecipe>(&json)
+            .map_err(KeepframeError::from)?
+            .validate(),
+        None => Ok(DevelopRecipe::neutral()),
+    }
+}
+
+#[tauri::command]
+fn get_develop_recipe(asset_id: String, state: State<'_, AppState>) -> Result<DevelopRecipe> {
+    let connection = open_db(&root_from(&state)?)?;
+    develop_recipe_in(&connection, &asset_id)
+}
+
+#[tauri::command]
+fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>) -> Result<bool> {
+    let recipe = recipe.validate()?;
+    let mut connection = open_db(&root_from(&state)?)?;
+    let _ = develop_recipe_in(&connection, &asset_id)?;
+    let tx = connection.transaction()?;
+    if recipe.is_edited() {
+        tx.execute(
+            "INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,?2,?3,?4) ON CONFLICT(asset_id) DO UPDATE SET schema_version=excluded.schema_version,recipe_json=excluded.recipe_json,updated_at=excluded.updated_at",
+            params![asset_id, recipe.schema_version, serde_json::to_string(&recipe)?, Utc::now().to_rfc3339()],
+        )?;
+    } else {
+        tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1", [&asset_id])?;
+    }
+    tx.commit()?;
+    Ok(recipe.is_edited())
+}
+
+#[tauri::command]
+async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>) -> Result<String> {
+    let recipe = recipe.validate()?;
+    let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<String> {
+        let connection = open_db(&root)?;
+        let _ = develop_recipe_in(&connection, &asset_id)?;
+        let preview: String = connection.query_row(
+            "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL", [&asset_id], |row| row.get(0),
+        )?;
+        // Keep interactive work bounded even when the browsing thumbnail cache
+        // was built at a larger size. Export always decodes the original.
+        let image = image::open(preview)?.thumbnail(720, 540);
+        let adjusted = image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, recipe.settings));
+        let mut digest = Sha256::new();
+        digest.update(b"keepframe-develop-preview-v1");
+        digest.update(asset_id.as_bytes());
+        digest.update(serde_json::to_vec(&recipe)?);
+        let key = format!("{:x}", digest.finalize());
+        let output = root.join(".keepframe/previews").join(format!("develop-{}-{}.png", asset_id, &key[..16]));
+        if !output.exists() {
+            let temporary = output.with_extension("png.tmp");
+            fs::write(&temporary, encode_srgb_png(&adjusted)?)?;
+            fs::rename(&temporary, &output)?;
+        }
+        Ok(output.to_string_lossy().into())
+    }).await.map_err(|error| KeepframeError::Message(format!("Develop preview failed: {error}")))?
 }
 
 #[tauri::command]
@@ -2585,7 +2738,8 @@ fn query_assets_in(
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
          COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
-         COALESCE(a.missing_state,'available')
+         COALESCE(a.missing_state,'available'),
+         EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id)
          FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id LIMIT ? OFFSET ?"
     );
     let mut page_values = values;
@@ -2618,6 +2772,7 @@ fn query_assets_in(
             },
             location_source: row.get(15)?,
             missing_state: row.get(16)?,
+            has_edits: row.get::<_, i64>(17)? != 0,
         })
     })?;
     let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2638,7 +2793,8 @@ fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
          COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
-         COALESCE(a.missing_state,'available')
+         COALESCE(a.missing_state,'available'),
+         EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id)
          FROM assets a WHERE a.id=?1",
     )?;
     statement.query_row([asset_id], |row| {
@@ -2650,7 +2806,7 @@ fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>
             width: row.get::<_, Option<i64>>(6)?.map(|value| value as u32), height: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
             latitude: row.get(8)?, longitude: row.get(9)?, preview_url: thumbnail.clone(), thumbnail_url: thumbnail,
             representation_count: row.get(11)?, source_path: row.get(12)?, preferred_version_url: row.get(13)?,
-            tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?, missing_state: row.get(16)?,
+            tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?, missing_state: row.get(16)?, has_edits: row.get::<_, i64>(17)? != 0,
         })
     }).optional().map_err(KeepframeError::from)
 }
@@ -4549,6 +4705,23 @@ fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Res
         .filter(|value| !value.is_empty())
         .unwrap_or("photograph");
 
+    // Develop recipes are authoritative non-destructive edits.  Export always
+    // re-renders them from the protected full-resolution representation; it
+    // never upscales a preview or writes back to the original.
+    let recipe = develop_recipe_in(&connection, asset_id)?;
+    if recipe.is_edited() {
+        let input = original_adjustment_input(&connection, asset_id)?;
+        let image = prepare_full_resolution_image(
+            &input.path,
+            input.expected_dimensions,
+            &root.join(".keepframe/staging/working"),
+        )?;
+        let rendered = image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, recipe.settings));
+        let output = unused_export_path(destination, stem, "png");
+        fs::write(&output, encode_srgb_png(&rendered)?)?;
+        return Ok(output);
+    }
+
     if let Some(version_id) = preferred {
         let stored: String = connection.query_row(
             "SELECT path FROM versions WHERE id=?1 AND asset_id=?2 AND state!='rejected'",
@@ -4933,6 +5106,9 @@ pub fn run() {
             auto_basic_adjustments,
             preview_basic_adjustments,
             apply_basic_adjustments,
+            get_develop_recipe,
+            save_develop_recipe,
+            preview_develop_recipe,
             import_replacement,
             export_asset_image,
             export_external_edit,
@@ -5005,6 +5181,72 @@ mod tests {
         let cropped = apply_geometry(&source, BasicAdjustments { crop_left: 1.0 / 3.0, crop_width: 2.0 / 3.0, crop_height: 1.0, ..BasicAdjustments::default() });
         assert_eq!(cropped.dimensions(), (2, 2));
         assert_eq!(cropped.get_pixel(0, 0), &image::Rgb([0, 255, 0]));
+    }
+
+    #[test]
+    fn develop_recipe_is_versioned_deterministic_and_supports_flips() {
+        let recipe = DevelopRecipe { schema_version: 1, settings: BasicAdjustments { exposure: 0.5, horizontal_flip: true, ..BasicAdjustments::neutral() } };
+        let round_trip: DevelopRecipe = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+        assert_eq!(round_trip.validate().unwrap(), recipe);
+        assert!(recipe.is_edited());
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(3, 2, |x, y| image::Rgb([(x * 40) as u8, (y * 70) as u8, 30])));
+        assert_eq!(apply_adjustments_to_image(&source, recipe.settings), apply_adjustments_to_image(&source, recipe.settings));
+        let flipped = apply_geometry(&source.to_rgb8(), BasicAdjustments { horizontal_flip: true, ..BasicAdjustments::neutral() });
+        assert_eq!(flipped.get_pixel(0, 0), source.to_rgb8().get_pixel(2, 0));
+    }
+
+    #[test]
+    fn copied_develop_recipe_contains_no_asset_metadata() {
+        let recipe = DevelopRecipe { schema_version: 1, settings: BasicAdjustments { exposure: 0.5, saturation: 12.0, ..BasicAdjustments::neutral() } };
+        let copied: DevelopRecipe = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+        let stored = serde_json::to_string(&copied).unwrap();
+        for forbidden in ["filename", "capturedAt", "decision", "tags", "latitude", "longitude", "path", "assetId"] {
+            assert!(!stored.contains(forbidden), "copied Develop settings leaked {forbidden}");
+        }
+        assert_eq!(copied.settings, recipe.settings);
+    }
+
+    #[test]
+    fn develop_recipe_persists_without_changing_the_protected_original() {
+        let root = std::env::temp_dir().join(format!("keepframe-develop-test-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let original = root.join("Originals/photo.png");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, image::Rgb([70, 90, 110]))).save(&original).unwrap();
+        let original_hash = hash_file(&original).unwrap();
+        let connection = open_db(&root).unwrap();
+        connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','photo.png','2026-09-12T12:00:00Z',64,48,?1,'2026-09-12T12:00:00Z')", [original.to_string_lossy().as_ref()]).unwrap();
+        connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)", params![original.to_string_lossy(), original_hash, fs::metadata(&original).unwrap().len()]).unwrap();
+        let recipe = DevelopRecipe { schema_version: 1, settings: BasicAdjustments { exposure: 0.75, crop_left: 0.1, crop_width: 0.8, ..BasicAdjustments::neutral() } };
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',1,?1,?2)", params![serde_json::to_string(&recipe).unwrap(), Utc::now().to_rfc3339()]).unwrap();
+        assert_eq!(develop_recipe_in(&connection, "asset").unwrap(), recipe);
+        drop(connection);
+        let destination = root.join("Exports");
+        let exported = export_asset_image_in(&root, "asset", &destination).unwrap();
+        assert_eq!(image::open(exported).unwrap().dimensions(), (51, 48));
+        assert_eq!(hash_file(&original).unwrap(), original_hash);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual performance checkpoint; run with --ignored --nocapture"]
+    fn develop_render_performance_checkpoint() {
+        let preview = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])));
+        let recipe = BasicAdjustments { exposure: 0.35, highlights: -20.0, shadows: 18.0, texture: 10.0, clarity: 8.0, saturation: 6.0, ..BasicAdjustments::neutral() };
+        let preview_started = Instant::now();
+        let rendered_preview = apply_adjustments_to_image(&preview, recipe);
+        let preview_elapsed = preview_started.elapsed();
+        let warm_started = Instant::now();
+        let cache_key = Sha256::digest(serde_json::to_vec(&recipe).unwrap());
+        let warm_elapsed = warm_started.elapsed();
+        let full = image::DynamicImage::ImageRgb8(image::imageops::resize(&rendered_preview, 2400, 1600, image::imageops::FilterType::Triangle));
+        let export_started = Instant::now();
+        let encoded = encode_srgb_png(&image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&full, recipe))).unwrap();
+        let export_elapsed = export_started.elapsed();
+        eprintln!("Develop checkpoint: 720x480 preview={preview_elapsed:?}; warm recipe/cache-key={warm_elapsed:?}; 2400x1600 render+PNG={export_elapsed:?}; output={} bytes", encoded.len());
+        assert!(!cache_key.is_empty());
+        assert!(preview_elapsed < Duration::from_secs(15));
+        assert!(export_elapsed < Duration::from_secs(15));
     }
 
     #[test]

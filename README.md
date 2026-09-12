@@ -11,7 +11,7 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 3. Browse the timeline, tags and clustered full-library map; search configured places, select a marker, or place an unlocated photograph without changing its source metadata.
 4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
-6. Make non-destructive basic exposure, white-balance, tonal-range, colour, texture/clarity/dehaze and point-curve adjustments, including a protected automatic range option.
+6. Use Develop for non-destructive exposure, white balance, tonal, presence, colour, transform and crop edits; the catalogue recipe is authoritative and exports render it from the protected full-resolution source.
 7. Choose a plain-language AI action such as **Improve photo**, **Improve lighting**, **Enhance colour**, **Restore old photo**, **Remove distraction** or **Custom instruction**.
 8. Choose a local edit when it is genuinely available, or prepare a manual ChatGPT/Gemini hand-off. Import the returned image as a traceable candidate version.
 
@@ -77,6 +77,8 @@ Keepframe preserves imported embedded GPS separately from a manual catalogue pin
 **Settings & Library Health** provides explicit local XMP sidecar export/import, a versioned portable catalogue JSON export, integrity/rescan, hash-confirmed relinking and an optional Changes-detected Inbox for folders you choose to watch. These operations do not rewrite original image pixels, auto-import files, delete catalogue records or silently relink an uncertain match. XMP and catalogue exports may include GPS coordinates, paths, filenames, tags and hashes, so share them deliberately.
 
 See `MILESTONE_5_INTEROPERABILITY_GUIDE.md` for the metadata mapping, XMP subset, export schema, moved-library path rebasing, folder-watch behaviour and known limits.
+
+See `MILESTONE_6_DEVELOP_GUIDE.md` for Develop controls, render order, recipe persistence, cache behaviour, shortcuts and current RAW/colour boundaries.
 
 ## Optional local AI
 

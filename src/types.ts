@@ -1,4 +1,4 @@
-export type ViewName = "library" | "triage" | "map" | "workshop" | "trash" | "settings";
+export type ViewName = "library" | "develop" | "triage" | "map" | "workshop" | "trash" | "settings";
 export type Decision = "undecided" | "keep" | "discard";
 export type EditIntent =
   | "restoration"
@@ -58,6 +58,7 @@ export type Asset = {
   tags: string[];
   representationCount: number;
   preferredVersionUrl?: string;
+  hasEdits?: boolean;
 };
 
 export type MapBounds = { south: number; west: number; north: number; east: number };
@@ -169,6 +170,8 @@ export type BasicAdjustments = {
   cropHeight: number;
   rotateQuadrants: number;
   straighten: number;
+  horizontalFlip: boolean;
+  verticalFlip: boolean;
 };
 
 export const neutralAdjustments: BasicAdjustments = {
@@ -177,8 +180,10 @@ export const neutralAdjustments: BasicAdjustments = {
   colourBoost: 0, saturation: 0, curveHighlights: 0, curveLights: 0,
   curveDarks: 0, curveShadows: 0,
   cropLeft: 0, cropTop: 0, cropWidth: 1, cropHeight: 1,
-  rotateQuadrants: 0, straighten: 0,
+  rotateQuadrants: 0, straighten: 0, horizontalFlip: false, verticalFlip: false,
 };
+
+export type DevelopRecipe = { schemaVersion: 1; settings: BasicAdjustments };
 
 export type JobAttempt = {
   attemptNumber: number;
