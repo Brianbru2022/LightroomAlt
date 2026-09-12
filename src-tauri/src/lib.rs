@@ -31,7 +31,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
 const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
@@ -76,6 +76,7 @@ struct AppState {
     renderer_caches: Arc<Mutex<RendererCaches>>,
     mask_install_cancel: AtomicBool,
     export_generation: Arc<AtomicU64>,
+    batch_generation: Arc<AtomicU64>,
     folder_watcher: Mutex<Option<FolderWatcher>>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -641,6 +642,11 @@ struct AssetFilter {
     tagged: Option<bool>,
     located: Option<bool>,
     trashed: Option<bool>,
+    rating: Option<i64>,
+    edited: Option<bool>,
+    file_type: Option<String>,
+    sort: Option<String>,
+    descending: Option<bool>,
 }
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -651,6 +657,11 @@ struct Asset {
     preview_url: String,
     thumbnail_url: String,
     decision: String,
+    rating: i64,
+    title: Option<String>,
+    caption: Option<String>,
+    copyright: Option<String>,
+    creator: Option<String>,
     captured_at: String,
     date_fallback: bool,
     camera: Option<String>,
@@ -1041,7 +1052,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     }
     connection.execute_batch(r#"
       CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, embedded_latitude REAL, embedded_longitude REAL, manual_latitude REAL, manual_longitude REAL, location_source TEXT NOT NULL DEFAULT 'none', missing_state TEXT NOT NULL DEFAULT 'available', last_verified_at TEXT, thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
+      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), rating INTEGER NOT NULL DEFAULT 0 CHECK(rating BETWEEN 0 AND 5), title TEXT, caption TEXT, copyright TEXT, creator TEXT, captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, embedded_latitude REAL, embedded_longitude REAL, manual_latitude REAL, manual_longitude REAL, location_source TEXT NOT NULL DEFAULT 'none', missing_state TEXT NOT NULL DEFAULT 'available', last_verified_at TEXT, thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
       CREATE TABLE IF NOT EXISTS representations(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, path TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, extension TEXT NOT NULL, stem TEXT NOT NULL, byte_size INTEGER NOT NULL, is_raw INTEGER NOT NULL DEFAULT 0, UNIQUE(asset_id,path));
       CREATE INDEX IF NOT EXISTS idx_representations_hash ON representations(sha256);
       CREATE INDEX IF NOT EXISTS idx_representations_asset ON representations(asset_id,is_raw,path);
@@ -1079,6 +1090,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v8(&mut connection, existed, version)?;
     migrations::apply_v9(&mut connection, existed, version)?;
     migrations::apply_v10(&mut connection, existed, version)?;
+    migrations::apply_v11(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -3182,6 +3194,53 @@ fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_,
     Ok(recipe.is_edited())
 }
 
+fn write_develop_recipe(tx:&rusqlite::Transaction<'_>,asset_id:&str,recipe:&DevelopRecipe)->Result<()> {
+    if recipe.is_edited(){tx.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,2,?2,?3) ON CONFLICT(asset_id) DO UPDATE SET schema_version=2,recipe_json=excluded.recipe_json,updated_at=excluded.updated_at",params![asset_id,serde_json::to_string(recipe)?,Utc::now().to_rfc3339()])?;}else{tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1",[asset_id])?;}Ok(())
+}
+
+fn recipe_snapshots(connection:&Connection,asset_ids:&[String])->Result<Value>{Ok(Value::Array(asset_ids.iter().map(|id|Ok(json!({"id":id,"recipe":develop_recipe_in(connection,id)?}))).collect::<Result<Vec<_>>>()?))}
+
+fn apply_recipe_snapshots(tx:&rusqlite::Transaction<'_>,snapshots:&Value)->Result<()> {
+    for item in snapshots.as_array().ok_or_else(||KeepframeError::Message("Batch recipe history is invalid".into()))?{let id=item["id"].as_str().ok_or_else(||KeepframeError::Message("Batch recipe history has no asset id".into()))?;let recipe=serde_json::from_value::<DevelopRecipe>(item["recipe"].clone())?.validate()?;write_develop_recipe(tx,id,&recipe)?;}Ok(())
+}
+
+fn copy_setting_categories(target:&mut BasicAdjustments,source:&BasicAdjustments,categories:&HashSet<String>){
+    if categories.contains("whiteBalance"){target.light_balance=source.light_balance;target.tint=source.tint;}
+    if categories.contains("tone"){target.exposure=source.exposure;target.contrast=source.contrast;target.highlights=source.highlights;target.shadows=source.shadows;target.whites=source.whites;target.blacks=source.blacks;target.dynamic_range=source.dynamic_range;target.curve_highlights=source.curve_highlights;target.curve_lights=source.curve_lights;target.curve_darks=source.curve_darks;target.curve_shadows=source.curve_shadows;}
+    if categories.contains("presence"){target.texture=source.texture;target.clarity=source.clarity;target.dehaze=source.dehaze;}
+    if categories.contains("colour"){target.colour_boost=source.colour_boost;target.saturation=source.saturation;}
+    if categories.contains("transform"){target.crop_left=source.crop_left;target.crop_top=source.crop_top;target.crop_width=source.crop_width;target.crop_height=source.crop_height;target.rotate_quadrants=source.rotate_quadrants;target.straighten=source.straighten;target.horizontal_flip=source.horizontal_flip;target.vertical_flip=source.vertical_flip;}
+}
+
+fn apply_batch_recipes(connection:&mut Connection,asset_ids:Vec<String>,recipes:Vec<DevelopRecipe>)->Result<BatchSummary>{
+    let requested=asset_ids.len();if requested==0||requested!=recipes.len()||requested>10_000{return Err(KeepframeError::Message("The Develop batch is invalid".into()));}
+    let old=recipe_snapshots(connection,&asset_ids)?;let tx=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;let mut changed=0;let mut new=Vec::with_capacity(requested);
+    for (id,recipe) in asset_ids.iter().zip(recipes){let recipe=recipe.validate()?;let before=old.as_array().unwrap().iter().find(|item|item["id"]==*id).unwrap()["recipe"].clone();let after=serde_json::to_value(&recipe)?;if before!=after{changed+=1;}write_develop_recipe(&tx,id,&recipe)?;new.push(json!({"id":id,"recipe":recipe}));}
+    if changed>0{tx.execute("DELETE FROM audit_log WHERE undone=1",[])?;tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('batch',?1,'batch_recipes',?2,?3,?4)",params![Uuid::new_v4().to_string(),old.to_string(),Value::Array(new).to_string(),Utc::now().to_rfc3339()])?;}tx.commit()?;Ok(BatchSummary{requested,changed,failed:0,cancelled:0})
+}
+
+#[tauri::command]
+fn sync_develop_settings(request:SyncDevelopRequest,state:State<'_,AppState>)->Result<BatchSummary>{
+    let mut connection=open_db(&root_from(&state)?)?;sync_develop_settings_in(&mut connection,request)
+}
+
+fn sync_develop_settings_in(connection:&mut Connection,request:SyncDevelopRequest)->Result<BatchSummary>{
+    let allowed=["tone","whiteBalance","presence","colour","transform","manualMasks","intelligentMasks"];if request.categories.is_empty()||request.categories.iter().any(|value|!allowed.contains(&value.as_str())){return Err(KeepframeError::Message("Choose valid Develop categories to sync".into()));}
+    let categories=request.categories.into_iter().collect::<HashSet<_>>();let mut ids=request.target_ids.into_iter().filter(|id|id!=&request.source_id).collect::<Vec<_>>();ids.sort();ids.dedup();let source=develop_recipe_in(connection,&request.source_id)?;let mut recipes=Vec::with_capacity(ids.len());
+    for id in &ids{let mut target=develop_recipe_in(connection,id)?;copy_setting_categories(&mut target.settings,&source.settings,&categories);let manual=categories.contains("manualMasks");let intelligent=categories.contains("intelligentMasks");if manual||intelligent{target.masks.retain(|mask|match mask.geometry{MaskGeometry::Semantic{..}=>!intelligent,_=>!manual});for mask in source.masks.iter().filter(|mask|match mask.geometry{MaskGeometry::Semantic{..}=>intelligent,_=>manual}){let mut copied=mask.clone();copied.id=Uuid::new_v4().to_string();target.masks.push(copied);}}recipes.push(target);}
+    apply_batch_recipes(connection,ids,recipes)
+}
+
+#[tauri::command]
+fn apply_preset_to_selection(request:ApplyPresetBatchRequest,state:State<'_,AppState>)->Result<BatchSummary>{
+    let mut connection=open_db(&root_from(&state)?)?;let preset=if let Some(preset)=built_in_presets().into_iter().find(|preset|preset.id==request.preset_id){preset}else{let json:String=connection.query_row("SELECT preset_json FROM develop_presets WHERE id=?1",[&request.preset_id],|row|row.get(0))?;serde_json::from_str::<DevelopPreset>(&json)?.validate(true)?};
+    apply_preset_batch_in(&mut connection,request.asset_ids,&preset)
+}
+
+fn apply_preset_batch_in(connection:&mut Connection,mut ids:Vec<String>,preset:&DevelopPreset)->Result<BatchSummary>{
+    let categories=preset.categories.iter().cloned().collect::<HashSet<_>>();ids.sort();ids.dedup();let mut recipes=Vec::with_capacity(ids.len());for id in &ids{let mut recipe=develop_recipe_in(connection,id)?;copy_setting_categories(&mut recipe.settings,&preset.settings,&categories);recipes.push(recipe);}apply_batch_recipes(connection,ids,recipes)
+}
+
 #[tauri::command]
 async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>,) -> Result<String> {
     let recipe = recipe.validate()?;
@@ -3755,10 +3814,21 @@ fn asset_where(filter: &AssetFilter) -> (String, Vec<SqlValue>) {
     if let Some(located) = filter.located {
         clauses.push(if located { "a.latitude IS NOT NULL AND a.longitude IS NOT NULL" } else { "a.latitude IS NULL OR a.longitude IS NULL" });
     }
+    if let Some(rating) = filter.rating {
+        clauses.push("a.rating = ?");
+        values.push(SqlValue::Integer(rating.clamp(0, 5)));
+    }
+    if let Some(edited) = filter.edited {
+        clauses.push(if edited { "EXISTS(SELECT 1 FROM develop_recipes edr WHERE edr.asset_id=a.id)" } else { "NOT EXISTS(SELECT 1 FROM develop_recipes edr WHERE edr.asset_id=a.id)" });
+    }
+    if let Some(file_type) = filter.file_type.as_ref().filter(|value| !value.trim().is_empty()) {
+        clauses.push("EXISTS(SELECT 1 FROM representations fr WHERE fr.asset_id=a.id AND lower(fr.extension)=?)");
+        values.push(SqlValue::Text(file_type.trim().trim_start_matches('.').to_lowercase()));
+    }
     if !filter.search.trim().is_empty() {
-        clauses.push("(lower(a.filename) LIKE ? OR lower(COALESCE(a.camera,'')) LIKE ? OR EXISTS (SELECT 1 FROM asset_tags sat JOIN tags st ON st.id=sat.tag_id WHERE sat.asset_id=a.id AND lower(st.name) LIKE ?))");
+        clauses.push("(lower(a.filename) LIKE ? OR lower(COALESCE(a.camera,'')) LIKE ? OR lower(COALESCE(a.title,'')) LIKE ? OR lower(COALESCE(a.caption,'')) LIKE ? OR EXISTS (SELECT 1 FROM asset_tags sat JOIN tags st ON st.id=sat.tag_id WHERE sat.asset_id=a.id AND lower(st.name) LIKE ?))");
         let search = SqlValue::Text(format!("%{}%", filter.search.trim().to_lowercase()));
-        values.extend([search.clone(), search.clone(), search]);
+        values.extend([search.clone(), search.clone(), search.clone(), search.clone(), search]);
     }
     let sql = if clauses.is_empty() {
         String::new()
@@ -3766,6 +3836,63 @@ fn asset_where(filter: &AssetFilter) -> (String, Vec<SqlValue>) {
         format!(" WHERE {}", clauses.join(" AND "))
     };
     (sql, values)
+}
+
+fn analyse_auto_batch(root:&Path,asset_ids:&[String],generation:u64,counter:&AtomicU64,app:Option<&AppHandle>)->Result<(Vec<String>,Vec<DevelopRecipe>,usize,usize)>{
+    let connection=open_db(root)?;let total=asset_ids.len();let mut ids=Vec::new();let mut recipes=Vec::new();let mut failed=0;let mut low_confidence=0;
+    for (index,id) in asset_ids.iter().enumerate(){if counter.load(Ordering::Acquire)!=generation{break;}let analysed=(||->Result<DevelopRecipe>{let mut recipe=develop_recipe_in(&connection,id)?;let preview:String=connection.query_row("SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",[id],|row|row.get(0))?;let image=image::open(preview)?.thumbnail(720,540);let proposal=auto_proposal(&image,recipe.settings);if proposal.confidence<0.55{low_confidence+=1;}recipe.settings=proposal.settings;Ok(recipe)})();match analysed{Ok(recipe)=>{ids.push(id.clone());recipes.push(recipe);},Err(_)=>failed+=1}if let Some(app)=app{let _=app.emit("batch-progress",json!({"kind":"Batch Auto","current":index+1,"total":total,"failed":failed}));}}
+    Ok((ids,recipes,failed,low_confidence))
+}
+
+#[tauri::command]
+async fn preview_batch_auto(asset_ids:Vec<String>,state:State<'_,AppState>)->Result<BatchAutoSummary>{
+    let requested=asset_ids.len();if requested==0||requested>10_000{return Err(KeepframeError::Message("Select between 1 and 10,000 photographs".into()));}let root=root_from(&state)?;let counter=Arc::clone(&state.batch_generation);let generation=counter.fetch_add(1,Ordering::AcqRel)+1;
+    let (ids,_,failed,low)=tauri::async_runtime::spawn_blocking(move||analyse_auto_batch(&root,&asset_ids,generation,&counter,None)).await.map_err(|error|KeepframeError::Message(format!("Batch Auto preview failed: {error}")))??;
+    Ok(BatchAutoSummary{requested,changed:0,failed,cancelled:0,analyzable:ids.len(),low_confidence_white_balance:low,skipped:failed})
+}
+
+#[tauri::command]
+async fn apply_batch_auto(asset_ids:Vec<String>,app:AppHandle,state:State<'_,AppState>)->Result<BatchAutoSummary>{
+    let requested=asset_ids.len();if requested==0||requested>10_000{return Err(KeepframeError::Message("Select between 1 and 10,000 photographs".into()));}let root=root_from(&state)?;let counter=Arc::clone(&state.batch_generation);let generation=counter.fetch_add(1,Ordering::AcqRel)+1;
+    tauri::async_runtime::spawn_blocking(move||{let (ids,recipes,failed,low)=analyse_auto_batch(&root,&asset_ids,generation,&counter,Some(&app))?;let cancelled=if counter.load(Ordering::Acquire)!=generation{requested.saturating_sub(ids.len()+failed)}else{0};if cancelled>0{return Ok(BatchAutoSummary{requested,changed:0,failed,cancelled,analyzable:ids.len(),low_confidence_white_balance:low,skipped:failed});}let mut connection=open_db(&root)?;let applied=apply_batch_recipes(&mut connection,ids,recipes)?;Ok(BatchAutoSummary{requested,changed:applied.changed,failed,cancelled:0,analyzable:applied.requested,low_confidence_white_balance:low,skipped:failed})}).await.map_err(|error|KeepframeError::Message(format!("Batch Auto failed: {error}")))?
+}
+
+#[tauri::command]
+fn cancel_library_batch(state:State<'_,AppState>){state.batch_generation.fetch_add(1,Ordering::AcqRel);}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchMetadataRequest { asset_ids: Vec<String>, patch: Value }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchSummary { requested: usize, changed: usize, failed: usize, cancelled: usize }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchAutoSummary {
+    requested: usize, changed: usize, failed: usize, cancelled: usize,
+    analyzable: usize, low_confidence_white_balance: usize, skipped: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncDevelopRequest { source_id: String, target_ids: Vec<String>, categories: Vec<String> }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyPresetBatchRequest { asset_ids: Vec<String>, preset_id: String }
+
+fn asset_order(filter: &AssetFilter) -> String {
+    let direction = if filter.descending.unwrap_or(true) { "DESC" } else { "ASC" };
+    let field = match filter.sort.as_deref().unwrap_or("captureTime") {
+        "filename" => "a.filename COLLATE NOCASE",
+        "rating" => "a.rating",
+        "importTime" => "a.created_at",
+        "editedTime" => "COALESCE((SELECT updated_at FROM develop_recipes sor WHERE sor.asset_id=a.id),'')",
+        _ => "a.captured_at",
+    };
+    format!("{field} {direction},a.id")
 }
 
 fn query_assets_in(
@@ -3790,8 +3917,9 @@ fn query_assets_in(
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
          COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
          COALESCE(a.missing_state,'available'),
-         EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id)
-         FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id LIMIT ? OFFSET ?"
+         EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id),
+         a.rating,a.title,a.caption,a.copyright,a.creator
+         FROM assets a{where_sql} ORDER BY {} LIMIT ? OFFSET ?", asset_order(filter)
     );
     let mut page_values = values;
     page_values.push(SqlValue::Integer(limit));
@@ -3824,6 +3952,11 @@ fn query_assets_in(
             location_source: row.get(15)?,
             missing_state: row.get(16)?,
             has_edits: row.get::<_, i64>(17)? != 0,
+            rating: row.get(18)?,
+            title: row.get(19)?,
+            caption: row.get(20)?,
+            copyright: row.get(21)?,
+            creator: row.get(22)?,
         })
     })?;
     let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3845,7 +3978,8 @@ fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
          COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
          COALESCE(a.missing_state,'available'),
-         EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id)
+         EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id),
+         a.rating,a.title,a.caption,a.copyright,a.creator
          FROM assets a WHERE a.id=?1",
     )?;
     statement.query_row([asset_id], |row| {
@@ -3858,6 +3992,7 @@ fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>
             latitude: row.get(8)?, longitude: row.get(9)?, preview_url: thumbnail.clone(), thumbnail_url: thumbnail,
             representation_count: row.get(11)?, source_path: row.get(12)?, preferred_version_url: row.get(13)?,
             tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?, missing_state: row.get(16)?, has_edits: row.get::<_, i64>(17)? != 0,
+            rating: row.get(18)?, title: row.get(19)?, caption: row.get(20)?, copyright: row.get(21)?, creator: row.get(22)?,
         })
     }).optional().map_err(KeepframeError::from)
 }
@@ -4079,7 +4214,7 @@ fn query_asset_ids(filter: AssetFilter, state: State<'_, AppState>) -> Result<Ve
     let connection = open_db(&root_from(&state)?)?;
     let (where_sql, values) = asset_where(&filter);
     let mut statement = connection.prepare(&format!(
-        "SELECT a.id FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id"
+        "SELECT a.id FROM assets a{where_sql} ORDER BY {}", asset_order(&filter)
     ))?;
     let ids = statement
         .query_map(params_from_iter(values.iter()), |row| row.get(0))?
@@ -4105,6 +4240,7 @@ fn set_decision_in(connection: &mut Connection, asset_id: &str, decision: &str) 
         return Ok(());
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     tx.execute(
         "UPDATE assets SET decision=?2 WHERE id=?1",
         params![asset_id, decision],
@@ -4163,6 +4299,69 @@ fn replace_asset_tags(
     )?;
     Ok(())
 }
+
+fn catalogue_snapshot(connection: &Connection, asset_id: &str) -> Result<Value> {
+    let (rating, decision, title, caption, copyright, creator): (i64, String, Option<String>, Option<String>, Option<String>, Option<String>) = connection.query_row(
+        "SELECT rating,decision,title,caption,copyright,creator FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        [asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    )?;
+    Ok(json!({"id":asset_id,"rating":rating,"decision":decision,"title":title,"caption":caption,"copyright":copyright,"creator":creator,"tags":asset_tags(connection,asset_id)?}))
+}
+
+fn apply_catalogue_snapshots(tx: &rusqlite::Transaction<'_>, snapshots: &Value) -> Result<()> {
+    let items = snapshots.as_array().ok_or_else(|| KeepframeError::Message("Batch catalogue history is invalid".into()))?;
+    for item in items {
+        let id=item["id"].as_str().ok_or_else(|| KeepframeError::Message("Batch catalogue history has no asset id".into()))?;
+        let rating=item["rating"].as_i64().ok_or_else(|| KeepframeError::Message("Batch rating history is invalid".into()))?;
+        let decision=item["decision"].as_str().ok_or_else(|| KeepframeError::Message("Batch flag history is invalid".into()))?;
+        tx.execute("UPDATE assets SET rating=?2,decision=?3,title=?4,caption=?5,copyright=?6,creator=?7 WHERE id=?1", params![id,rating,decision,item["title"].as_str(),item["caption"].as_str(),item["copyright"].as_str(),item["creator"].as_str()])?;
+        replace_asset_tags(tx,id,&serde_json::from_value::<Vec<String>>(item["tags"].clone())?)?;
+    }
+    Ok(())
+}
+
+fn patch_text(patch: &serde_json::Map<String,Value>, key: &str, max_chars: usize) -> Result<Option<Option<String>>> {
+    let Some(value)=patch.get(key) else{return Ok(None)};
+    if value.is_null(){return Ok(Some(None));}
+    let text=value.as_str().ok_or_else(||KeepframeError::Message(format!("{key} must be text or null")))?.trim().to_string();
+    if text.chars().count()>max_chars || text.chars().any(|character| character=='\0') {return Err(KeepframeError::Message(format!("{key} is too long or contains invalid text")));}
+    Ok(Some(if text.is_empty(){None}else{Some(text)}))
+}
+
+fn batch_metadata_in(connection: &mut Connection, request: BatchMetadataRequest) -> Result<BatchSummary> {
+    let requested=request.asset_ids.len();
+    if requested==0 || requested>10_000{return Err(KeepframeError::Message("Select between 1 and 10,000 photographs".into()));}
+    let ids=request.asset_ids.into_iter().collect::<HashSet<_>>();
+    if ids.len()!=requested{return Err(KeepframeError::Message("The batch selection contains duplicate ids".into()));}
+    let patch=request.patch.as_object().ok_or_else(||KeepframeError::Message("The metadata patch must be an object".into()))?;
+    let title=patch_text(patch,"title",512)?;let caption=patch_text(patch,"caption",8_000)?;let copyright=patch_text(patch,"copyright",1_000)?;let creator=patch_text(patch,"creator",512)?;
+    let rating=patch.get("rating").map(|value|value.as_i64().ok_or_else(||KeepframeError::Message("Rating must be 0 to 5".into()))).transpose()?;
+    if rating.is_some_and(|value|!(0..=5).contains(&value)){return Err(KeepframeError::Message("Rating must be 0 to 5".into()));}
+    let decision=patch.get("decision").map(|value|value.as_str().ok_or_else(||KeepframeError::Message("Flag must be Pick, Unflagged or Reject".into()))).transpose()?;
+    if decision.is_some_and(|value|!["keep","undecided","discard"].contains(&value)){return Err(KeepframeError::Message("Flag must be Pick, Unflagged or Reject".into()));}
+    let read_words=|key:&str|->Result<Option<Vec<String>>>{patch.get(key).map(|value|serde_json::from_value::<Vec<String>>(value.clone()).map(normalise_tags).map_err(KeepframeError::from)).transpose()};
+    let add=read_words("addKeywords")?;let remove=read_words("removeKeywords")?;let replace=read_words("replaceKeywords")?;
+    let tx=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut old=Vec::with_capacity(requested);let mut new=Vec::with_capacity(requested);let mut changed=0;
+    for id in ids.iter(){
+        let before=catalogue_snapshot(&tx,id)?;old.push(before.clone());
+        if let Some(value)=rating{tx.execute("UPDATE assets SET rating=?2 WHERE id=?1",params![id,value])?;}
+        if let Some(value)=decision{tx.execute("UPDATE assets SET decision=?2 WHERE id=?1",params![id,value])?;}
+        for (column,value) in [("title",&title),("caption",&caption),("copyright",&copyright),("creator",&creator)]{if let Some(value)=value{tx.execute(&format!("UPDATE assets SET {column}=?2 WHERE id=?1"),params![id,value])?;}}
+        if replace.is_some()||add.is_some()||remove.is_some(){
+            let mut tags=match replace.clone(){Some(tags)=>tags,None=>asset_tags(&tx,id)?};
+            if let Some(words)=add.as_ref(){tags.extend(words.clone());}
+            if let Some(words)=remove.as_ref(){let removed=words.iter().map(|word|word.to_lowercase()).collect::<HashSet<_>>();tags.retain(|tag|!removed.contains(&tag.to_lowercase()));}
+            replace_asset_tags(&tx,id,&normalise_tags(tags))?;
+        }
+        let after=catalogue_snapshot(&tx,id)?;if after!=before{changed+=1;}new.push(after);
+    }
+    if changed>0{tx.execute("DELETE FROM audit_log WHERE undone=1",[])?;tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('batch',?1,'batch_assets',?2,?3,?4)",params![Uuid::new_v4().to_string(),Value::Array(old).to_string(),Value::Array(new).to_string(),Utc::now().to_rfc3339()])?;}
+    tx.commit()?;Ok(BatchSummary{requested,changed,failed:0,cancelled:0})
+}
+
+#[tauri::command]
+fn batch_update_metadata(request: BatchMetadataRequest,state:State<'_,AppState>)->Result<BatchSummary>{let mut connection=open_db(&root_from(&state)?)?;batch_metadata_in(&mut connection,request)}
 
 fn catalogued_paths(connection: &Connection, asset_id: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
@@ -4524,6 +4723,8 @@ fn undo_last_action_in(connection: &mut Connection) -> Result<bool> {
                     ],
                 )?;
             }
+            "batch_assets" => apply_catalogue_snapshots(&tx, &value)?,
+            "batch_recipes" => apply_recipe_snapshots(&tx, &value)?,
             _ => {
                 return Err(KeepframeError::Message(format!(
                     "Unsupported undo action: {kind}"
@@ -4551,6 +4752,7 @@ fn update_tags_in(connection: &mut Connection, asset_id: &str, tags: Vec<String>
         return Ok(());
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     replace_asset_tags(&tx, asset_id, &tags)?;
     tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'tags',?2,?3,?4)",params![asset_id,json!({"tags":old}).to_string(),json!({"tags":tags}).to_string(),Utc::now().to_rfc3339()])?;
     tx.commit()?;
@@ -4583,6 +4785,7 @@ fn update_location_in(
         return Ok(());
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     tx.execute(
         "UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?2,manual_longitude=?3,location_source='manual' WHERE id=?1",
         params![asset_id, latitude, longitude],
@@ -4611,6 +4814,7 @@ fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitu
     let ids = asset_ids.iter().filter(|id| unique.insert(id.as_str())).collect::<Vec<_>>();
     if ids.is_empty() { return Ok(0); }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     for asset_id in &ids {
         let old: (Option<f64>, Option<f64>, Option<f64>, Option<f64>, String) = tx.query_row(
             "SELECT latitude,longitude,manual_latitude,manual_longitude,location_source FROM assets WHERE id=?1", [asset_id.as_str()],
@@ -4645,6 +4849,7 @@ fn clear_manual_location_in(connection: &mut Connection, asset_id: &str) -> Resu
     )?;
     let source = if embedded.0.is_some() && embedded.1.is_some() { "embedded" } else { "none" };
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     tx.execute(
         "UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=NULL,manual_longitude=NULL,location_source=?4 WHERE id=?1",
         params![asset_id, embedded.0, embedded.1, source],
@@ -5767,6 +5972,27 @@ async fn start_export_batch(
     .map_err(|error| KeepframeError::Message(format!("Export task failed: {error}")))?
 }
 
+fn redo_last_action_in(connection: &mut Connection) -> Result<bool> {
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let action: Option<(i64,String,String,String)> = tx.query_row("SELECT id,entity_id,action,new_json FROM audit_log WHERE undone=1 ORDER BY id ASC LIMIT 1", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+    let Some((id,entity,kind,new_json))=action else { tx.commit()?; return Ok(false); };
+    let value: Value=serde_json::from_str(&new_json)?;
+    match kind.as_str() {
+        "decision" => { let decision=value["decision"].as_str().ok_or_else(||KeepframeError::Message("Decision redo record is invalid".into()))?; tx.execute("UPDATE assets SET decision=?2 WHERE id=?1",params![entity,decision])?; }
+        "tags" => replace_asset_tags(&tx,&entity,&serde_json::from_value::<Vec<String>>(value["tags"].clone())?)?,
+        "location" => { tx.execute("UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?4,manual_longitude=?5,location_source=?6 WHERE id=?1",params![entity,value["latitude"].as_f64(),value["longitude"].as_f64(),value["manualLatitude"].as_f64(),value["manualLongitude"].as_f64(),value["locationSource"].as_str().unwrap_or(if value["latitude"].is_null(){"none"}else{"embedded"})])?; }
+        "batch_assets" => apply_catalogue_snapshots(&tx,&value)?,
+        "batch_recipes" => apply_recipe_snapshots(&tx,&value)?,
+        _ => return Err(KeepframeError::Message(format!("Unsupported redo action: {kind}"))),
+    }
+    tx.execute("UPDATE audit_log SET undone=0 WHERE id=?1",[id])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn redo_last_action(state: State<'_,AppState>) -> Result<bool> { let mut connection=open_db(&root_from(&state)?)?; redo_last_action_in(&mut connection) }
+
 #[tauri::command]
 fn cancel_export_batch(state: State<'_, AppState>) {
     state.export_generation.fetch_add(1, Ordering::AcqRel);
@@ -6147,6 +6373,7 @@ pub fn run() {
             renderer_caches: Arc::new(Mutex::new(RendererCaches::default())),
             mask_install_cancel: AtomicBool::new(false),
             export_generation: Arc::new(AtomicU64::new(0)),
+            batch_generation: Arc::new(AtomicU64::new(0)),
             folder_watcher: Mutex::new(None),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -6220,6 +6447,8 @@ pub fn run() {
             restore_from_trash,
             empty_trash,
             undo_last_action,
+            redo_last_action,
+            batch_update_metadata,
             update_tags,
             update_location,
             update_locations,
@@ -6246,6 +6475,11 @@ pub fn run() {
             export_develop_preset,
             import_develop_preset,
             propose_develop_auto,
+            sync_develop_settings,
+            apply_preset_to_selection,
+            preview_batch_auto,
+            apply_batch_auto,
+            cancel_library_batch,
             import_replacement,
             start_export_batch,
             cancel_export_batch,
@@ -7224,6 +7458,7 @@ mod tests {
             tagged: None,
             located: None,
             trashed: Some(true),
+            rating: None, edited: None, file_type: None, sort: None, descending: None,
         };
         let normal = AssetFilter {
             decision: "all".into(),
@@ -7236,6 +7471,7 @@ mod tests {
             tagged: None,
             located: None,
             trashed: Some(false),
+            rating: None, edited: None, file_type: None, sort: None, descending: None,
         };
         let (trash_where, _) = asset_where(&trashed);
         let (normal_where, _) = asset_where(&normal);
@@ -7246,7 +7482,7 @@ mod tests {
     }
 
     fn map_filter() -> AssetFilter {
-        AssetFilter { decision: "all".into(), search: String::new(), year: None, tag: None, date_from: None, date_to: None, camera: None, tagged: None, located: None, trashed: Some(false), }
+        AssetFilter { decision: "all".into(), search: String::new(), year: None, tag: None, date_from: None, date_to: None, camera: None, tagged: None, located: None, trashed: Some(false), rating: None, edited: None, file_type: None, sort: None, descending: None, }
     }
 
     #[test]
@@ -7600,6 +7836,8 @@ mod tests {
         assert!(undo_last_action_in(&mut connection).unwrap());
         assert!(asset_tags(&connection, "asset").unwrap().is_empty());
         assert!(!undo_last_action_in(&mut connection).unwrap());
+        set_decision_in(&mut connection, "asset", "keep").unwrap();
+        assert!(!redo_last_action_in(&mut connection).unwrap(), "a new catalogue branch must invalidate redo history");
 
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
@@ -7657,6 +7895,7 @@ mod tests {
             tagged: None,
             located: None,
             trashed: None,
+            rating: None, edited: None, file_type: None, sort: None, descending: None,
         };
         let first = query_assets_in(&connection, &keep, 0, 1).unwrap();
         assert_eq!(first.total, 2);
@@ -7677,6 +7916,7 @@ mod tests {
             tagged: None,
             located: None,
             trashed: None,
+            rating: None, edited: None, file_type: None, sort: None, descending: None,
         };
         let result = query_assets_in(&connection, &tag_search, 0, 50).unwrap();
         assert_eq!(result.total, 1);
@@ -7893,5 +8133,39 @@ mod tests {
         assert_eq!(watch_kind(&EventKind::Remove(notify::event::RemoveKind::File)), Some("file_removed"));
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn insert_library_productivity_assets(connection:&mut Connection,count:usize){let tx=connection.transaction().unwrap();for index in 0..count{let id=format!("asset-{index:05}");tx.execute("INSERT INTO assets(id,filename,decision,rating,captured_at,thumbnail_path,created_at)VALUES(?1,?2,'undecided',0,?3,'thumb.jpg',?3)",params![id,format!("photo-{index:05}.jpg"),format!("2026-{:02}-{:02}T12:00:00Z",1+(index%9),1+(index%27))]).unwrap();tx.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES(?1,?2,?3,?4,'jpg',?5,1,0)",params![format!("representation-{index:05}"),id,format!("C:/benchmark/photo-{index:05}.jpg"),format!("sha-{index:05}"),format!("photo-{index:05}")]).unwrap();}tx.commit().unwrap();}
+
+    #[test]
+    fn batch_metadata_is_one_transaction_and_undo_redo_unit(){
+        let root=std::env::temp_dir().join(format!("keepframe-batch-metadata-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,3);
+        let result=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()],patch:json!({"rating":5,"decision":"keep","title":"Portfolio","addKeywords":["Client","Select"]})}).unwrap();assert_eq!((result.requested,result.changed),(3,3));
+        let audit:i64=connection.query_row("SELECT count(*) FROM audit_log WHERE action='batch_assets'",[],|row|row.get(0)).unwrap();let updated:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=5 AND decision='keep' AND title='Portfolio'",[],|row|row.get(0)).unwrap();assert_eq!((audit,updated),(1,3));assert!(undo_last_action_in(&mut connection).unwrap());let restored:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=0 AND decision='undecided' AND title IS NULL",[],|row|row.get(0)).unwrap();assert_eq!(restored,3);assert!(redo_last_action_in(&mut connection).unwrap());let redone:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=5 AND decision='keep'",[],|row|row.get(0)).unwrap();assert_eq!(redone,3);assert!(batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into(),"missing".into()],patch:json!({"rating":1})}).is_err());let rolled_back:i64=connection.query_row("SELECT rating FROM assets WHERE id='asset-00000'",[],|row|row.get(0)).unwrap();assert_eq!(rolled_back,5);let removed=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into()],patch:json!({"removeKeywords":["client"]})}).unwrap();assert_eq!(removed.changed,1);assert_eq!(asset_tags(&connection,"asset-00000").unwrap(),vec!["Select"]);drop(connection);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_semantic_mask_sync_uses_fresh_ids_and_restores_target_recipe(){
+        let root=std::env::temp_dir().join(format!("keepframe-sync-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,2);
+        let mut source=DevelopRecipe::neutral();source.settings.exposure=1.0;source.settings.crop_left=0.2;source.settings.crop_width=0.7;source.masks.push(linear_mask("manual-source",0.2));source.masks.push(semantic_mask("semantic-source",0.4));let mut target=DevelopRecipe::neutral();target.settings.exposure = -1.0;target.masks.push(linear_mask("target-mask",-0.2));
+        {let tx=connection.transaction().unwrap();write_develop_recipe(&tx,"asset-00000",&source).unwrap();write_develop_recipe(&tx,"asset-00001",&target).unwrap();tx.commit().unwrap();}
+        let global=sync_develop_settings_in(&mut connection,SyncDevelopRequest{source_id:"asset-00000".into(),target_ids:vec!["asset-00001".into()],categories:vec!["tone".into()]}).unwrap();assert_eq!(global.changed,1);let global_synced=develop_recipe_in(&connection,"asset-00001").unwrap();assert_eq!(global_synced.settings.exposure,1.0);assert_eq!(global_synced.settings.crop_left,0.0);assert_eq!(global_synced.masks,target.masks);assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap(),target);
+        let result=sync_develop_settings_in(&mut connection,SyncDevelopRequest{source_id:"asset-00000".into(),target_ids:vec!["asset-00001".into()],categories:vec!["transform".into(),"manualMasks".into(),"intelligentMasks".into()]}).unwrap();assert_eq!(result.changed,1);let synced=develop_recipe_in(&connection,"asset-00001").unwrap();assert_eq!(synced.settings.crop_left,0.2);assert_eq!(synced.settings.crop_width,0.7);assert_eq!(synced.masks.len(),2);assert!(synced.masks.iter().all(|mask|mask.id!="manual-source"&&mask.id!="semantic-source"&&mask.id!="target-mask"));assert!(synced.masks.iter().any(|mask|matches!(mask.geometry,MaskGeometry::Semantic{..})));assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap(),target);assert!(redo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap().settings.crop_left,0.2);drop(connection);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preset_batch_preserves_masks_and_excluded_categories_for_mixed_edits(){
+        let root=std::env::temp_dir().join(format!("keepframe-preset-batch-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,3);let mut edited=DevelopRecipe::neutral();edited.settings.texture=17.0;edited.masks.push(linear_mask("preserved",0.3));{let tx=connection.transaction().unwrap();write_develop_recipe(&tx,"asset-00001",&edited).unwrap();tx.commit().unwrap();}let preset=built_in_presets().into_iter().find(|item|item.id=="warm").unwrap();let result=apply_preset_batch_in(&mut connection,vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()],&preset).unwrap();assert_eq!(result.changed,3);let first=develop_recipe_in(&connection,"asset-00000").unwrap();let mixed=develop_recipe_in(&connection,"asset-00001").unwrap();assert_eq!(first.settings.light_balance,14.0);assert_eq!(mixed.settings.texture,17.0);assert_eq!(mixed.masks,edited.masks);assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap(),edited);drop(connection);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_auto_is_independent_failure_tolerant_cancellable_and_one_undo_unit(){
+        let root=std::env::temp_dir().join(format!("keepframe-batch-auto-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,3);let dark=root.join("dark.png");let saturated=root.join("saturated.png");image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96,64,image::Rgb([25,25,25]))).save(&dark).unwrap();image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96,64,image::Rgb([210,20,20]))).save(&saturated).unwrap();connection.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1",params!["asset-00000",dark.to_string_lossy()]).unwrap();connection.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1",params!["asset-00001",saturated.to_string_lossy()]).unwrap();connection.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1",params!["asset-00002",root.join("missing.png").to_string_lossy()]).unwrap();let requested=vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()];let counter=AtomicU64::new(7);let(ids,recipes,failed,low)=analyse_auto_batch(&root,&requested,7,&counter,None).unwrap();assert_eq!((ids.len(),recipes.len(),failed),(2,2,1));assert!(low>=1);assert_ne!(recipes[0].settings,recipes[1].settings);let applied=apply_batch_recipes(&mut connection,ids,recipes).unwrap();assert_eq!(applied.changed,2);assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00000").unwrap(),DevelopRecipe::neutral());counter.store(8,Ordering::Release);let(stale_ids,_,stale_failed,_)=analyse_auto_batch(&root,&requested,7,&counter,None).unwrap();assert!(stale_ids.is_empty());assert_eq!(stale_failed,0);drop(connection);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore="manual Milestone 12 Library benchmark; run scripts/benchmark-library.ps1"]
+    fn library_productivity_performance_checkpoint(){
+        let root=std::env::temp_dir().join(format!("keepframe-library-benchmark-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();let started=Instant::now();insert_library_productivity_assets(&mut connection,10_000);let insert_ms=started.elapsed().as_millis();let base_filter=AssetFilter{decision:"all".into(),search:String::new(),year:None,tag:None,date_from:None,date_to:None,camera:None,tagged:None,located:None,trashed:None,rating:Some(0),edited:None,file_type:Some("jpg".into()),sort:Some("filename".into()),descending:Some(false)};let started=Instant::now();let page=query_assets_in(&connection,&base_filter,0,240).unwrap();let filter_ms=started.elapsed().as_millis();let mut rating_sort=base_filter.clone();rating_sort.rating=None;rating_sort.sort=Some("rating".into());rating_sort.descending=Some(true);let started=Instant::now();let sorted=query_assets_in(&connection,&rating_sort,0,240).unwrap();let sort_ms=started.elapsed().as_millis();let ids:Vec<String>=(0..1_000).map(|index|format!("asset-{index:05}")).collect();let started=Instant::now();let rated=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:ids.clone(),patch:json!({"rating":4})}).unwrap();let rating_ms=started.elapsed().as_millis();let started=Instant::now();let keyworded=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:ids,patch:json!({"addKeywords":["Benchmark"]})}).unwrap();let keyword_ms=started.elapsed().as_millis();let mut source=DevelopRecipe::neutral();source.settings.exposure=0.75;{let tx=connection.transaction().unwrap();write_develop_recipe(&tx,"asset-00000",&source).unwrap();tx.commit().unwrap();}let sync_targets=(1..=100).map(|index|format!("asset-{index:05}")).collect();let started=Instant::now();let synced=sync_develop_settings_in(&mut connection,SyncDevelopRequest{source_id:"asset-00000".into(),target_ids:sync_targets,categories:vec!["tone".into()]}).unwrap();let sync_ms=started.elapsed().as_millis();println!("M12_LIBRARY_BENCHMARK records=10000 insert_ms={insert_ms} filter_10000_ms={filter_ms} sort_10000_ms={sort_ms} page={} batch_rating_1000_ms={rating_ms} batch_keyword_1000_ms={keyword_ms} sync_100_ms={sync_ms}",page.items.len());assert_eq!(page.total,10_000);assert_eq!(sorted.total,10_000);assert_eq!(rated.changed,1_000);assert_eq!(keyworded.changed,1_000);assert_eq!(synced.changed,100);drop(connection);fs::remove_dir_all(root).unwrap();
     }
 }

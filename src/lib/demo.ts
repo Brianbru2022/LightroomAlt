@@ -26,6 +26,7 @@ export const demoAssets: Asset[] = scenes.map((previewUrl, index) => ({
   previewUrl,
   thumbnailUrl: previewUrl,
   decision: (["keep", "undecided", "keep", "discard", "undecided", "keep"] as Decision[])[index],
+  rating: [4, 0, 5, 1, 0, 3][index],
   capturedAt: ["2025-04-18T14:21:00Z", "2024-09-07T19:12:00Z", "2024-06-22T11:05:00Z", "2024-01-14T10:42:00Z", "2023-08-03T20:03:00Z", "1968-07-01T12:00:00Z"][index],
   dateFallback: index === 5,
   camera: ["Nikon Z8", "Canon EOS R5", "Panasonic S5 II", "Sony α7R V", "iPhone 15 Pro", "Epson V850 scan"][index],

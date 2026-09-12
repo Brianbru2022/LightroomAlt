@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchJob, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchAutoSummary, type BatchJob, type BatchSummary, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryMetadataPatch, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type SyncCategory, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -22,8 +22,24 @@ const browserTrash = new Set<string>();
 type BrowserHistory =
   | { kind: "decision"; id: string; decision: Decision }
   | { kind: "tags"; id: string; tags: string[] }
-  | { kind: "location"; id: string; latitude?: number; longitude?: number };
+  | { kind: "location"; id: string; latitude?: number; longitude?: number }
+  | { kind: "batch"; assets: Asset[]; recipes: Array<[string, DevelopRecipe | null]> };
 const history: BrowserHistory[] = [];
+const redoHistory: BrowserHistory[] = [];
+
+const applyBrowserHistory = (entry: BrowserHistory): BrowserHistory | null => {
+  if (entry.kind === "batch") {
+    const ids = entry.assets.map(asset => asset.id);
+    const inverse: BrowserHistory = { kind: "batch", assets: structuredClone(browserAssets.filter(asset => ids.includes(asset.id))), recipes: entry.recipes.map(([id]) => [id, structuredClone(browserDevelopRecipes.get(id) ?? null)]) };
+    for (const snapshot of entry.assets) { const index = browserAssets.findIndex(asset => asset.id === snapshot.id); if (index >= 0) browserAssets[index] = structuredClone(snapshot); }
+    for (const [id, recipe] of entry.recipes) { if (recipe) browserDevelopRecipes.set(id, structuredClone(recipe)); else browserDevelopRecipes.delete(id); }
+    return inverse;
+  }
+  const asset = browserAssets.find(item => item.id === entry.id); if (!asset) return null;
+  if (entry.kind === "decision") { const inverse: BrowserHistory = { kind: "decision", id: entry.id, decision: asset.decision }; asset.decision = entry.decision; return inverse; }
+  if (entry.kind === "tags") { const inverse: BrowserHistory = { kind: "tags", id: entry.id, tags: [...asset.tags] }; asset.tags = [...entry.tags]; return inverse; }
+  const inverse: BrowserHistory = { kind: "location", id: entry.id, latitude: asset.latitude, longitude: asset.longitude }; asset.latitude = entry.latitude; asset.longitude = entry.longitude; return inverse;
+};
 
 const withAssetUrls = (asset: Asset): Asset => {
   const normalised = { ...asset, latitude: asset.latitude ?? undefined, longitude: asset.longitude ?? undefined, locationSource: asset.locationSource ?? (asset.latitude != null && asset.longitude != null ? "embedded" : "none"), missingState: asset.missingState ?? "available" };
@@ -51,8 +67,26 @@ const withVersionUrl = (version: AssetVersion): AssetVersion => tauri()
   ? { ...version, imageUrl: convertFileSrc(version.imageUrl) }
   : version;
 
+const snapshotBrowserBatch = (ids: string[]): BrowserHistory => ({ kind: "batch", assets: structuredClone(browserAssets.filter(asset => ids.includes(asset.id))), recipes: ids.map(id => [id, structuredClone(browserDevelopRecipes.get(id) ?? null)]) });
+const applyRecipeCategories = (target: DevelopRecipe, source: DevelopRecipe, categories: readonly SyncCategory[]): DevelopRecipe => {
+  const next = structuredClone(target); const include = new Set(categories);
+  const copy = (keys: Array<keyof BasicAdjustments>) => keys.forEach(key => { (next.settings as unknown as Record<string, unknown>)[key] = source.settings[key]; });
+  if (include.has("whiteBalance")) copy(["lightBalance", "tint"]);
+  if (include.has("tone")) copy(["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "dynamicRange", "curveHighlights", "curveLights", "curveDarks", "curveShadows"]);
+  if (include.has("presence")) copy(["texture", "clarity", "dehaze"]);
+  if (include.has("colour")) copy(["colourBoost", "saturation"]);
+  if (include.has("transform")) copy(["cropLeft", "cropTop", "cropWidth", "cropHeight", "rotateQuadrants", "straighten", "horizontalFlip", "verticalFlip"]);
+  if (include.has("manualMasks") || include.has("intelligentMasks")) {
+    const semantic = (mask: DevelopRecipe["masks"][number]) => mask.geometry.kind === "semantic";
+    next.masks = next.masks.filter(mask => semantic(mask) ? !include.has("intelligentMasks") : !include.has("manualMasks"));
+    next.masks.push(...source.masks.filter(mask => semantic(mask) ? include.has("intelligentMasks") : include.has("manualMasks")).map(mask => ({ ...structuredClone(mask), id: crypto.randomUUID() })));
+  }
+  return next;
+};
+
 export const api = {
   isNative: tauri,
+  resetBrowserSession():void { if(tauri())return;browserAssets=structuredClone(demoAssets);browserDevelopRecipes.clear();browserDevelopPresets=[];browserExportPresets=[];browserJobs=structuredClone(demoJobs);browserTrash.clear();history.length=0;redoHistory.length=0; },
   async status(): Promise<LibraryStatus> {
     return tauri() ? invoke("get_library_status") : demoStatus(browserAssets);
   },
@@ -171,8 +205,13 @@ export const api = {
       if (filter.decision !== "all" && asset.decision !== filter.decision) return false;
       if (filter.year && new Date(asset.capturedAt).getFullYear() !== filter.year) return false;
       if (filter.tag && !asset.tags.includes(filter.tag)) return false;
+      if (filter.rating !== undefined && asset.rating < filter.rating) return false;
+      if (filter.edited !== undefined && Boolean(asset.hasEdits) !== filter.edited) return false;
+      if (filter.fileType && !asset.filename.toLowerCase().endsWith(`.${filter.fileType.toLowerCase().replace(/^\./, "")}`)) return false;
       return !query || `${asset.filename} ${asset.camera ?? ""} ${asset.tags.join(" ")}`.toLocaleLowerCase().includes(query);
     });
+    const direction = filter.descending === false ? 1 : -1;
+    matching.sort((left, right) => direction * (filter.sort === "filename" ? left.filename.localeCompare(right.filename) : filter.sort === "rating" ? left.rating - right.rating : left.capturedAt.localeCompare(right.capturedAt)) || left.id.localeCompare(right.id));
     const items = matching.slice(offset, offset + limit);
     return { items, total: matching.length, offset, limit, hasMore: offset + items.length < matching.length };
   },
@@ -199,18 +238,31 @@ export const api = {
   async setDecision(id: string, decision: Decision): Promise<void> {
     if (tauri()) return invoke("set_decision", { assetId: id, decision });
     const asset = browserAssets.find((item) => item.id === id);
-    if (asset && asset.decision !== decision) { history.push({ kind: "decision", id, decision: asset.decision }); asset.decision = decision; }
+    if (asset && asset.decision !== decision) { history.push({ kind: "decision", id, decision: asset.decision }); redoHistory.length = 0; asset.decision = decision; }
   },
   async undo(): Promise<boolean> {
     if (tauri()) return invoke("undo_last_action");
-    const prior = history.pop();
-    const asset = prior && browserAssets.find((item) => item.id === prior.id);
-    if (!asset || !prior) return false;
-    if (prior.kind === "decision") asset.decision = prior.decision;
-    if (prior.kind === "tags") asset.tags = prior.tags;
-    if (prior.kind === "location") { asset.latitude = prior.latitude; asset.longitude = prior.longitude; }
-    return true;
+    const prior = history.pop(); if (!prior) return false;
+    const inverse = applyBrowserHistory(prior); if (!inverse) return false; redoHistory.push(inverse); return true;
   },
+  async redo(): Promise<boolean> { if (tauri()) return invoke("redo_last_action"); const next=redoHistory.pop();if(!next)return false;const inverse=applyBrowserHistory(next);if(!inverse)return false;history.push(inverse);return true; },
+  async batchUpdateMetadata(assetIds: string[], patch: LibraryMetadataPatch): Promise<BatchSummary> {
+    if (tauri()) return invoke("batch_update_metadata", { request: { assetIds, patch } });
+    history.push(snapshotBrowserBatch(assetIds)); redoHistory.length=0; let changed=0;
+    for (const asset of browserAssets.filter(value=>assetIds.includes(value.id))) { const before=JSON.stringify(asset); if ("title" in patch) asset.title=patch.title??undefined;if("caption" in patch)asset.caption=patch.caption??undefined;if("copyright" in patch)asset.copyright=patch.copyright??undefined;if("creator" in patch)asset.creator=patch.creator??undefined;if(patch.rating!==undefined)asset.rating=patch.rating;if(patch.decision)asset.decision=patch.decision;if(patch.replaceKeywords)asset.tags=[...new Set(patch.replaceKeywords)];if(patch.addKeywords)asset.tags=[...new Set([...asset.tags,...patch.addKeywords])];if(patch.removeKeywords){const remove=new Set(patch.removeKeywords.map(value=>value.toLowerCase()));asset.tags=asset.tags.filter(value=>!remove.has(value.toLowerCase()));}if(JSON.stringify(asset)!==before)changed+=1; }
+    return { requested: assetIds.length, changed, failed: 0, cancelled: 0 };
+  },
+  async syncDevelopSettings(sourceId: string, targetIds: string[], categories: SyncCategory[]): Promise<BatchSummary> {
+    if (tauri()) return invoke("sync_develop_settings", { request: { sourceId, targetIds, categories } });
+    const ids=[...new Set(targetIds.filter(id=>id!==sourceId))];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;const source=await this.getDevelopRecipe(sourceId);for(const id of ids){const recipe=applyRecipeCategories(await this.getDevelopRecipe(id),source,categories);browserDevelopRecipes.set(id,recipe);const asset=browserAssets.find(value=>value.id===id);if(asset)asset.hasEdits=true;}return {requested:ids.length,changed:ids.length,failed:0,cancelled:0};
+  },
+  async applyPresetToSelection(assetIds:string[],presetId:string):Promise<BatchSummary>{
+    if(tauri())return invoke("apply_preset_to_selection",{request:{assetIds,presetId}});const preset=[...browserBuiltInDevelopPresets,...browserDevelopPresets].find(value=>value.id===presetId);if(!preset)throw new Error("That preset no longer exists.");const ids=[...new Set(assetIds)];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;const source:DevelopRecipe={schemaVersion:2,settings:preset.settings,masks:[]};for(const id of ids){const recipe=applyRecipeCategories(await this.getDevelopRecipe(id),source,preset.categories as SyncCategory[]);browserDevelopRecipes.set(id,recipe);const asset=browserAssets.find(value=>value.id===id);if(asset)asset.hasEdits=true;}return{requested:ids.length,changed:ids.length,failed:0,cancelled:0};
+  },
+  async previewBatchAuto(assetIds:string[]):Promise<BatchAutoSummary>{if(tauri())return invoke("preview_batch_auto",{assetIds});return{requested:assetIds.length,changed:0,failed:0,cancelled:0,analyzable:assetIds.length,lowConfidenceWhiteBalance:0,skipped:0};},
+  async applyBatchAuto(assetIds:string[]):Promise<BatchAutoSummary>{if(tauri())return invoke("apply_batch_auto",{assetIds});const ids=[...new Set(assetIds)];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;for(const id of ids){const asset=browserAssets.find(value=>value.id===id);if(!asset)continue;const recipe=await this.getDevelopRecipe(id);const seed=[...asset.filename].reduce((sum,value)=>sum+value.charCodeAt(0),0);recipe.settings={...recipe.settings,exposure:((seed%9)-4)/20,contrast:6+(seed%7),highlights:-18-(seed%13),shadows:12+(seed%11),clarity:3+(seed%5),colourBoost:5+(seed%8)};browserDevelopRecipes.set(id,recipe);asset.hasEdits=true;}return{requested:ids.length,changed:ids.length,failed:0,cancelled:0,analyzable:ids.length,lowConfidenceWhiteBalance:0,skipped:0};},
+  async cancelLibraryBatch():Promise<void>{if(tauri())return invoke("cancel_library_batch");},
+  async onBatchProgress(callback:(progress:{kind:string;current:number;total:number;failed:number})=>void):Promise<()=>void>{if(!tauri())return()=>{};return listen("batch-progress",event=>callback(event.payload as {kind:string;current:number;total:number;failed:number}));},
   async moveToTrash(assetIds: string[]): Promise<TrashSummary> {
     if (tauri()) return invoke("move_to_trash", { assetIds });
     let affected = 0;

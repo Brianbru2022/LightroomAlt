@@ -46,6 +46,11 @@ export type Asset = {
   previewUrl: string;
   thumbnailUrl: string;
   decision: Decision;
+  rating: number;
+  title?: string;
+  caption?: string;
+  copyright?: string;
+  creator?: string;
   capturedAt: string;
   dateFallback: boolean;
   camera?: string;
@@ -118,7 +123,27 @@ export type AssetFilter = {
   tagged?: boolean;
   located?: boolean;
   trashed?: boolean;
+  rating?: number;
+  edited?: boolean;
+  fileType?: string;
+  sort?: "captureTime" | "importTime" | "filename" | "rating" | "editedTime";
+  descending?: boolean;
 };
+
+export type LibraryMetadataPatch = {
+  title?: string | null;
+  caption?: string | null;
+  copyright?: string | null;
+  creator?: string | null;
+  rating?: number;
+  decision?: Decision;
+  addKeywords?: string[];
+  removeKeywords?: string[];
+  replaceKeywords?: string[];
+};
+export type SyncCategory = "tone" | "whiteBalance" | "presence" | "colour" | "transform" | "manualMasks" | "intelligentMasks";
+export type BatchSummary = { requested: number; changed: number; failed: number; cancelled: number };
+export type BatchAutoSummary = BatchSummary & { analyzable: number; lowConfidenceWhiteBalance: number; skipped: number };
 
 export type AssetPage = {
   items: Asset[];

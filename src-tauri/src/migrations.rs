@@ -245,6 +245,30 @@ pub(crate) fn apply_v10(connection: &mut Connection, _existed: bool, version: i6
     tx.commit()
 }
 
+/// Version 11 adds catalogue-owned descriptive metadata and ratings. These
+/// fields never rewrite originals. The compound indexes cover the measured
+/// Library flag/rating sorts without multiplying indexes for every filter.
+pub(crate) fn apply_v11(connection: &mut Connection, existed: bool, version: i64) -> rusqlite::Result<()> {
+    if version >= 11 { return Ok(()); }
+    let additions = [
+        ("rating", "ALTER TABLE assets ADD COLUMN rating INTEGER NOT NULL DEFAULT 0 CHECK(rating BETWEEN 0 AND 5)"),
+        ("title", "ALTER TABLE assets ADD COLUMN title TEXT"),
+        ("caption", "ALTER TABLE assets ADD COLUMN caption TEXT"),
+        ("copyright", "ALTER TABLE assets ADD COLUMN copyright TEXT"),
+        ("creator", "ALTER TABLE assets ADD COLUMN creator TEXT"),
+    ];
+    let missing = if existed {
+        additions.iter().map(|(column, sql)| Ok((*sql, !column_exists(connection, "assets", column)?))).collect::<rusqlite::Result<Vec<_>>>()?
+    } else { Vec::new() };
+    let tx = connection.transaction()?;
+    for (sql, should_add) in missing { if should_add { tx.execute(sql, [])?; } }
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_assets_rating_captured ON assets(rating,captured_at DESC)", [])?;
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_assets_decision_rating ON assets(decision,rating DESC,captured_at DESC)", [])?;
+    tx.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(11,?1)", [Utc::now().to_rfc3339()])?;
+    tx.pragma_update(None, "user_version", 11)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +328,17 @@ mod tests {
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         let records: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='export_presets'", [], |row| row.get(0)).unwrap();
         assert_eq!((version, records), (10, 1));
+    }
+
+
+    #[test]
+    fn v11_migration_adds_library_metadata_idempotently() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE assets(id TEXT PRIMARY KEY,captured_at TEXT NOT NULL,decision TEXT NOT NULL DEFAULT 'undecided');").unwrap();
+        apply_v11(&mut connection, true, 10).unwrap(); apply_v11(&mut connection, true, 11).unwrap();
+        assert!(column_exists(&connection, "assets", "rating").unwrap());
+        assert!(column_exists(&connection, "assets", "caption").unwrap());
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 11);
     }
 }

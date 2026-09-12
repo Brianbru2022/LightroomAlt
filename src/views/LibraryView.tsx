@@ -1,5 +1,5 @@
 import { CalendarDays, ChevronRight, ImageOff, LoaderCircle } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { Asset } from "../types";
 import { AssetCard } from "../components/AssetCard";
 
@@ -10,7 +10,10 @@ type Props = {
   hasMore: boolean;
   onLoadMore: () => void;
   selected: Asset | null;
-  onSelect: (asset: Asset) => void;
+  selectedIds?: ReadonlySet<string>;
+  activeId?: string | null;
+  onSelect: (asset: Asset, event?: Pick<MouseEvent, "ctrlKey" | "metaKey" | "shiftKey">) => void;
+  onClearSelection?: () => void;
   onOpen: (asset: Asset) => void;
   mode?: "library" | "trash";
   onRestoreAll?: () => void;
@@ -21,7 +24,7 @@ type VirtualRow =
   | { key: string; kind: "year"; year: string; count: number; top: number; height: number }
   | { key: string; kind: "photos"; assets: Asset[]; columns: number; top: number; height: number };
 
-export function LibraryView({ assets, total, loading, hasMore, onLoadMore, selected, onSelect, onOpen, mode = "library", onRestoreAll, onEmptyTrash }: Props) {
+export function LibraryView({ assets, total, loading, hasMore, onLoadMore, selected, selectedIds, activeId, onSelect, onClearSelection, onOpen, mode = "library", onRestoreAll, onEmptyTrash }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({ width: 1000, height: 600, top: 0 });
   useEffect(() => {
@@ -85,13 +88,13 @@ export function LibraryView({ assets, total, loading, hasMore, onLoadMore, selec
       {assets.length === 0 && !loading ? (
         <div className="empty-state"><ImageOff size={40} /><h2>{mode === "trash" ? "Trash is empty" : "No photographs match"}</h2><p>{mode === "trash" ? "Discarded photographs moved here can be restored before Empty Trash is used." : "Clear a filter or import a folder to begin."}</p></div>
       ) : (
-        <div ref={scrollRef} className="library-scroll" onScroll={onScroll}>
-          <div className="virtual-library" style={{ height }}>
+        <div ref={scrollRef} className="library-scroll" onScroll={onScroll} onClick={event=>{if(event.target===event.currentTarget)onClearSelection?.();}}>
+          <div className="virtual-library" role="listbox" aria-label="Photographs" aria-multiselectable="true" style={{ height }} onClick={event=>{if(event.target===event.currentTarget)onClearSelection?.();}}>
             {visibleRows.map((row) => row.kind === "year" ? (
               <div key={row.key} className="virtual-library-row year-heading" style={{ top: row.top, height: row.height }}><CalendarDays size={16} /><h2>{row.year}</h2><span>{row.count} loaded</span><ChevronRight size={15} /></div>
             ) : (
               <div key={row.key} className="virtual-library-row photo-grid" style={{ top: row.top, height: row.height, gridTemplateColumns: `repeat(${row.columns}, minmax(0, 1fr))` }}>
-                {row.assets.map((asset) => <AssetCard key={asset.id} asset={asset} selected={selected?.id === asset.id} onSelect={onSelect} onOpen={onOpen} />)}
+                {row.assets.map((asset) => <AssetCard key={asset.id} asset={asset} selected={selectedIds?.has(asset.id) ?? selected?.id === asset.id} active={(activeId ?? selected?.id) === asset.id} onSelect={onSelect} onOpen={onOpen} />)}
               </div>
             ))}
           </div>

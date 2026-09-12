@@ -5,9 +5,11 @@ import { ImportDialog } from "./components/ImportDialog";
 import { TagDialog } from "./components/TagDialog";
 import { Topbar } from "./components/Topbar";
 import { api } from "./lib/bridge";
+import { clearSelection, emptySelection, navigateSelection, selectAll, selectId, visibleSelectionCount, type SelectionState } from "./lib/selection";
 import { decisionLabel } from "./lib/format";
-import type { Asset, AssetFilter, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryStatus, MapAsset, MapBounds, ServiceHealth, ViewName } from "./types";
+import type { Asset, AssetFilter, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryMetadataPatch, LibraryStatus, MapAsset, MapBounds, ServiceHealth, SyncCategory, ViewName } from "./types";
 import { LibraryView } from "./views/LibraryView";
+import { LibraryProductivityView, type LibraryLayout } from "./views/LibraryProductivityView";
 import { MapView } from "./views/MapView";
 import { TriageView } from "./views/TriageView";
 import { DevelopView } from "./views/DevelopView";
@@ -18,7 +20,7 @@ import { SettingsView } from "./views/SettingsView";
 const PAGE_SIZE = 240;
 const emptyStatus: LibraryStatus = { configured: false, counts: { total: 0, keep: 0, undecided: 0, discard: 0 } };
 const emptyHealth: ServiceHealth = { localAiAvailable: false, serviceReachable: false, localAiBusy: false, localAiDetail: "No local image service is responding.", localAiState: "service_not_running", localAiUrl: "http://127.0.0.1:7868", analysisModelInstalled: false, analysisAvailable: false, analysisDetail: "The image-analysis worker is unavailable. Recipes will use the controls-only fallback." };
-type OperationProgress = { kind: "Import" | "Trash" | "Cache"; current: number; total: number; importId?: string; file?: string; error?: string };
+type OperationProgress = { kind: "Import" | "Trash" | "Cache" | "Batch Auto"; current: number; total: number; importId?: string; file?: string; error?: string };
 
 export function App() {
   const [status, setStatus] = useState<LibraryStatus>(emptyStatus);
@@ -32,11 +34,15 @@ export function App() {
   const [spatialBounds, setSpatialBounds] = useState<MapBounds | undefined>();
   const [jobs, setJobs] = useState<BatchJob[]>([]);
   const [view, setView] = useState<ViewName>("library");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selection, setSelection] = useState<SelectionState>(emptySelection);
+  const [resultIds, setResultIds] = useState<string[]>([]);
+  const [libraryLayout, setLibraryLayout] = useState<LibraryLayout>("grid");
+  const [autoAdvance, setAutoAdvanceState] = useState(()=>localStorage.getItem("keepframe.autoAdvance")==="true");
   const [filter, setFilter] = useState<AssetFilter>({ decision: "all", search: "" });
   const [busy, setBusy] = useState(true);
   const [tagAsset, setTagAsset] = useState<Asset | null>(null);
   const [exportAsset, setExportAsset] = useState<Asset | null>(null);
+  const [exportSelection, setExportSelection] = useState<string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [importPaths, setImportPaths] = useState<string[]>([]);
   const [operationProgress, setOperationProgress] = useState<OperationProgress | null>(null);
@@ -44,19 +50,24 @@ export function App() {
   const deferredSearch = useDeferredValue(filter.search);
   const effectiveFilter = useMemo<AssetFilter>(() => ({ ...filter, search: deferredSearch, trashed: view === "trash" }), [deferredSearch, filter, view]);
   const knownTags = useMemo(() => [...new Set(assets.flatMap((asset) => asset.tags))].sort((left, right) => left.localeCompare(right)), [assets]);
-  const selected = useMemo(() => assets.find((asset) => asset.id === selectedId) ?? assets[0] ?? null, [assets, selectedId]);
+  const selectedId=selection.activeId;
+  const selected = useMemo(() => assets.find((asset) => asset.id === selectedId) ?? null, [assets, selectedId]);
   const selectedAssetId = selected?.id;
+  const visibleSelectedCount = useMemo(() => visibleSelectionCount(selection.selectedIds, resultIds), [resultIds, selection.selectedIds]);
+  const setSingleSelection=(id:string|null)=>setSelection(id?{activeId:id,anchorId:id,selectedIds:new Set([id])}:clearSelection());
+  const setAutoAdvance=(value:boolean)=>{setAutoAdvanceState(value);localStorage.setItem("keepframe.autoAdvance",String(value));};
 
   const loadFirstPage = useCallback(async () => {
     const request = ++requestId.current;
     setLoadingAssets(true);
     try {
-      const page = await api.assets(effectiveFilter, 0, PAGE_SIZE);
+      const [page,ids] = await Promise.all([api.assets(effectiveFilter, 0, PAGE_SIZE),api.assetIds(effectiveFilter)]);
       if (request !== requestId.current) return;
       setAssets(page.items);
       setVisibleTotal(page.total);
       setHasMoreAssets(page.hasMore);
-      setSelectedId((current) => current && page.items.some((asset) => asset.id === current) ? current : page.items[0]?.id ?? null);
+      setResultIds(ids);
+      setSelection(current => current.activeId ? current : (page.items[0] ? selectId(current,page.items[0].id,ids) : current));
     } catch (error) {
       if (request === requestId.current) setNotice(`Could not load photographs: ${String(error)}`);
     } finally {
@@ -106,9 +117,19 @@ export function App() {
       setNotice(`Undo failed: ${String(error)}`);
     }
   }, [refreshCatalogue]);
+  const redoCatalogue = useCallback(async () => {
+    try { const changed=await api.redo();setNotice(changed?"Latest catalogue change redone.":"Nothing to redo.");await refreshCatalogue(); }
+    catch(error){setNotice(`Redo failed: ${String(error)}`);}
+  },[refreshCatalogue]);
+  const applySelectionMetadata = useCallback(async (patch:LibraryMetadataPatch) => {
+    const ids=[...selection.selectedIds];if(!ids.length&&selection.activeId)ids.push(selection.activeId);if(!ids.length)return {requested:0,changed:0,failed:0,cancelled:0};
+    const summary=await api.batchUpdateMetadata(ids,patch);setNotice(`${summary.changed} of ${summary.requested} photographs updated as one undoable action.`);await refreshCatalogue();return summary;
+  },[refreshCatalogue,selection]);
+  const reviewOne=useCallback(async(id:string,patch:LibraryMetadataPatch)=>{await api.batchUpdateMetadata([id],patch);await refreshCatalogue();},[refreshCatalogue]);
 
   useEffect(() => {
     let active = true;
+    api.resetBrowserSession();
     api.status()
       .then(async (currentStatus) => {
         if (!active) return;
@@ -134,6 +155,7 @@ export function App() {
         listen<Record<string, unknown>>("import-progress", ({ payload }) => active && setOperationProgress({ kind: "Import", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), importId: String(payload.importId ?? ""), file: String(payload.file ?? ""), error: payload.error ? String(payload.error) : undefined })),
         listen<Record<string, unknown>>("trash-progress", ({ payload }) => active && setOperationProgress({ kind: "Trash", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), error: payload.error ? String(payload.error) : undefined })),
         listen<Record<string, unknown>>("cache-progress", ({ payload }) => active && setOperationProgress({ kind: "Cache", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), error: payload.error ? String(payload.error) : undefined })),
+        listen<Record<string, unknown>>("batch-progress", ({ payload }) => active && setOperationProgress({ kind: "Batch Auto", current: Number(payload.current ?? 0), total: Number(payload.total ?? 0), error: Number(payload.failed??0)>0?`${payload.failed} failed so far`:undefined })),
       ]);
       if (active) unlisteners.push(...registrations); else registrations.forEach((unlisten) => unlisten());
     });
@@ -155,26 +177,25 @@ export function App() {
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
+      const target = event.target;
+      const isEditing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable);
+      const isOtherControl = target instanceof HTMLElement && target.closest("button, [role='button']") && !target.closest(".asset-card");
       if (event.ctrlKey && key === "k") {
         event.preventDefault();
         document.querySelector<HTMLInputElement>(".search-field input")?.focus();
         return;
       }
-      if (event.ctrlKey && key === "z") {
+      if (!isEditing && event.ctrlKey && key === "z") {
         event.preventDefault();
-        void undoCatalogue();
+        void (event.shiftKey?redoCatalogue():undoCatalogue());
         return;
       }
-
-      const target = event.target;
-      const isEditing = target instanceof HTMLInputElement
-        || target instanceof HTMLTextAreaElement
-        || target instanceof HTMLSelectElement
-        || (target instanceof HTMLElement && target.isContentEditable);
-      const isOtherControl = target instanceof HTMLElement
-        && target.closest("button, [role='button']")
-        && !target.closest(".asset-card");
-      if (busy || isEditing || isOtherControl || event.ctrlKey || event.altKey || event.metaKey || view !== "library" || !selectedAssetId) return;
+      if (busy || isEditing || isOtherControl || event.altKey || event.metaKey || view !== "library") return;
+      if((event.ctrlKey&&event.shiftKey&&key==="a")||(!event.ctrlKey&&event.key==="Escape")){event.preventDefault();setSelection(clearSelection());return;}
+      if(event.ctrlKey&&key==="a"){event.preventDefault();setSelection(selectAll(resultIds,selection.activeId));return;}
+      if(event.ctrlKey)return;
+      if(key==="g"){setLibraryLayout("grid");return;}if(key==="c"){setLibraryLayout("compare");return;}if(key==="n"){setLibraryLayout("survey");return;}if(key===" "){event.preventDefault();setLibraryLayout("loupe");return;}if(key==="d"||event.key==="Enter"){if(selected){event.preventDefault();setView("develop");}return;}
+      if(!selectedAssetId)return;
 
       if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
         const cards = Array.from(document.querySelectorAll<HTMLElement>(".asset-card[data-asset-id]"));
@@ -205,19 +226,20 @@ export function App() {
         const nextId = next?.dataset.assetId;
         if (!next || !nextId) return;
         event.preventDefault();
-        setSelectedId(nextId);
+        setSingleSelection(nextId);
         next.focus({ preventScroll: true });
         next.scrollIntoView?.({ block: "nearest", inline: "nearest" });
         return;
       }
 
-      if (key === "x" || key === "m") {
+      if (/^[0-5]$/.test(key) || ["p","x","u","m"].includes(key)) {
         event.preventDefault();
-        void api.setDecision(selectedAssetId, key === "x" ? "discard" : "keep").then(refreshCatalogue);
+        const patch:LibraryMetadataPatch=/^[0-5]$/.test(key)?{rating:Number(key)}:{decision:key==="x"?"discard":key==="u"?"undecided":"keep"};
+        void applySelectionMetadata(patch).then(()=>{if(autoAdvance&&selection.selectedIds.size<=1)setSelection(current=>navigateSelection(current,resultIds,1));});
       }
     };
     window.addEventListener("keydown", shortcut); return () => window.removeEventListener("keydown", shortcut);
-  }, [busy, refreshCatalogue, selectedAssetId, undoCatalogue, view]);
+  }, [applySelectionMetadata, autoAdvance, busy, redoCatalogue, resultIds, selected, selectedAssetId, selection, undoCatalogue, view]);
 
   useEffect(() => {
     const index = assets.findIndex((asset) => asset.id === selectedAssetId);
@@ -229,7 +251,7 @@ export function App() {
     const current = assets[index];
     const next = assets[index + 1];
     const changed = current?.decision !== decision;
-    if (next) setSelectedId(next.id);
+    if (next) setSingleSelection(next.id);
     try {
       await api.setDecision(id, decision);
       setNotice(!changed
@@ -237,7 +259,7 @@ export function App() {
         : `${current?.filename ?? "Photograph"} marked ${decisionLabel[decision]}. Ctrl+Z to undo.`);
       await refreshCatalogue();
     } catch (error) {
-      setSelectedId(id);
+      setSingleSelection(id);
       setNotice(`Could not update decision: ${String(error)}`);
     }
   };
@@ -307,15 +329,21 @@ export function App() {
   };
   const selectMapAsset = async (id: string) => {
     const existing = assets.find((asset) => asset.id === id);
-    if (existing) { setSelectedId(id); return; }
+    if (existing) { setSingleSelection(id); return; }
     try {
       const asset = await api.asset(id);
       if (!asset) { setNotice("That map photograph is no longer in the catalogue."); return; }
       setAssets((current) => current.some((item) => item.id === id) ? current : [asset, ...current]);
-      setSelectedId(id);
+      setSingleSelection(id);
     } catch (error) { setNotice(`Could not select map photograph: ${String(error)}`); }
   };
-  const openAsset = (asset: Asset) => { setSelectedId(asset.id); setView("develop"); };
+  const openAsset = (asset: Asset) => { setSelection(current=>current.selectedIds.has(asset.id)?{...current,activeId:asset.id}:{activeId:asset.id,anchorId:asset.id,selectedIds:new Set([asset.id])}); setView("develop"); };
+  const selectLibraryAsset=(asset:Asset,event?:{ctrlKey:boolean;metaKey:boolean;shiftKey:boolean})=>setSelection(current=>selectId(current,asset.id,resultIds,{toggle:Boolean(event?.ctrlKey||event?.metaKey),range:Boolean(event?.shiftKey),additiveRange:Boolean(event?.shiftKey&&(event?.ctrlKey||event?.metaKey))}));
+  const removeSelectedId=(id:string)=>setSelection(current=>{const selectedIds=new Set(current.selectedIds);selectedIds.delete(id);const activeId=current.activeId===id?(assets.find(asset=>selectedIds.has(asset.id))?.id??null):current.activeId;return{activeId,anchorId:current.anchorId===id?activeId:current.anchorId,selectedIds};});
+  const syncSelection=async(sourceId:string,categories:SyncCategory[])=>{const summary=await api.syncDevelopSettings(sourceId,[...selection.selectedIds],categories);setNotice(`${summary.changed} destination photographs synchronised as one undoable action; mask IDs were regenerated.`);await refreshCatalogue();return summary;};
+  const applyPresetSelection=async(presetId:string)=>{const summary=await api.applyPresetToSelection([...selection.selectedIds],presetId);setNotice(`${summary.changed} photographs received the preset as one undoable action.`);await refreshCatalogue();return summary;};
+  const runBatchAuto=async()=>{const ids=[...selection.selectedIds];const preview=await api.previewBatchAuto(ids);if(!window.confirm(`Batch Auto analysed ${preview.analyzable} of ${preview.requested} photographs independently.\n\n${preview.lowConfidenceWhiteBalance} have low-confidence white balance; ${preview.skipped} would be skipped. Apply the proposals?`))return preview;setOperationProgress({kind:"Batch Auto",current:0,total:ids.length});try{const summary=await api.applyBatchAuto(ids);setNotice(`Batch Auto changed ${summary.changed}; ${summary.failed} failed; ${summary.cancelled} cancelled. The accepted batch is one undo item.`);await refreshCatalogue();return summary;}finally{setOperationProgress(null);}};
+  const exportSelected=()=>{if(!selected)return;setExportSelection([...selection.selectedIds]);setExportAsset(selected);};
   const enqueue = async (assetIds: string[], brief: string) => { const unique = [...new Set(assetIds)]; if (!unique.length) return; await api.enqueue(unique, brief); setJobs(await api.jobs()); setNotice(`${unique.length} ${unique.length === 1 ? "photograph is" : "photographs are"} being analysed for individual recipe review.`); };
   const runLocal = async (assetId: string, recipe: EditRecipe, prompt: string) => {
     try {
@@ -418,19 +446,19 @@ export function App() {
       <Sidebar view={view} status={{ ...status, ...health }} onView={(nextView) => { setView(nextView); if (nextView === "trash") setFilter((value) => ({ ...value, decision: "all" })); }} />
       <div className="workspace">
         <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => setFilter((value) => ({ ...value, search }))} onDecision={(decision) => setFilter((value) => ({ ...value, decision }))} tags={knownTags} selectedTag={filter.tag} onTag={(tag) => setFilter((value) => ({ ...value, tag }))} dateFrom={filter.dateFrom} dateTo={filter.dateTo} onDateRange={(dateFrom, dateTo) => setFilter((value) => ({ ...value, dateFrom, dateTo }))} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={moveAllDiscarded} />
-        {view === "library" ? <LibraryView assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={openAsset} /> : null}
-        {view === "develop" ? <DevelopView assets={assets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onExport={async (asset) => setExportAsset(asset)} onRecipeSaved={() => { void refreshCatalogue(); }} /> : null}
-        {view === "triage" ? <TriageView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onDecision={decide} onWorkshop={() => setView("workshop")} onMap={() => setView("map")} onTags={setTagAsset} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={api.applyBasicAdjustments} onAdjustmentSaved={() => setNotice("Adjustment saved as a candidate version; the protected original is unchanged.")} /> : null}
+        {view === "library" ? <LibraryProductivityView assets={assets} total={visibleTotal} visibleSelectedCount={visibleSelectedCount} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} filter={filter} onFilter={patch=>setFilter(value=>({...value,...patch}))} active={selected} activeId={selection.activeId} selectedIds={selection.selectedIds} layout={libraryLayout} onLayout={setLibraryLayout} onSelect={selectLibraryAsset} onSetActive={id=>setSelection(current=>current.selectedIds.has(id)?{...current,activeId:id}:selectId(current,id,resultIds))} onRemove={removeSelectedId} onClear={()=>setSelection(clearSelection())} onOpenDevelop={openAsset} onMetadata={applySelectionMetadata} onReviewAsset={reviewOne} onSync={syncSelection} onPreset={applyPresetSelection} onBatchAuto={runBatchAuto} onExport={exportSelected} autoAdvance={autoAdvance} onAutoAdvance={setAutoAdvance} /> : null}
+        {view === "develop" ? <DevelopView assets={assets} selected={selected} selectedIds={selection.selectedIds} onSelect={selectLibraryAsset} onOpenSync={()=>{setLibraryLayout("grid");setView("library");setNotice("Selection retained. Choose Sync settings to select categories and apply from the active photograph.");}} onExport={async (asset) => {setExportSelection([...selection.selectedIds]);setExportAsset(asset);}} onRecipeSaved={() => { void refreshCatalogue(); }} /> : null}
+        {view === "triage" ? <TriageView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSingleSelection(asset.id)} onDecision={decide} onWorkshop={() => setView("workshop")} onMap={() => setView("map")} onTags={setTagAsset} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={api.applyBasicAdjustments} onAdjustmentSaved={() => setNotice("Adjustment saved as a candidate version; the protected original is unchanged.")} /> : null}
         {view === "map" ? <MapView assets={assets} mapAssets={mapAssets} mapLoading={mapLoading} total={visibleTotal} selected={selected} onSelect={selectMapAsset} onLocations={saveLocations} onClearManualLocation={clearManualLocation} onOpenSelected={() => setView("triage")} onLocatedFilter={(located) => { setSpatialBounds(undefined); setFilter((value) => ({ ...value, located })); }} spatialBounds={spatialBounds} onUseVisibleBounds={setSpatialBounds} onClearSpatialBounds={() => setSpatialBounds(undefined)} /> : null}
         {view === "workshop" ? <WorkshopView asset={selected} assets={assets} jobs={jobs} serviceHealth={health} onAnalyse={(asset, intent: EditIntent, action, brief) => api.analyse(asset, intent, action, brief)} onPrompts={api.prompts} onCopy={api.copy} onPrepare={async (assetId, provider, prompt) => { const path = await api.prepareCloud(assetId, provider, prompt); setJobs(await api.jobs()); setNotice(`Prepared a local PNG and provider-specific instruction at ${path}. Upload it yourself, then import the returned image.`); }} onExportExternal={async (assetId, provider, prompt) => { const path = await api.exportExternal(assetId, provider, prompt); if (path) setNotice(`External AI image and prompt exported to ${path}`); }} onImportReturned={async (assetId, provider, prompt, recipe) => { const job = await api.importReturned(assetId, provider, prompt, recipe); if (job) { setJobs(await api.jobs()); setNotice("Returned edit validated and imported as a candidate version. The original is unchanged."); } }} onLoadVersions={api.versions} onSetPreferred={async (assetId, versionId) => { await api.setPreferredVersion(assetId, versionId); await refreshCatalogue(); setNotice("Preferred display version updated; catalogue metadata is unchanged."); }} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={async (asset, adjustments: BasicAdjustments) => { const version = await api.applyBasicAdjustments(asset, adjustments); setNotice("Adjustment saved as a candidate version; the protected original is unchanged."); return version; }} onEnqueue={enqueue} onRunLocal={runLocal} onJob={updateJob} onSaveJobReview={saveJobReview} onApproveJobs={approveJobs} /> : null}
-        {view === "trash" ? <LibraryView mode="trash" assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={(asset) => setSelectedId(asset.id)} onRestoreAll={restoreAllTrash} onEmptyTrash={emptyAllTrash} /> : null}
+        {view === "trash" ? <LibraryView mode="trash" assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSingleSelection(asset.id)} onOpen={(asset) => setSingleSelection(asset.id)} onRestoreAll={restoreAllTrash} onEmptyTrash={emptyAllTrash} /> : null}
         {view === "settings" ? <SettingsView status={status} health={health} busy={busy} selectedAssetName={selected?.filename} onExportSidecars={exportSidecars} onImportSidecar={importSidecar} onExportPortableCatalogue={exportPortableCatalogue} onRescanLibrary={rescanLibrary} onRelinkSelected={relinkSelected} onAddFolderWatch={addFolderWatch} onDisableFolderWatches={disableFolderWatches} onShowFolderWatchEvents={showFolderWatchEvents} onRefreshAi={async () => { setHealth(await api.serviceHealth(true)); }} onConfigureAi={async (url) => { await api.configureLocalAi(url); setHealth(await api.serviceHealth(true)); setNotice("Local AI service address saved. Keepframe permits loopback addresses only."); }} onIntegrity={async () => { setBusy(true); try { setNotice(`Catalogue integrity: ${await api.catalogueIntegrity()}.`); } catch (error) { setNotice(`Integrity check failed: ${String(error)}`); } finally { setBusy(false); } }} onBackup={async () => { setBusy(true); try { setNotice(`Verified backup created at ${await api.createBackup()}`); } catch (error) { setNotice(`Backup failed: ${String(error)}`); } finally { setBusy(false); } }} onRestore={async () => { if (!window.confirm("Restore a catalogue backup? Keepframe will first create a safety backup of the current catalogue.")) return; setBusy(true); try { if (await api.restoreBackup()) { await refreshCatalogue(); setNotice("Catalogue backup restored and verified."); } } catch (error) { setNotice(`Restore failed: ${String(error)}`); } finally { setBusy(false); } }} onRebuild={async () => { setBusy(true); try { const count = await api.rebuildThumbnails(); await refreshCatalogue(); setNotice(`${count} thumbnails rebuilt.`); } catch (error) { setNotice(`Thumbnail rebuild failed: ${String(error)}`); } finally { setBusy(false); } }} onDiagnostics={async () => { setBusy(true); try { const path = await api.exportDiagnostics(); if (path) setNotice(`Privacy-safe diagnostics exported to ${path}`); } catch (error) { setNotice(`Diagnostics export failed: ${String(error)}`); } finally { setBusy(false); } }} /> : null}
       </div>
       {tagAsset ? <TagDialog asset={tagAsset} onClose={() => setTagAsset(null)} onSave={saveTags} /> : null}
-      {exportAsset ? <ExportDialog assets={assets} selected={exportAsset} onClose={() => setExportAsset(null)} /> : null}
+      {exportAsset ? <ExportDialog assets={assets} selected={exportAsset} initialAssetIds={exportSelection} onClose={() => setExportAsset(null)} /> : null}
       {importPaths.length ? <ImportDialog sourceCount={importPaths.length} onClose={() => setImportPaths([])} onStart={startImport} /> : null}
       {notice ? <button className="toast" aria-live="polite" onClick={() => setNotice(null)}>{notice}</button> : null}
-      {operationProgress ? <section className="operation-progress" aria-live="polite"><div><strong>{operationProgress.kind}</strong><span>{operationProgress.current} of {operationProgress.total}</span></div><progress max={Math.max(1, operationProgress.total)} value={operationProgress.current} /><small>{operationProgress.error ?? operationProgress.file ?? "Working safely in the background…"}</small>{operationProgress.kind === "Import" && operationProgress.importId ? <button className="quiet-button" onClick={() => api.cancelImport(operationProgress.importId!).then(() => setNotice("Import cancellation requested; the current safe boundary will finish first."))}>Cancel import</button> : null}</section> : null}
+      {operationProgress ? <section className="operation-progress" aria-live="polite"><div><strong>{operationProgress.kind}</strong><span>{operationProgress.current} of {operationProgress.total}</span></div><progress max={Math.max(1, operationProgress.total)} value={operationProgress.current} /><small>{operationProgress.error ?? operationProgress.file ?? "Working safely in the background…"}</small>{operationProgress.kind === "Import" && operationProgress.importId ? <button className="quiet-button" onClick={() => api.cancelImport(operationProgress.importId!).then(() => setNotice("Import cancellation requested; the current safe boundary will finish first."))}>Cancel import</button> : null}{operationProgress.kind==="Batch Auto"?<button className="quiet-button" onClick={()=>void api.cancelLibraryBatch().then(()=>setNotice("Batch Auto cancellation requested; no catalogue change is committed until analysis completes."))}>Cancel Batch Auto</button>:null}</section> : null}
     </div>
   );
 }

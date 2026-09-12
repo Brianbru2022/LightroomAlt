@@ -8,14 +8,16 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 
 1. Choose or reconnect a portable master-library folder.
 2. Import with **Copy** (default) or explicitly choose **Move after verification**.
-3. Browse the timeline, tags and clustered full-library map; search configured places, select a marker, or place an unlocated photograph without changing its source metadata.
-4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
+3. Browse the virtualised Library, use Ctrl/Shift multi-selection, Grid/Loupe/Compare/Survey, ratings, flags, metadata, filtering and sorting, or use the clustered full-library map without changing source metadata.
+4. Cull with `0–5`, `P`/`M`, `X`, `U` and optional Auto Advance; Reject is a catalogue flag, never deletion.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
-6. Use Develop for non-destructive exposure, white balance, tonal, presence, colour, transform, crop and local-mask edits; optional local intelligent masking can propose Subject, combined People or Sky coverage for explicit acceptance into the same authoritative recipe.
+6. Use Develop for non-destructive exposure, white balance, tonal, presence, colour, transform, crop and local-mask edits; retain a multi-selection for explicit category-based Sync, Batch Auto and preset batching.
 7. Choose a plain-language AI action such as **Improve photo**, **Improve lighting**, **Enhance colour**, **Restore old photo**, **Remove distraction** or **Custom instruction**.
 8. Choose a local edit when it is genuinely available, or prepare a manual ChatGPT/Gemini hand-off. Import the returned image as a traceable candidate version.
 
 Catalogue, triage and manual external-edit workflows work without either optional AI service. Keepframe does not submit to ChatGPT or Gemini APIs and stores no cloud API keys.
+
+The full high-volume workflow, selection policy, keyboard map, batch undo contract and native acceptance checklist are documented in `MILESTONE_12_LIBRARY_PRODUCTIVITY_GUIDE.md`.
 
 ## Safety model
 
