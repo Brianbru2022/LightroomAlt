@@ -184,6 +184,10 @@ export const neutralAdjustments: BasicAdjustments = {
 };
 
 export type DevelopRecipe = { schemaVersion: 1; settings: BasicAdjustments };
+export type PresetCategory = "whiteBalance" | "tone" | "presence" | "colour";
+export type DevelopPreset = { schemaVersion: 1; id: string; name: string; categories: PresetCategory[]; settings: BasicAdjustments; builtIn: boolean };
+export type ImageStatistics = { luminanceBins: number[]; redBins: number[]; greenBins: number[]; blueBins: number[]; samples: number; averageLuminance: number; p01: number; p50: number; p99: number; shadowClipFraction: number; highlightClipFraction: number; averageSaturation: number; redGreenBlue: [number, number, number]; dynamicRange: number };
+export type AutoProposal = { settings: BasicAdjustments; explanation: string[]; confidence: number; statistics: ImageStatistics; recommendations: string[] };
 
 export type JobAttempt = {
   attemptNumber: number;

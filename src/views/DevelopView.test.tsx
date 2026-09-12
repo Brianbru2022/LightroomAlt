@@ -17,4 +17,18 @@ describe("Develop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: /original/i }));
     expect(screen.getByAltText(selected.filename).getAttribute("src")).toContain(selected.previewUrl);
   });
+
+  it("keeps Auto and preset previews out of persistence until explicit Apply", async () => {
+    const saved = vi.fn(); const selected = { ...demoAssets[0], hasEdits: false };
+    render(<DevelopView assets={[selected]} selected={selected} onSelect={vi.fn()} onExport={async () => undefined} onRecipeSaved={saved} />);
+    await screen.findByText("Analyse photo");
+    fireEvent.click(screen.getByRole("button", { name: /analyse photo/i }));
+    await screen.findByRole("button", { name: "Apply" });
+    expect(saved).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Warm" }));
+    expect(await screen.findByText("Warm preview")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(saved).toHaveBeenCalled());
+  });
 });

@@ -1,20 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
+type Bins = { luminance: number[]; red: number[]; green: number[]; blue: number[]; shadows: number; highlights: number };
+const points = (bins: number[]) => { const maximum = Math.max(...bins, 1); return bins.map((value, index) => `${index * (160 / 63)},${48 - value / maximum * 46}`).join(" "); };
+
+/** Reads the displayed preview at a bounded size. It has no recipe side effect. */
 export function Histogram({ src }: { src: string }) {
-  const [bins, setBins] = useState<number[]>([]);
-  const sourceRef = useRef(src); sourceRef.current = src;
-  useEffect(() => {
-    const image = new Image(); image.crossOrigin = "anonymous";
-    image.onload = () => {
-      if (sourceRef.current !== src) return;
-      const canvas = document.createElement("canvas"); const scale = Math.min(1, 256 / Math.max(image.width, image.height));
-      canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale));
-      const context = canvas.getContext("2d", { willReadFrequently: true }); if (!context) return;
-      context.drawImage(image, 0, 0, canvas.width, canvas.height); const next = Array.from({ length: 64 }, () => 0);
-      for (let offset = 0, data = context.getImageData(0, 0, canvas.width, canvas.height).data; offset < data.length; offset += 4) next[Math.min(63, Math.floor((data[offset] * .2126 + data[offset + 1] * .7152 + data[offset + 2] * .0722) / 4))]++;
-      const maximum = Math.max(...next, 1); setBins(next.map((value) => value / maximum));
-    }; image.src = src;
-  }, [src]);
-  const points = bins.map((value, index) => `${index * (160 / 63)},${48 - value * 46}`).join(" ");
-  return <section className="histogram" aria-label="Luminance histogram"><span>Histogram</span><svg viewBox="0 0 160 50" role="img" aria-label="Brightness distribution"><polyline points={points} /></svg></section>;
+  const [bins, setBins] = useState<Bins | null>(null); const sourceRef = useRef(src); sourceRef.current = src;
+  useEffect(() => { const image = new Image(); image.crossOrigin = "anonymous"; image.onload = () => { if (sourceRef.current !== src) return; const canvas = document.createElement("canvas"); const scale = Math.min(1, 256 / Math.max(image.width, image.height)); canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale)); const context = canvas.getContext("2d", { willReadFrequently: true }); if (!context) return; context.drawImage(image, 0, 0, canvas.width, canvas.height); const next: Bins = { luminance: Array(64).fill(0), red: Array(64).fill(0), green: Array(64).fill(0), blue: Array(64).fill(0), shadows: 0, highlights: 0 }; for (let offset = 0, data = context.getImageData(0, 0, canvas.width, canvas.height).data; offset < data.length; offset += 4) { const r = data[offset], g = data[offset + 1], b = data[offset + 2], lum = r * .2126 + g * .7152 + b * .0722; next.luminance[Math.min(63, Math.floor(lum / 4))]++; next.red[Math.min(63, Math.floor(r / 4))]++; next.green[Math.min(63, Math.floor(g / 4))]++; next.blue[Math.min(63, Math.floor(b / 4))]++; if (lum <= 5) next.shadows++; if (lum >= 250) next.highlights++; } setBins(next); }; image.src = src; }, [src]);
+  return <section className="histogram" aria-label="Edited RGB histogram"><div><span>Edited RGB histogram</span>{bins ? <small>{bins.shadows ? `${bins.shadows} shadow-clipped` : "No shadow clipping"} · {bins.highlights ? `${bins.highlights} highlight-clipped` : "No highlight clipping"}</small> : null}</div><svg viewBox="0 0 160 50" role="img" aria-label="Brightness and RGB distribution"><polyline className="hist-luminance" points={points(bins?.luminance ?? [])} /><polyline className="hist-red" points={points(bins?.red ?? [])} /><polyline className="hist-green" points={points(bins?.green ?? [])} /><polyline className="hist-blue" points={points(bins?.blue ?? [])} /></svg></section>;
 }

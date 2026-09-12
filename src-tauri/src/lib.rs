@@ -27,7 +27,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SUPPORTED: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "heic", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf",
     "rw2",
@@ -255,6 +256,57 @@ struct DevelopRecipe {
     settings: BasicAdjustments,
 }
 
+const PRESET_CATEGORIES: &[&str] = &["whiteBalance", "tone", "presence", "colour"];
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DevelopPreset {
+    schema_version: i64,
+    id: String,
+    name: String,
+    categories: Vec<String>,
+    settings: BasicAdjustments,
+    built_in: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresetFile {
+    schema_version: i64,
+    name: String,
+    categories: Vec<String>,
+    settings: BasicAdjustments,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ImageStatistics {
+    luminance_bins: Vec<u64>,
+    red_bins: Vec<u64>,
+    green_bins: Vec<u64>,
+    blue_bins: Vec<u64>,
+    samples: u64,
+    average_luminance: f32,
+    p01: f32,
+    p50: f32,
+    p99: f32,
+    shadow_clip_fraction: f32,
+    highlight_clip_fraction: f32,
+    average_saturation: f32,
+    red_green_blue: [f32; 3],
+    dynamic_range: f32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoProposal {
+    settings: BasicAdjustments,
+    explanation: Vec<String>,
+    confidence: f32,
+    statistics: ImageStatistics,
+    recommendations: Vec<String>,
+}
+
 impl DevelopRecipe {
     fn neutral() -> Self { Self { schema_version: 1, settings: BasicAdjustments::neutral() } }
     fn validate(self) -> Result<Self> {
@@ -264,6 +316,49 @@ impl DevelopRecipe {
         Ok(Self { settings: self.settings.validate()?, ..self })
     }
     fn is_edited(self) -> bool { self.settings != BasicAdjustments::neutral() }
+}
+
+impl DevelopPreset {
+    fn validate(mut self, user_authored: bool) -> Result<Self> {
+        if self.schema_version != 1 {
+            return Err(KeepframeError::Message("This Develop preset version is not supported by this build.".into()));
+        }
+        self.name = self.name.trim().to_string();
+        if self.name.is_empty() || self.name.chars().count() > 80 || self.name.chars().any(char::is_control) {
+            return Err(KeepframeError::Message("Preset names must be 1 to 80 printable characters.".into()));
+        }
+        self.categories.sort();
+        self.categories.dedup();
+        if self.categories.is_empty() || self.categories.iter().any(|category| !PRESET_CATEGORIES.contains(&category.as_str())) {
+            return Err(KeepframeError::Message("A preset contains an unsupported settings category.".into()));
+        }
+        if user_authored && (self.built_in || self.id.trim().is_empty()) {
+            return Err(KeepframeError::Message("User presets must have an application-generated id and cannot claim to be built in.".into()));
+        }
+        self.settings = self.settings.validate()?;
+        Ok(self)
+    }
+}
+
+fn built_in_presets() -> Vec<DevelopPreset> {
+    let preset = |id: &str, name: &str, categories: &[&str], settings: BasicAdjustments| DevelopPreset {
+        schema_version: 1, id: id.into(), name: name.into(), categories: categories.iter().map(|value| (*value).into()).collect(), settings, built_in: true,
+    };
+    vec![
+        preset("natural", "Natural", &["tone", "colour"], BasicAdjustments::neutral()),
+        preset("clean", "Clean", &["tone", "presence", "colour"], BasicAdjustments { contrast: 4.0, highlights: -8.0, shadows: 6.0, clarity: 3.0, colour_boost: 3.0, ..BasicAdjustments::neutral() }),
+        preset("warm", "Warm", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: 14.0, tint: 2.0, contrast: 4.0, colour_boost: 6.0, ..BasicAdjustments::neutral() }),
+        preset("cool", "Cool", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: -12.0, tint: -2.0, highlights: -8.0, colour_boost: 3.0, ..BasicAdjustments::neutral() }),
+        preset("high-contrast", "High Contrast", &["tone", "presence"], BasicAdjustments { contrast: 20.0, highlights: -8.0, shadows: -5.0, whites: 8.0, blacks: -10.0, clarity: 5.0, ..BasicAdjustments::neutral() }),
+        preset("soft-contrast", "Soft Contrast", &["tone", "presence"], BasicAdjustments { contrast: -14.0, highlights: -12.0, shadows: 12.0, texture: -5.0, ..BasicAdjustments::neutral() }),
+        preset("vivid", "Vivid", &["tone", "colour"], BasicAdjustments { contrast: 8.0, colour_boost: 20.0, saturation: 5.0, ..BasicAdjustments::neutral() }),
+        preset("muted", "Muted", &["tone", "colour"], BasicAdjustments { contrast: -4.0, colour_boost: -8.0, saturation: -22.0, ..BasicAdjustments::neutral() }),
+        preset("portrait", "Portrait", &["tone", "presence", "colour"], BasicAdjustments { contrast: -3.0, highlights: -10.0, shadows: 8.0, texture: -12.0, clarity: -5.0, colour_boost: 5.0, ..BasicAdjustments::neutral() }),
+        preset("landscape", "Landscape", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, highlights: -10.0, dehaze: 7.0, clarity: 8.0, colour_boost: 15.0, ..BasicAdjustments::neutral() }),
+        preset("black-and-white", "Black & White", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, clarity: 4.0, saturation: -100.0, ..BasicAdjustments::neutral() }),
+        preset("high-key-bw", "High-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: 0.45, contrast: -8.0, shadows: 18.0, blacks: 10.0, clarity: -3.0, saturation: -100.0, ..BasicAdjustments::neutral() }),
+        preset("low-key-bw", "Low-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: -0.45, contrast: 18.0, highlights: -15.0, blacks: -18.0, clarity: 6.0, saturation: -100.0, ..BasicAdjustments::neutral() }),
+    ]
 }
 
 struct AdjustmentInput {
@@ -705,6 +800,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, kind TEXT NOT NULL, path TEXT NOT NULL, provider TEXT, prompt TEXT, recipe_json TEXT, source_hash TEXT, output_hash TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS edit_recipes(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, schema_version INTEGER NOT NULL, recipe_json TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS develop_recipes(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,schema_version INTEGER NOT NULL,recipe_json TEXT NOT NULL,updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS develop_presets(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,schema_version INTEGER NOT NULL,preset_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_develop_recipes_updated ON develop_recipes(updated_at DESC);
       CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, common_brief TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(id), asset_id TEXT NOT NULL REFERENCES assets(id), state TEXT NOT NULL, prompt TEXT NOT NULL, recipe_json TEXT, negative_prompt TEXT, model TEXT, seed INTEGER, settings_json TEXT, output_path TEXT, output_hash TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -719,6 +815,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v5(&mut connection, existed, version)?;
     migrations::apply_v6(&mut connection, existed, version)?;
     migrations::apply_v7(&mut connection, existed, version)?;
+    migrations::apply_v8(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -2013,6 +2110,52 @@ fn original_adjustment_input(connection: &Connection, asset_id: &str) -> Result<
     Ok(AdjustmentInput { path: PathBuf::from(path), source_hash, captured_at: captured, expected_dimensions: width.zip(height) })
 }
 
+fn image_statistics(image: &image::DynamicImage) -> ImageStatistics {
+    let rgb = image.to_rgb8();
+    let step = ((rgb.width() as usize * rgb.height() as usize) / 250_000).max(1);
+    let mut luminance_bins = vec![0_u64; 64]; let mut red_bins = vec![0_u64; 64]; let mut green_bins = vec![0_u64; 64]; let mut blue_bins = vec![0_u64; 64];
+    let mut luminances = Vec::new(); let mut saturation_total = 0.0_f32; let mut channel_total = [0.0_f32; 3]; let mut shadows = 0_u64; let mut highlights = 0_u64;
+    for pixel in rgb.pixels().step_by(step) {
+        let channels = [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0];
+        let luminance = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+        luminance_bins[(luminance * 63.0).round().clamp(0.0, 63.0) as usize] += 1;
+        red_bins[(channels[0] * 63.0).round() as usize] += 1; green_bins[(channels[1] * 63.0).round() as usize] += 1; blue_bins[(channels[2] * 63.0).round() as usize] += 1;
+        let maximum = channels.into_iter().fold(0.0_f32, f32::max); let minimum = channels.into_iter().fold(1.0_f32, f32::min);
+        saturation_total += if maximum > 0.0 { (maximum - minimum) / maximum } else { 0.0 };
+        channel_total[0] += channels[0]; channel_total[1] += channels[1]; channel_total[2] += channels[2];
+        if luminance <= 0.02 { shadows += 1; }
+        if luminance >= 0.98 { highlights += 1; }
+        luminances.push(luminance);
+    }
+    luminances.sort_by(|left, right| left.total_cmp(right)); let samples = luminances.len().max(1);
+    let percentile = |fraction: f32| luminances.get(((samples - 1) as f32 * fraction).round() as usize).copied().unwrap_or(0.5);
+    ImageStatistics { luminance_bins, red_bins, green_bins, blue_bins, samples: samples as u64, average_luminance: luminances.iter().sum::<f32>() / samples as f32, p01: percentile(0.01), p50: percentile(0.50), p99: percentile(0.99), shadow_clip_fraction: shadows as f32 / samples as f32, highlight_clip_fraction: highlights as f32 / samples as f32, average_saturation: saturation_total / samples as f32, red_green_blue: [channel_total[0] / samples as f32, channel_total[1] / samples as f32, channel_total[2] / samples as f32], dynamic_range: (percentile(0.99) - percentile(0.01)).max(0.0) }
+}
+
+fn auto_proposal(image: &image::DynamicImage, current: BasicAdjustments) -> AutoProposal {
+    let stats = image_statistics(image); let mut settings = current; let mut explanation = Vec::new();
+    // Auto analyses the source-derived, bounded thumbnail and adds restrained
+    // deltas to the current recipe. It deliberately never changes geometry.
+    let exposure_delta = ((0.46 / stats.p50.max(0.08)).log2()).clamp(-0.35, 0.65);
+    if exposure_delta.abs() >= 0.08 { settings.exposure = (current.exposure + exposure_delta).clamp(-3.0, 3.0); explanation.push(if exposure_delta > 0.0 { "Exposure increased because midtones were under-represented.".into() } else { "Exposure reduced because midtones were already bright.".into() }); }
+    if stats.highlight_clip_fraction > 0.004 || stats.p99 > 0.94 { settings.highlights = (current.highlights - 18.0).max(-45.0); explanation.push("Highlights reduced because clipping was detected.".into()); }
+    if stats.shadow_clip_fraction > 0.012 || stats.p01 < 0.07 { settings.shadows = (current.shadows + 14.0).min(35.0); explanation.push("Shadows raised moderately because dark detail was limited.".into()); }
+    if stats.dynamic_range < 0.55 { settings.contrast = (current.contrast + 7.0).min(20.0); explanation.push("Contrast raised slightly because the tonal range was flat.".into()); }
+    if stats.average_saturation < 0.18 { settings.colour_boost = (current.colour_boost + 8.0).min(18.0); explanation.push("Vibrance increased conservatively because average saturation was low.".into()); }
+    let neutral_spread = (stats.red_green_blue[0] - stats.red_green_blue[1]).abs().max((stats.red_green_blue[2] - stats.red_green_blue[1]).abs());
+    let wb_confidence = (1.0 - neutral_spread * 8.0).clamp(0.0, 1.0);
+    if wb_confidence >= 0.58 && stats.average_saturation < 0.42 {
+        let temperature = ((stats.red_green_blue[2] - stats.red_green_blue[0]) * 55.0).clamp(-12.0, 12.0);
+        if temperature.abs() >= 2.0 { settings.light_balance = (current.light_balance + temperature).clamp(-100.0, 100.0); explanation.push(if temperature > 0.0 { "White balance warmed using a low-saturation grey-world estimate.".into() } else { "White balance cooled using a low-saturation grey-world estimate.".into() }); }
+    } else { explanation.push("White balance unchanged because no reliable neutral estimate was found.".into()); }
+    if explanation.is_empty() { explanation.push("The image already falls within conservative Auto thresholds; no changes are proposed.".into()); }
+    let mut recommendations = Vec::new();
+    if stats.average_saturation > 0.24 && stats.dynamic_range > 0.55 { recommendations.push("Landscape".into()); }
+    if stats.average_saturation < 0.22 && stats.p50 > 0.38 && stats.p50 < 0.70 { recommendations.push("Portrait".into()); }
+    if stats.dynamic_range < 0.45 { recommendations.push("Soft Contrast".into()); }
+    AutoProposal { settings, explanation, confidence: ((wb_confidence + (1.0 - stats.highlight_clip_fraction * 8.0).clamp(0.0, 1.0)) / 2.0).clamp(0.25, 1.0), statistics: stats, recommendations }
+}
+
 fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments {
     let rgb = image.to_rgb8();
     let step = ((rgb.width() as usize * rgb.height() as usize) / 250_000).max(1);
@@ -2218,6 +2361,57 @@ async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: 
         }
         Ok(output.to_string_lossy().into())
     }).await.map_err(|error| KeepframeError::Message(format!("Develop preview failed: {error}")))?
+}
+
+#[tauri::command]
+fn list_develop_presets(state: State<'_, AppState>) -> Result<Vec<DevelopPreset>> {
+    let connection = open_db(&root_from(&state)?)?;
+    let mut presets = built_in_presets();
+    let mut statement = connection.prepare("SELECT preset_json FROM develop_presets ORDER BY name COLLATE NOCASE")?;
+    let user_presets = statement.query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| row.map_err(KeepframeError::from).and_then(|json| serde_json::from_str::<DevelopPreset>(&json).map_err(KeepframeError::from)?.validate(true)))
+        .collect::<Result<Vec<_>>>()?;
+    presets.extend(user_presets); Ok(presets)
+}
+
+#[tauri::command]
+fn save_develop_preset(preset: DevelopPreset, state: State<'_, AppState>) -> Result<DevelopPreset> {
+    let mut preset = preset.validate(true)?; preset.built_in = false;
+    let now = Utc::now().to_rfc3339(); let mut connection = open_db(&root_from(&state)?)?; let tx = connection.transaction()?;
+    tx.execute("INSERT INTO develop_presets(id,name,schema_version,preset_json,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,schema_version=excluded.schema_version,preset_json=excluded.preset_json,updated_at=excluded.updated_at", params![preset.id,preset.name,preset.schema_version,serde_json::to_string(&preset)?,now])?;
+    tx.commit()?; Ok(preset)
+}
+
+#[tauri::command]
+fn delete_develop_preset(id: String, state: State<'_, AppState>) -> Result<()> {
+    if built_in_presets().iter().any(|preset| preset.id == id) { return Err(KeepframeError::Message("Built-in presets cannot be deleted.".into())); }
+    let connection = open_db(&root_from(&state)?)?; connection.execute("DELETE FROM develop_presets WHERE id=?1", [id])?; Ok(())
+}
+
+#[tauri::command]
+fn export_develop_preset(id: String, path: String, state: State<'_, AppState>) -> Result<()> {
+    let preset = list_develop_presets(state)?.into_iter().find(|preset| preset.id == id).ok_or_else(|| KeepframeError::Message("The preset no longer exists.".into()))?;
+    let path = PathBuf::from(path); if !path.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("keepframe-preset")).unwrap_or(false) { return Err(KeepframeError::Message("Preset exports must use the .keepframe-preset extension.".into())); }
+    let file = PresetFile { schema_version: 1, name: preset.name, categories: preset.categories, settings: preset.settings };
+    fs::write(path, serde_json::to_vec_pretty(&file)?)?; Ok(())
+}
+
+#[tauri::command]
+fn import_develop_preset(path: String, state: State<'_, AppState>) -> Result<DevelopPreset> {
+    let path = PathBuf::from(path); let metadata = fs::metadata(&path)?;
+    if metadata.len() > PRESET_FILE_MAX_BYTES { return Err(KeepframeError::Message("Preset file is larger than the 128 KiB safety limit.".into())); }
+    let file: PresetFile = serde_json::from_slice(&fs::read(path)?)?;
+    let preset = DevelopPreset { schema_version: file.schema_version, id: Uuid::new_v4().to_string(), name: file.name, categories: file.categories, settings: file.settings, built_in: false };
+    save_develop_preset(preset, state)
+}
+
+#[tauri::command]
+async fn propose_develop_auto(asset_id: String, current: BasicAdjustments, state: State<'_, AppState>) -> Result<AutoProposal> {
+    let current = current.validate()?; let root = root_from(&state)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<AutoProposal> {
+        let connection = open_db(&root)?; let preview: String = connection.query_row("SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL", [&asset_id], |row| row.get(0))?;
+        let image = image::open(preview)?.thumbnail(720, 540); Ok(auto_proposal(&image, current))
+    }).await.map_err(|error| KeepframeError::Message(format!("Automatic Develop analysis failed: {error}")))?
 }
 
 #[tauri::command]
@@ -5109,6 +5303,12 @@ pub fn run() {
             get_develop_recipe,
             save_develop_recipe,
             preview_develop_recipe,
+            list_develop_presets,
+            save_develop_preset,
+            delete_develop_preset,
+            export_develop_preset,
+            import_develop_preset,
+            propose_develop_auto,
             import_replacement,
             export_asset_image,
             export_external_edit,
@@ -5342,6 +5542,59 @@ mod tests {
         apply_protected_local_contrast(&mut source, 1.0, 75.0);
         assert_eq!(source.get_pixel(2, 2)[0], 120);
         assert!(source.get_pixel(23, 32)[0] - source.get_pixel(24, 32)[0] > 20);
+    }
+
+    #[test]
+    fn built_in_develop_presets_are_valid_and_never_include_geometry() {
+        let presets = built_in_presets();
+        assert_eq!(presets.len(), 13);
+        assert!(presets.iter().all(|preset| preset.clone().validate(false).is_ok()));
+        assert!(presets.iter().all(|preset| preset.settings.crop_left == 0.0 && preset.settings.crop_width == 1.0 && !preset.settings.horizontal_flip));
+        assert!(presets.iter().any(|preset| preset.name == "Black & White" && preset.settings.saturation == -100.0));
+    }
+
+    #[test]
+    fn untrusted_preset_rejects_unknown_categories_and_out_of_range_values() {
+        let invalid_category = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["filesystem".into()], settings: BasicAdjustments::neutral(), built_in: false };
+        assert!(invalid_category.validate(true).is_err());
+        let invalid_value = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["tone".into()], settings: BasicAdjustments { exposure: 99.0, ..BasicAdjustments::neutral() }, built_in: false };
+        assert!(invalid_value.validate(true).is_err());
+    }
+
+    #[test]
+    fn auto_analysis_is_image_dependent_conservative_and_preserves_geometry() {
+        let dark = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([45, 18, 8])));
+        let bright = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([245, 245, 245])));
+        let current = BasicAdjustments { crop_left: 0.1, crop_top: 0.1, crop_width: 0.8, crop_height: 0.8, rotate_quadrants: 1, ..BasicAdjustments::neutral() };
+        let dark_proposal = auto_proposal(&dark, current); let bright_proposal = auto_proposal(&bright, current);
+        assert!(dark_proposal.settings.exposure > current.exposure);
+        assert!(bright_proposal.settings.highlights < current.highlights);
+        assert_eq!((dark_proposal.settings.crop_left, dark_proposal.settings.crop_width, dark_proposal.settings.rotate_quadrants), (0.1, 0.8, 1));
+        assert!(dark_proposal.statistics.p50 < bright_proposal.statistics.p50);
+        assert!(dark_proposal.explanation.iter().any(|line| line.contains("White balance unchanged")));
+    }
+
+    #[test]
+    fn statistics_detect_clipping_and_channel_cast_without_a_model() {
+        let mut source = RgbImage::from_pixel(100, 1, image::Rgb([50, 30, 20]));
+        for index in 0..10 { source.put_pixel(index, 0, image::Rgb([255, 255, 255])); }
+        let statistics = image_statistics(&image::DynamicImage::ImageRgb8(source));
+        assert!(statistics.highlight_clip_fraction > 0.05);
+        assert!(statistics.red_green_blue[0] > statistics.red_green_blue[2]);
+        assert_eq!(statistics.luminance_bins.len(), 64);
+    }
+
+    #[test]
+    #[ignore = "manual Milestone 7 performance checkpoint; run with --ignored --nocapture"]
+    fn intelligent_editing_performance_checkpoint() {
+        let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * 3 + y) % 256) as u8])));
+        let histogram_started = Instant::now(); let statistics = image_statistics(&image); let histogram_elapsed = histogram_started.elapsed();
+        let auto_started = Instant::now(); let proposal = auto_proposal(&image, BasicAdjustments::neutral()); let auto_elapsed = auto_started.elapsed();
+        let preview_started = Instant::now(); let _preview = apply_adjustments_to_image(&image, proposal.settings); let preview_elapsed = preview_started.elapsed();
+        let warm_preset = built_in_presets().into_iter().find(|preset| preset.id == "warm").unwrap();
+        let preset_started = Instant::now(); let _preset = apply_adjustments_to_image(&image, warm_preset.settings); let preset_elapsed = preset_started.elapsed();
+        eprintln!("M7 checkpoint: histogram={histogram_elapsed:?}; auto={auto_elapsed:?}; auto-preview={preview_elapsed:?}; warm-preset-render={preset_elapsed:?}; samples={}", statistics.samples);
+        assert_eq!(statistics.luminance_bins.len(), 64);
     }
 
     #[test]

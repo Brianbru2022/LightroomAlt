@@ -193,6 +193,37 @@ pub(crate) fn apply_v7(connection: &mut Connection, existed: bool, version: i64)
     tx.commit()
 }
 
+/// Version 8 stores only user-authored Develop presets.  Built-ins remain in
+/// the executable, so an application upgrade can improve their wording or
+/// availability without silently changing a recipe which was already applied.
+/// A preset is settings plus an explicit category list; it never stores an
+/// asset id, file path, preview or any other catalogue/UI data.
+pub(crate) fn apply_v8(connection: &mut Connection, existed: bool, version: i64) -> rusqlite::Result<()> {
+    if !existed {
+        connection.execute(
+            "INSERT INTO schema_migrations(version,applied_at)VALUES(?1,?2)",
+            params![8, Utc::now().to_rfc3339()],
+        )?;
+        connection.pragma_update(None, "user_version", 8)?;
+        return Ok(());
+    }
+    if version >= 8 {
+        return Ok(());
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS develop_presets(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,schema_version INTEGER NOT NULL,preset_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+        [],
+    )?;
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_develop_presets_name ON develop_presets(name COLLATE NOCASE)", [])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(8,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.pragma_update(None, "user_version", 8)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +252,16 @@ mod tests {
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         let records: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='develop_recipes'", [], |row| row.get(0)).unwrap();
         assert_eq!((version, records), (7, 1));
+    }
+
+    #[test]
+    fn v8_migration_is_atomic_and_creates_user_presets() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);").unwrap();
+        apply_v8(&mut connection, true, 7).unwrap();
+        apply_v8(&mut connection, true, 8).unwrap();
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let records: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='develop_presets'", [], |row| row.get(0)).unwrap();
+        assert_eq!((version, records), (8, 1));
     }
 }

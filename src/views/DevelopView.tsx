@@ -1,126 +1,51 @@
-import { Clipboard, ClipboardPaste, Eye, Maximize2, Minus, RotateCcw, Undo2, Redo2, ZoomIn } from "lucide-react";
+import { Clipboard, ClipboardPaste, Eye, Maximize2, Minus, Redo2, RotateCcw, Sparkles, Undo2, ZoomIn } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { CropOverlay } from "../components/CropOverlay";
+import { Histogram } from "../components/Histogram";
 import { PhotoAdjustmentControls } from "../components/PhotoAdjustmentControls";
 import { useAdjustmentPreview } from "../hooks/useAdjustmentPreview";
 import { api } from "../lib/bridge";
-import { neutralAdjustments, type Asset, type BasicAdjustments, type DevelopRecipe } from "../types";
+import { neutralAdjustments, type Asset, type AutoProposal, type BasicAdjustments, type DevelopPreset, type PresetCategory } from "../types";
 
 type Props = { assets: Asset[]; selected: Asset | null; onSelect: (asset: Asset) => void; onExport: (asset: Asset) => Promise<void>; onRecipeSaved: () => void };
-
+type Staged = { settings: BasicAdjustments; title: string; detail?: string[] };
+const categoryOptions: PresetCategory[] = ["whiteBalance", "tone", "presence", "colour"];
 let copiedSettings: BasicAdjustments | null = null;
-const copySettings = (settings: BasicAdjustments): BasicAdjustments => structuredClone(settings);
+const clone = (settings: BasicAdjustments) => structuredClone(settings);
+const isEdited = (settings: BasicAdjustments) => JSON.stringify(settings) !== JSON.stringify(neutralAdjustments);
+
+function applyPreset(current: BasicAdjustments, preset: DevelopPreset) {
+  const next = clone(current); const include = new Set(preset.categories);
+  if (include.has("whiteBalance")) Object.assign(next, { lightBalance: preset.settings.lightBalance, tint: preset.settings.tint });
+  if (include.has("tone")) Object.assign(next, { exposure: preset.settings.exposure, contrast: preset.settings.contrast, highlights: preset.settings.highlights, shadows: preset.settings.shadows, whites: preset.settings.whites, blacks: preset.settings.blacks, dynamicRange: preset.settings.dynamicRange, curveHighlights: preset.settings.curveHighlights, curveLights: preset.settings.curveLights, curveDarks: preset.settings.curveDarks, curveShadows: preset.settings.curveShadows });
+  if (include.has("presence")) Object.assign(next, { texture: preset.settings.texture, clarity: preset.settings.clarity, dehaze: preset.settings.dehaze });
+  if (include.has("colour")) Object.assign(next, { colourBoost: preset.settings.colourBoost, saturation: preset.settings.saturation });
+  return next;
+}
 
 export function DevelopView({ assets, selected, onSelect, onExport, onRecipeSaved }: Props) {
-  const [settings, setSettings] = useState<BasicAdjustments>(neutralAdjustments);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [recipeEdited, setRecipeEdited] = useState(false);
-  const [hasClipboard, setHasClipboard] = useState(Boolean(copiedSettings));
-  const [before, setBefore] = useState(false);
-  const [cropping, setCropping] = useState(false);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [drag, setDrag] = useState<{ x: number; y: number; pan: { x: number; y: number } } | null>(null);
-  const history = useRef<BasicAdjustments[]>([neutralAdjustments]);
-  const historyIndex = useRef(0);
-  const groupTimer = useRef<number | null>(null);
-  const saveTimer = useRef<number | null>(null);
-  const latest = useRef(settings);
-  latest.current = settings;
-  const selectedId = selected?.id;
-  const { request: requestPreview, cancel: cancelPreview } = useAdjustmentPreview(
-    (asset, next) => api.previewDevelopRecipe(asset.id, { schemaVersion: 1, settings: next }),
-    setPreviewUrl,
-    (reason) => setError(String(reason)),
-  );
+  const [settings, setSettings] = useState<BasicAdjustments>(neutralAdjustments); const [previewUrl, setPreviewUrl] = useState<string | null>(null); const [error, setError] = useState<string | null>(null); const [before, setBefore] = useState(false); const [cropping, setCropping] = useState(false); const [zoom, setZoom] = useState(1); const [pan, setPan] = useState({ x: 0, y: 0 }); const [drag, setDrag] = useState<{ x: number; y: number; pan: { x: number; y: number } } | null>(null);
+  const [hasClipboard, setHasClipboard] = useState(Boolean(copiedSettings)); const [presets, setPresets] = useState<DevelopPreset[]>([]); const [staged, setStaged] = useState<Staged | null>(null); const [proposal, setProposal] = useState<AutoProposal | null>(null); const [analysing, setAnalysing] = useState(false); const [showClipping, setShowClipping] = useState(false); const [presetName, setPresetName] = useState(""); const [presetCategories, setPresetCategories] = useState<PresetCategory[]>(categoryOptions);
+  const history = useRef<BasicAdjustments[]>([neutralAdjustments]); const historyIndex = useRef(0); const groupTimer = useRef<number | null>(null); const saveTimer = useRef<number | null>(null); const latest = useRef(settings); const analysisToken = useRef(0); latest.current = settings; const selectedId = selected?.id; const displayed = staged?.settings ?? settings;
+  const { request: requestPreview, cancel: cancelPreview } = useAdjustmentPreview((asset, next) => api.previewDevelopRecipe(asset.id, { schemaVersion: 1, settings: next }), setPreviewUrl, (reason) => setError(String(reason)));
+  const persist = (next: BasicAdjustments) => { if (!selected) return; if (saveTimer.current !== null) window.clearTimeout(saveTimer.current); saveTimer.current = window.setTimeout(() => { void api.saveDevelopRecipe(selected.id, { schemaVersion: 1, settings: next }).then(onRecipeSaved).catch((reason) => setError(String(reason))); }, 450); };
+  const settleHistory = () => { if (groupTimer.current === null) return; window.clearTimeout(groupTimer.current); groupTimer.current = null; if (JSON.stringify(history.current[historyIndex.current]) !== JSON.stringify(latest.current)) { history.current = [...history.current.slice(0, historyIndex.current + 1), clone(latest.current)].slice(-80); historyIndex.current = history.current.length - 1; } };
+  const change = (next: BasicAdjustments) => { if (!selected) return; setStaged(null); setProposal(null); latest.current = next; setSettings(next); requestPreview(selected, next); persist(next); if (groupTimer.current !== null) window.clearTimeout(groupTimer.current); groupTimer.current = window.setTimeout(settleHistory, 350); };
+  const commit = (next: BasicAdjustments) => { if (!selected) return; if (groupTimer.current !== null) window.clearTimeout(groupTimer.current); groupTimer.current = null; latest.current = next; setSettings(next); setStaged(null); setProposal(null); requestPreview(selected, next); persist(next); if (JSON.stringify(history.current[historyIndex.current]) !== JSON.stringify(next)) { history.current = [...history.current.slice(0, historyIndex.current + 1), clone(next)].slice(-80); historyIndex.current = history.current.length - 1; } };
+  const stage = (next: BasicAdjustments, title: string, detail?: string[]) => { if (!selected) return; setStaged({ settings: next, title, detail }); requestPreview(selected, next); };
+  const undo = () => { settleHistory(); if (historyIndex.current > 0) { historyIndex.current -= 1; commit(clone(history.current[historyIndex.current])); } }; const redo = () => { settleHistory(); if (historyIndex.current < history.current.length - 1) { historyIndex.current += 1; commit(clone(history.current[historyIndex.current])); } };
+  const refreshPresets = () => void api.developPresets().then(setPresets).catch((reason) => setError(String(reason)));
 
-  const persist = (next: BasicAdjustments) => {
-    if (!selected) return;
-    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => {
-      void api.saveDevelopRecipe(selected.id, { schemaVersion: 1, settings: next })
-        .then(() => onRecipeSaved())
-        .catch((reason) => setError(String(reason)));
-    }, 450);
-  };
-  const settleHistory = () => {
-    if (groupTimer.current === null) return;
-    window.clearTimeout(groupTimer.current); groupTimer.current = null;
-    const current = latest.current;
-    if (JSON.stringify(history.current[historyIndex.current]) !== JSON.stringify(current)) {
-      history.current = [...history.current.slice(0, historyIndex.current + 1), copySettings(current)].slice(-80);
-      historyIndex.current = history.current.length - 1;
-    }
-  };
-  const change = (next: BasicAdjustments) => {
-    if (!selected) return;
-    latest.current = next; setSettings(next); setRecipeEdited(JSON.stringify(next) !== JSON.stringify(neutralAdjustments)); setError(null); requestPreview(selected, next); persist(next);
-    if (groupTimer.current !== null) window.clearTimeout(groupTimer.current);
-    groupTimer.current = window.setTimeout(settleHistory, 350);
-  };
-  const replace = (next: BasicAdjustments) => change(next);
-  const undo = () => {
-    settleHistory();
-    if (historyIndex.current <= 0) return;
-    historyIndex.current -= 1; change(copySettings(history.current[historyIndex.current])); settleHistory();
-  };
-  const redo = () => {
-    settleHistory();
-    if (historyIndex.current >= history.current.length - 1) return;
-    historyIndex.current += 1; change(copySettings(history.current[historyIndex.current])); settleHistory();
-  };
-
-  useEffect(() => {
-    cancelPreview(); setPreviewUrl(null); setBefore(false); setCropping(false); setZoom(1); setPan({ x: 0, y: 0 }); setError(null); setRecipeEdited(false);
-    if (!selected) return;
-    let active = true;
-    void api.getDevelopRecipe(selected.id).then((recipe) => {
-      if (!active) return;
-      latest.current = recipe.settings; setSettings(recipe.settings); setRecipeEdited(JSON.stringify(recipe.settings) !== JSON.stringify(neutralAdjustments)); history.current = [copySettings(recipe.settings)]; historyIndex.current = 0;
-      if (JSON.stringify(recipe.settings) !== JSON.stringify(neutralAdjustments)) requestPreview(selected, recipe.settings);
-    }).catch((reason) => active && setError(String(reason)));
-    return () => { active = false; };
-  }, [cancelPreview, requestPreview, selected, selectedId]);
-
+  useEffect(() => { cancelPreview(); analysisToken.current += 1; setPreviewUrl(null); setBefore(false); setCropping(false); setZoom(1); setPan({ x: 0, y: 0 }); setStaged(null); setProposal(null); if (!selected) return; let active = true; void Promise.all([api.getDevelopRecipe(selected.id), api.developPresets()]).then(([recipe, loaded]) => { if (!active) return; latest.current = recipe.settings; setSettings(recipe.settings); history.current = [clone(recipe.settings)]; historyIndex.current = 0; setPresets(loaded); if (isEdited(recipe.settings)) requestPreview(selected, recipe.settings); }).catch((reason) => active && setError(String(reason))); return () => { active = false; }; }, [cancelPreview, requestPreview, selected, selectedId]);
   useEffect(() => () => { if (groupTimer.current !== null) window.clearTimeout(groupTimer.current); if (saveTimer.current !== null) window.clearTimeout(saveTimer.current); }, []);
-  useEffect(() => {
-    const handler = (event: KeyboardEvent) => {
-      const element = event.target as HTMLElement | null;
-      if (!selected || element?.matches("input,textarea,select") || element?.isContentEditable) return;
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); return; }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") { event.preventDefault(); copiedSettings = copySettings(latest.current); setHasClipboard(true); return; }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") { event.preventDefault(); if (copiedSettings) change(copySettings(copiedSettings)); return; }
-      if (event.code === "Backslash") { event.preventDefault(); setBefore((value) => !value); return; }
-      if (event.key === "0") { event.preventDefault(); setZoom(1); setPan({ x: 0, y: 0 }); return; }
-      if (event.key === "1") { event.preventDefault(); setZoom(1.75); setPan({ x: 0, y: 0 }); return; }
-      if (event.key === "r") { event.preventDefault(); change(copySettings(neutralAdjustments)); return; }
-      const index = assets.findIndex((asset) => asset.id === selected.id);
-      if (event.key === "ArrowLeft" && assets[index - 1]) { event.preventDefault(); onSelect(assets[index - 1]); }
-      if (event.key === "ArrowRight" && assets[index + 1]) { event.preventDefault(); onSelect(assets[index + 1]); }
-    };
-    window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
-  }, [assets, selected, settings]);
-
+  useEffect(() => { const handler = (event: KeyboardEvent) => { const target = event.target as HTMLElement | null; if (!selected || target?.matches("input,textarea,select") || target?.isContentEditable) return; if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") { event.preventDefault(); copiedSettings = clone(latest.current); setHasClipboard(true); } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v" && copiedSettings) { event.preventDefault(); change(clone(copiedSettings)); } else if (event.code === "Backslash") { event.preventDefault(); setBefore((value) => !value); } else if (event.key === "r") { event.preventDefault(); commit(clone(neutralAdjustments)); } else { const index = assets.findIndex((asset) => asset.id === selected.id); if (event.key === "ArrowLeft" && assets[index - 1]) onSelect(assets[index - 1]); if (event.key === "ArrowRight" && assets[index + 1]) onSelect(assets[index + 1]); } }; window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler); }, [assets, selected]);
   if (!selected) return <main className="view empty-state"><Eye size={42} /><h2>Choose a photograph to develop</h2></main>;
-  const fallbackFilter = previewUrl || before ? undefined : { filter: `brightness(${Math.pow(2, settings.exposure)}) contrast(${1 + settings.contrast / 150}) saturate(${1 + settings.saturation / 100})` };
-  const source = before ? selected.previewUrl : previewUrl || selected.previewUrl;
-  return <main className="view develop-view">
-    <section className="develop-stage" onWheel={(event) => { event.preventDefault(); setZoom((value) => Math.max(0.5, Math.min(4, value + (event.deltaY < 0 ? .15 : -.15)))); }}>
-      <div className="develop-toolbar"><span className="eyebrow">Non-destructive Develop</span><strong>{selected.filename}</strong><span className={recipeEdited ? "edited-state" : "edited-state neutral"}>{recipeEdited ? "Edited" : "As shot"}</span></div>
-      <div className="develop-canvas" onPointerDown={(event) => zoom > 1 && setDrag({ x: event.clientX, y: event.clientY, pan })} onPointerMove={(event) => drag && setPan({ x: drag.pan.x + event.clientX - drag.x, y: drag.pan.y + event.clientY - drag.y })} onPointerUp={() => setDrag(null)} onPointerLeave={() => setDrag(null)}>
-        <img src={source} alt={selected.filename} draggable={false} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, ...fallbackFilter }} />
-        {cropping && !before && zoom === 1 ? <CropOverlay value={settings} onChange={(part) => replace({ ...latest.current, ...part })} /> : null}
-      </div>
-      <div className="develop-actions"><button type="button" aria-pressed={before} onPointerDown={() => setBefore(true)} onPointerUp={() => setBefore(false)} onPointerLeave={() => setBefore(false)} onClick={() => setBefore((value) => !value)}><Eye size={15} /> Original <kbd>\</kbd></button><button type="button" onClick={undo} title="Undo Develop change"><Undo2 size={15} /> Undo</button><button type="button" onClick={redo} title="Redo Develop change"><Redo2 size={15} /> Redo</button><button type="button" onClick={() => { copiedSettings = copySettings(settings); setHasClipboard(true); }}><Clipboard size={15} /> Copy settings</button><button type="button" disabled={!hasClipboard} onClick={() => copiedSettings && change(copySettings(copiedSettings))}><ClipboardPaste size={15} /> Paste settings</button><button type="button" aria-pressed={cropping} onClick={() => setCropping((value) => !value)}>Crop</button><button type="button" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}><Maximize2 size={15} /> Fit <kbd>0</kbd></button><button type="button" onClick={() => setZoom(1.75)}><ZoomIn size={15} /> 100% <kbd>1</kbd></button><button type="button" onClick={() => setZoom((value) => Math.max(.5, value - .25))}><Minus size={15} /> Zoom</button></div>
-    </section>
-    <aside className="develop-panel">
-      <div className="develop-panel-heading"><div><span className="eyebrow">Settings</span><h2>Develop</h2></div><button type="button" title="Reset all Develop settings" onClick={() => change(copySettings(neutralAdjustments))}><RotateCcw size={16} /> Reset all <kbd>R</kbd></button></div>
-      <p className="develop-note">Edits are saved as a compact catalogue recipe. The original file is never changed.</p>
-      <PhotoAdjustmentControls value={settings} onChange={(key, value) => change({ ...latest.current, [key]: value })} onReplace={replace} />
-      {error ? <p className="develop-error" role="alert">Develop preview: {error}</p> : null}
-      <button className="primary-button full" type="button" onClick={() => void onExport(selected)}>Export full-resolution edit</button>
-      <p className="develop-shortcuts">Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z redo · Ctrl/Cmd+C/V copy/paste · \ original · 0 fit · 1 100%</p>
-    </aside>
+  const source = before ? selected.previewUrl : previewUrl || selected.previewUrl; const fallbackFilter = previewUrl || before ? undefined : { filter: `brightness(${Math.pow(2, displayed.exposure)}) contrast(${1 + displayed.contrast / 150}) saturate(${1 + displayed.saturation / 100})` };
+  const analyse = async () => { const token = ++analysisToken.current; setAnalysing(true); try { const next = await api.proposeDevelopAuto(selected.id, latest.current); if (token !== analysisToken.current) return; setProposal(next); stage(next.settings, "Auto proposal", next.explanation); } catch (reason) { if (token === analysisToken.current) setError(String(reason)); } finally { if (token === analysisToken.current) setAnalysing(false); } };
+  const savePreset = async () => { if (!presetName.trim()) return; try { await api.saveDevelopPreset({ schemaVersion: 1, id: crypto.randomUUID(), name: presetName.trim(), categories: presetCategories, settings: clone(settings), builtIn: false }); setPresetName(""); refreshPresets(); } catch (reason) { setError(String(reason)); } };
+  const renamePreset = async (preset: DevelopPreset) => { const name = window.prompt("Rename Develop preset", preset.name)?.trim(); if (!name || name === preset.name) return; try { await api.saveDevelopPreset({ ...preset, name, builtIn: false }); refreshPresets(); } catch (reason) { setError(String(reason)); } };
+  return <main className="view develop-view"><section className="develop-stage" onWheel={(event) => { event.preventDefault(); setZoom((value) => Math.max(.5, Math.min(4, value + (event.deltaY < 0 ? .15 : -.15)))); }}><div className="develop-toolbar"><span className="eyebrow">Non-destructive Develop</span><strong>{selected.filename}</strong><span className={isEdited(settings) ? "edited-state" : "edited-state neutral"}>{isEdited(settings) ? "Edited" : "As shot"}</span></div><div className={`develop-canvas ${showClipping ? "show-clipping" : ""}`} onPointerDown={(event) => zoom > 1 && setDrag({ x: event.clientX, y: event.clientY, pan })} onPointerMove={(event) => drag && setPan({ x: drag.pan.x + event.clientX - drag.x, y: drag.pan.y + event.clientY - drag.y })} onPointerUp={() => setDrag(null)} onPointerLeave={() => setDrag(null)}><img src={source} alt={selected.filename} draggable={false} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, ...fallbackFilter }} />{cropping && !before && zoom === 1 ? <CropOverlay value={displayed} onChange={(part) => change({ ...latest.current, ...part })} /> : null}</div><div className="develop-actions"><button type="button" aria-pressed={before} onPointerDown={() => setBefore(true)} onPointerUp={() => setBefore(false)} onPointerLeave={() => setBefore(false)} onClick={() => setBefore((value) => !value)}><Eye size={15} /> Original</button><button type="button" onClick={undo}><Undo2 size={15} /> Undo</button><button type="button" onClick={redo}><Redo2 size={15} /> Redo</button><button type="button" onClick={() => { copiedSettings = clone(settings); setHasClipboard(true); }}><Clipboard size={15} /> Copy settings</button><button type="button" disabled={!hasClipboard} onClick={() => copiedSettings && change(clone(copiedSettings))}><ClipboardPaste size={15} /> Paste settings</button><button type="button" aria-pressed={cropping} onClick={() => setCropping((value) => !value)}>Crop</button><button type="button" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}><Maximize2 size={15} /> Fit</button><button type="button" onClick={() => setZoom(1.75)}><ZoomIn size={15} /> 100%</button><button type="button" onClick={() => setZoom((value) => Math.max(.5, value - .25))}><Minus size={15} /> Zoom</button></div></section>
+    <aside className="develop-panel"><div className="develop-panel-heading"><div><span className="eyebrow">Settings</span><h2>Develop</h2></div><button type="button" onClick={() => commit(clone(neutralAdjustments))}><RotateCcw size={16} /> Reset all</button></div><p className="develop-note">Auto and presets are previews until you apply them. The original file is never changed.</p><Histogram src={source} /><section className="develop-assistant"><div><span className="eyebrow">Local assistant</span><h3>Auto</h3></div><button className="primary-button" type="button" disabled={analysing || Boolean(staged)} onClick={() => void analyse()}><Sparkles size={15} /> {analysing ? "Analysing…" : "Analyse photo"}</button><p>{proposal ? `Confidence ${Math.round(proposal.confidence * 100)}%; source analysis is applied relative to the current recipe.` : "Uses bounded local statistics; no cloud or model is required."}</p></section>{staged ? <section className="develop-proposal" aria-label="Pending Develop proposal"><strong>{staged.title}</strong>{staged.detail?.map((line) => <p key={line}>{line}</p>)}{proposal?.recommendations.length ? <p>Suggested looks: {proposal.recommendations.join(", ")}</p> : null}<div><button className="primary-button" type="button" onClick={() => commit(staged.settings)}>Apply</button><button type="button" onClick={() => { analysisToken.current += 1; setStaged(null); setProposal(null); if (isEdited(settings)) requestPreview(selected, settings); else setPreviewUrl(null); }}>Cancel</button></div></section> : null}
+      <section className="develop-presets"><div className="develop-section-heading"><div><span className="eyebrow">Presets</span><h3>Looks</h3></div><button type="button" onClick={() => void api.importDevelopPreset().then((item) => { if (item) refreshPresets(); }).catch((reason) => setError(String(reason)))}>Import</button></div><div className="preset-grid">{presets.map((preset) => <div className="preset-entry" key={preset.id}><button type="button" disabled={Boolean(staged)} onClick={() => stage(applyPreset(settings, preset), `${preset.name} preview`)}>{preset.name}</button><button type="button" title={`Export ${preset.name}`} onClick={() => void api.exportDevelopPreset(preset.id).catch((reason) => setError(String(reason)))}>⇩</button>{!preset.builtIn ? <><button type="button" title={`Rename ${preset.name}`} onClick={() => void renamePreset(preset)}>✎</button><button type="button" title={`Delete ${preset.name}`} onClick={() => void api.deleteDevelopPreset(preset.id).then(refreshPresets).catch((reason) => setError(String(reason)))}>×</button></> : null}</div>)}</div><div className="preset-save"><input aria-label="New preset name" value={presetName} maxLength={80} placeholder="Save current settings as…" onChange={(event) => setPresetName(event.target.value)} /><div>{categoryOptions.map((category) => <label key={category}><input type="checkbox" checked={presetCategories.includes(category)} onChange={() => setPresetCategories((current) => current.includes(category) ? current.filter((item) => item !== category) : [...current, category])} /> {category === "whiteBalance" ? "WB" : category}</label>)}</div><button type="button" disabled={!presetName.trim() || !presetCategories.length} onClick={() => void savePreset()}>Save preset</button></div></section><label className="clipping-toggle"><input type="checkbox" checked={showClipping} onChange={(event) => setShowClipping(event.target.checked)} /> Show clipping guide</label><PhotoAdjustmentControls value={displayed} onChange={(key, value) => change({ ...latest.current, [key]: value })} onReplace={change} />{error ? <p className="develop-error" role="alert">Develop: {error}</p> : null}<button className="primary-button full" type="button" onClick={() => void onExport(selected)}>Export full-resolution edit</button><p className="develop-shortcuts">Ctrl/Cmd+Z undo · Ctrl/Cmd+C/V copy/paste · manual controls always remain available.</p></aside>
   </main>;
 }

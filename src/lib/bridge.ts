@@ -1,13 +1,17 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type DevelopRecipe, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchJob, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
 let browserAssets = structuredClone(demoAssets);
 const browserDevelopRecipes = new Map<string, DevelopRecipe>();
+let browserDevelopPresets: DevelopPreset[] = [];
+const browserBuiltInDevelopPresets: DevelopPreset[] = [
+  ["natural", "Natural", {}], ["clean", "Clean", { contrast: 4, clarity: 3, colourBoost: 3 }], ["warm", "Warm", { lightBalance: 14, tint: 2, colourBoost: 6 }], ["cool", "Cool", { lightBalance: -12, tint: -2, highlights: -8 }], ["high-contrast", "High Contrast", { contrast: 20, whites: 8, blacks: -10 }], ["soft-contrast", "Soft Contrast", { contrast: -14, highlights: -12, shadows: 12 }], ["vivid", "Vivid", { contrast: 8, colourBoost: 20, saturation: 5 }], ["muted", "Muted", { contrast: -4, colourBoost: -8, saturation: -22 }], ["portrait", "Portrait", { highlights: -10, shadows: 8, texture: -12, clarity: -5, colourBoost: 5 }], ["landscape", "Landscape", { contrast: 10, dehaze: 7, clarity: 8, colourBoost: 15 }], ["black-and-white", "Black & White", { contrast: 10, clarity: 4, saturation: -100 }], ["high-key-bw", "High-Key B&W", { exposure: .45, contrast: -8, shadows: 18, blacks: 10, saturation: -100 }], ["low-key-bw", "Low-Key B&W", { exposure: -.45, contrast: 18, highlights: -15, blacks: -18, saturation: -100 }],
+].map(([id, name, changes]) => ({ schemaVersion: 1, id: id as string, name: name as string, categories: ["whiteBalance", "tone", "presence", "colour"], settings: { ...neutralAdjustments, ...(changes as Partial<BasicAdjustments>) }, builtIn: true }));
 let browserJobs = structuredClone(demoJobs);
 const browserTrash = new Set<string>();
 type BrowserHistory =
@@ -303,6 +307,26 @@ export const api = {
   },
   async previewDevelopRecipe(assetId: string, recipe: DevelopRecipe): Promise<string> {
     return tauri() ? convertFileSrc(await invoke<string>("preview_develop_recipe", { assetId, recipe })) : "";
+  },
+  async developPresets(): Promise<DevelopPreset[]> { return tauri() ? invoke("list_develop_presets") : structuredClone([...browserBuiltInDevelopPresets, ...browserDevelopPresets]); },
+  async saveDevelopPreset(preset: DevelopPreset): Promise<DevelopPreset> {
+    if (tauri()) return invoke("save_develop_preset", { preset });
+    const stored = { ...structuredClone(preset), builtIn: false }; browserDevelopPresets = [...browserDevelopPresets.filter((entry) => entry.id !== stored.id && entry.name.toLowerCase() !== stored.name.toLowerCase()), stored]; return stored;
+  },
+  async deleteDevelopPreset(id: string): Promise<void> { if (tauri()) return invoke("delete_develop_preset", { id }); browserDevelopPresets = browserDevelopPresets.filter((preset) => preset.id !== id); },
+  async exportDevelopPreset(id: string): Promise<void> {
+    if (!tauri()) return;
+    const path = await save({ title: "Export Develop preset", defaultPath: "keepframe-preset.keepframe-preset", filters: [{ name: "Keepframe preset", extensions: ["keepframe-preset"] }] });
+    if (typeof path === "string") await invoke("export_develop_preset", { id, path });
+  },
+  async importDevelopPreset(): Promise<DevelopPreset | null> {
+    if (!tauri()) return null;
+    const path = await open({ multiple: false, directory: false, title: "Import Develop preset", filters: [{ name: "Keepframe preset", extensions: ["keepframe-preset"] }] });
+    return typeof path === "string" ? invoke("import_develop_preset", { path }) : null;
+  },
+  async proposeDevelopAuto(assetId: string, current: BasicAdjustments): Promise<AutoProposal> {
+    if (tauri()) return invoke("propose_develop_auto", { assetId, current });
+    return { settings: { ...current, exposure: Math.min(3, current.exposure + .25), highlights: Math.max(-100, current.highlights - 12), shadows: Math.min(100, current.shadows + 10) }, explanation: ["Exposure increased because midtones were under-represented.", "Highlights reduced because clipping was detected.", "White balance unchanged because no reliable neutral estimate was found."], confidence: .72, statistics: { luminanceBins: [], redBins: [], greenBins: [], blueBins: [], samples: 0, averageLuminance: .38, p01: .03, p50: .35, p99: .95, shadowClipFraction: .02, highlightClipFraction: .01, averageSaturation: .26, redGreenBlue: [.4, .38, .36], dynamicRange: .92 }, recommendations: ["Landscape"] };
   },
   async chooseReplacement(asset: Asset): Promise<AssetVersion | null> {
     if (!tauri()) return null;
