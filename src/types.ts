@@ -193,15 +193,30 @@ export const neutralLocalAdjustments: LocalAdjustments = {
   lightBalance: 0, tint: 0, saturation: 0, clarity: 0, dehaze: 0, texture: 0,
 };
 export type BrushStroke = { points: MaskPoint[]; radius: number; feather: number; flow: number; erase: boolean };
+export type IntelligentMaskCategory = "subject" | "people" | "sky";
+export type MaskProvenance = {
+  provider: string; providerVersion: string; model: string; modelRevision: string;
+  modelSha256: string; category: IntelligentMaskCategory; executionProvider: string;
+};
 export type MaskGeometry =
   | { kind: "linear"; start: MaskPoint; end: MaskPoint }
   | { kind: "radial"; centre: MaskPoint; radiusX: number; radiusY: number; rotation: number }
-  | { kind: "brush"; strokes: BrushStroke[] };
+  | { kind: "brush"; strokes: BrushStroke[] }
+  | { kind: "semantic"; width: number; height: number; coveragePng: string; checksum: string; provenance: MaskProvenance; refinements: BrushStroke[] };
 export type DevelopMask = {
   id: string; name: string; enabled: boolean; inverted: boolean; opacity: number; feather: number;
   geometry: MaskGeometry; adjustments: LocalAdjustments;
 };
 export type DevelopRecipe = { schemaVersion: 2; settings: BasicAdjustments; masks: DevelopMask[] };
+export type IntelligentMaskHealth = {
+  available: boolean; installed: boolean; runtimeAvailable: boolean; loaded: boolean; busy: boolean;
+  provider: string; providerVersion: string; model: string; modelRevision: string; licence: string;
+  source: string; approximateBytes: number; storagePath: string; executionProvider: string; detail: string;
+};
+export type IntelligentMaskProposal = {
+  requestId: number; category: IntelligentMaskCategory; confidence: number; coverageFraction: number;
+  elapsedMs: number; timings: { loadMs: number; preprocessMs: number; inferenceMs: number; postprocessMs: number }; mask: DevelopMask;
+};
 export type PresetCategory = "whiteBalance" | "tone" | "presence" | "colour";
 export type DevelopPreset = { schemaVersion: 1; id: string; name: string; categories: PresetCategory[]; settings: BasicAdjustments; builtIn: boolean };
 export type ImageStatistics = { luminanceBins: number[]; redBins: number[]; greenBins: number[]; blueBins: number[]; samples: number; averageLuminance: number; p01: number; p50: number; p99: number; shadowClipFraction: number; highlightClipFraction: number; averageSaturation: number; redGreenBlue: [number, number, number]; dynamicRange: number };

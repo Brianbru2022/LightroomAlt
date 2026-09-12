@@ -3,15 +3,15 @@
 //! These routines deliberately never change image pixels.  Sidecars and catalogue
 //! exports are staged before promotion, and any relink is hash-confirmed.
 
-use super::{hash_file, normalise_tags, KeepframeError, Result};
+use super::{hash_file, normalise_tags, DevelopRecipe, KeepframeError, Result};
 use chrono::Utc;
 use quick_xml::{events::Event, Reader};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::json;
-use std::{collections::{HashMap, HashSet}, fs, io::{BufWriter, Write}, path::{Path, PathBuf}};
+use std::{collections::{HashMap, HashSet}, fs, io::{BufWriter, Write}, path::{Path, PathBuf},};
 
-pub(crate) const PORTABLE_CATALOGUE_SCHEMA_VERSION: i64 = 1;
+pub(crate) const PORTABLE_CATALOGUE_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,9 +94,10 @@ fn xml_safe(value: &str) -> String {
         '<' => "&lt;".chars().collect(),
         '>' => "&gt;".chars().collect(),
         '\"' => "&quot;".chars().collect(),
-        '\'' => "&apos;".chars().collect(),
-        _ => vec![character],
-    }).collect()
+            '\'' => "&apos;".chars().collect(),
+            _ => vec![character],
+        })
+        .collect()
 }
 
 fn validate_xml(bytes: &[u8]) -> Result<()> {
@@ -107,12 +108,24 @@ fn validate_xml(bytes: &[u8]) -> Result<()> {
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) if depth == 0 => return Ok(()),
-            Ok(Event::Eof) => return Err(KeepframeError::Message("XMP ended before all elements were closed.".into())),
+            Ok(Event::Eof) => {
+                return Err(KeepframeError::Message(
+                    "XMP ended before all elements were closed.".into(),
+                ))
+            }
             Ok(Event::Start(_)) => depth += 1,
             Ok(Event::End(_)) if depth > 0 => depth -= 1,
-            Ok(Event::End(_)) => return Err(KeepframeError::Message("XMP contains an unexpected closing element.".into())),
-            Ok(_) => {},
-            Err(error) => return Err(KeepframeError::Message(format!("Generated XMP failed XML validation: {error}"))),
+            Ok(Event::End(_)) => {
+                return Err(KeepframeError::Message(
+                    "XMP contains an unexpected closing element.".into(),
+                ))
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(KeepframeError::Message(format!(
+                    "Generated XMP failed XML validation: {error}"
+                )))
+            }
         }
         buffer.clear();
     }
@@ -131,15 +144,30 @@ fn read_asset(connection: &Connection, asset_id: &str) -> Result<SidecarAsset> {
 }
 
 fn xmp_for(asset: &SidecarAsset) -> Vec<u8> {
-    let portable_label = match asset.decision.as_str() { "keep" => "Keep", "discard" => "Discard", _ => "Undecided" };
-    let tags = asset.tags.iter().map(|tag| format!("<rdf:li>{}</rdf:li>", xml_safe(tag))).collect::<String>();
-    let hierarchy = asset.tags.iter().filter(|tag| tag.contains('/')).map(|tag| format!("<rdf:li>{}</rdf:li>", xml_safe(tag))).collect::<String>();
+    let portable_label = match asset.decision.as_str() {
+        "keep" => "Keep",
+        "discard" => "Discard",
+        _ => "Undecided",
+    };
+    let tags = asset
+        .tags
+        .iter()
+        .map(|tag| format!("<rdf:li>{}</rdf:li>", xml_safe(tag)))
+        .collect::<String>();
+    let hierarchy = asset
+        .tags
+        .iter()
+        .filter(|tag| tag.contains('/'))
+        .map(|tag| format!("<rdf:li>{}</rdf:li>", xml_safe(tag)))
+        .collect::<String>();
     let location = match (asset.latitude, asset.longitude) {
         (Some(latitude), Some(longitude)) => format!("<exif:GPSLatitude>{latitude:.8}</exif:GPSLatitude><exif:GPSLongitude>{longitude:.8}</exif:GPSLongitude>"),
         _ => String::new(),
     };
     let provenance = [
-        asset.embedded_latitude.map(|value| format!(" keepframe:embeddedLatitude=\"{value:.8}\"")),
+        asset
+            .embedded_latitude
+            .map(|value| format!(" keepframe:embeddedLatitude=\"{value:.8}\"")),
         asset.embedded_longitude.map(|value| format!(" keepframe:embeddedLongitude=\"{value:.8}\"")),
         asset.manual_latitude.map(|value| format!(" keepframe:manualLatitude=\"{value:.8}\"")),
         asset.manual_longitude.map(|value| format!(" keepframe:manualLongitude=\"{value:.8}\"")),
@@ -152,9 +180,11 @@ fn xmp_for(asset: &SidecarAsset) -> Vec<u8> {
 fn staged_write(destination: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     validate_xml(bytes)?;
     let temporary = destination.with_extension("xmp.partial");
-    fs::write(&temporary, bytes).map_err(|error| KeepframeError::Message(format!("Could not stage XMP sidecar {}: {error}", temporary.display())))?;
-    fs::OpenOptions::new().read(true).write(true).open(&temporary).map_err(|error| KeepframeError::Message(format!("Could not validate staged XMP sidecar {}: {error}", temporary.display())))?.sync_all()?;
-    if destination.exists() && !replace { let _ = fs::remove_file(&temporary); return Err(KeepframeError::Message("An XMP sidecar already exists; choose replace explicitly to update it.".into())); }
+    fs::write(&temporary, bytes).map_err(|error| { KeepframeError::Message(format!("Could not stage XMP sidecar {}: {error}", temporary.display()))
+    })?;
+    fs::OpenOptions::new().read(true).write(true).open(&temporary).map_err(|error| { KeepframeError::Message(format!("Could not validate staged XMP sidecar {}: {error}", temporary.display()))
+        })?.sync_all()?;
+    if destination.exists() && !replace { let _ = fs::remove_file(&temporary); return Err(KeepframeError::Message("An XMP sidecar already exists; choose replace explicitly to update it.".into(),)); }
     if destination.exists() {
         let backup = destination.with_extension("xmp.keepframe-backup");
         if backup.exists() { fs::remove_file(&backup)?; }
@@ -164,14 +194,15 @@ fn staged_write(destination: &Path, bytes: &[u8], replace: bool) -> Result<()> {
             return Err(KeepframeError::Io(error));
         }
         fs::remove_file(backup)?;
-    } else { fs::rename(&temporary, destination).map_err(|error| KeepframeError::Message(format!("Could not promote staged XMP sidecar {}: {error}", destination.display())))?; }
+    } else { fs::rename(&temporary, destination).map_err(|error| { KeepframeError::Message(format!("Could not promote staged XMP sidecar {}: {error}", destination.display()))
+        })?; }
     Ok(())
 }
 
-pub(crate) fn export_sidecars(connection: &mut Connection, asset_ids: &[String], replace: bool) -> Result<SidecarExportSummary> {
+pub(crate) fn export_sidecars(connection: &mut Connection, asset_ids: &[String], replace: bool,) -> Result<SidecarExportSummary> {
     let mut unique = HashSet::new();
     let ids = asset_ids.iter().filter(|id| unique.insert(id.as_str())).collect::<Vec<_>>();
-    let mut result = SidecarExportSummary { requested: ids.len(), written: 0, preserved_existing: 0, failed: Vec::new() };
+    let mut result = SidecarExportSummary { requested: ids.len(), written: 0, preserved_existing: 0, failed: Vec::new(), };
     for id in ids {
         let asset = match read_asset(connection, id) { Ok(asset) => asset, Err(error) => { result.failed.push(format!("{id}: {error}")); continue; } };
         if !asset.original_path.is_file() { result.failed.push(format!("{}: original representation is unavailable", asset.filename)); continue; }
@@ -195,7 +226,8 @@ fn local_name(name: &[u8]) -> String { String::from_utf8_lossy(name).rsplit(':')
 fn parse_coordinate(value: &str) -> Option<f64> { value.trim().parse::<f64>().ok().filter(|value| value.is_finite()) }
 
 fn parse_xmp(bytes: &[u8]) -> Result<SidecarMetadata> {
-    validate_xml(bytes).map_err(|error| KeepframeError::Message(format!("The XMP sidecar is malformed: {error}")))?;
+    validate_xml(bytes).map_err(|error| { KeepframeError::Message(format!("The XMP sidecar is malformed: {error}"))
+    })?;
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
@@ -211,19 +243,22 @@ fn parse_xmp(bytes: &[u8]) -> Result<SidecarMetadata> {
                 if raw_name.ends_with("dc:subject") { in_subject = true; }
                 if raw_name.ends_with("hierarchicalsubject") { in_hierarchy = true; }
                 for attribute in event.attributes().with_checks(true) {
-                    let attribute = attribute.map_err(|error| KeepframeError::Message(format!("Malformed XMP attribute: {error}")))?;
+                    let attribute = attribute.map_err(|error| { KeepframeError::Message(format!("Malformed XMP attribute: {error}"))
+                    })?;
                     let key = String::from_utf8_lossy(attribute.key.as_ref()).to_ascii_lowercase();
-                    let value = attribute.unescape_value().map_err(|error| KeepframeError::Message(format!("Malformed XMP value: {error}")))?.into_owned();
+                    let value = attribute.unescape_value().map_err(|error| { KeepframeError::Message(format!("Malformed XMP value: {error}"))
+                        })?.into_owned();
                     if key.ends_with("triage") { metadata.decision = Some(value.clone()); }
                     if key.ends_with("locationsource") { metadata.location_source = Some(value.clone()); }
                     if key.ends_with("gpslatitude") { metadata.latitude = parse_coordinate(&value); }
                     if key.ends_with("gpslongitude") { metadata.longitude = parse_coordinate(&value); }
-                    if key.ends_with("label") && metadata.decision.is_none() { metadata.decision = match value.to_ascii_lowercase().as_str() { "keep" => Some("keep".into()), "discard" => Some("discard".into()), "undecided" => Some("undecided".into()), _ => None }; }
+                    if key.ends_with("label") && metadata.decision.is_none() { metadata.decision = match value.to_ascii_lowercase().as_str() { "keep" => Some("keep".into()), "discard" => Some("discard".into()), "undecided" => Some("undecided".into()), _ => None, }; }
                 }
                 current = name;
             }
             Ok(Event::Text(event)) => {
-                let value = event.unescape().map_err(|error| KeepframeError::Message(format!("Malformed XMP text: {error}")))?.into_owned();
+                let value = event.unescape().map_err(|error| { KeepframeError::Message(format!("Malformed XMP text: {error}"))
+                    })?.into_owned();
                 if in_hierarchy && current == "li" { metadata.hierarchy.push(value); }
                 else if in_subject && current == "li" { metadata.tags.push(value); }
                 else if current == "gpslatitude" { metadata.latitude = parse_coordinate(&value); }
@@ -236,21 +271,23 @@ fn parse_xmp(bytes: &[u8]) -> Result<SidecarMetadata> {
                 current.clear();
             }
             Ok(Event::Eof) => break,
-            Ok(_) => {},
-            Err(error) => return Err(KeepframeError::Message(format!("The XMP sidecar is malformed: {error}"))),
+            Ok(_) => {}
+            Err(error) => { return Err(KeepframeError::Message(format!("The XMP sidecar is malformed: {error}")))
+            }
         }
         buffer.clear();
     }
     Ok(metadata)
 }
 
-pub(crate) fn import_sidecar(connection: &mut Connection, asset_id: &str) -> Result<SidecarImportResult> {
+pub(crate) fn import_sidecar(connection: &mut Connection, asset_id: &str,) -> Result<SidecarImportResult> {
     let asset = read_asset(connection, asset_id)?;
     let path = sidecar_path(&asset.original_path);
-    let metadata = parse_xmp(&fs::read(&path).map_err(|_| KeepframeError::Message("No readable XMP sidecar exists beside this original.".into()))?)?;
-    let mut result = SidecarImportResult { tags_imported: false, location_imported: false, triage_imported: false, conflicts: Vec::new() };
+    let metadata = parse_xmp(&fs::read(&path).map_err(|_| { KeepframeError::Message("No readable XMP sidecar exists beside this original.".into())
+    })?)?;
+    let mut result = SidecarImportResult { tags_imported: false, location_imported: false, triage_imported: false, conflicts: Vec::new(), };
     let old_tags = asset.tags;
-    let tags = normalise_tags(metadata.tags.into_iter().chain(metadata.hierarchy).collect());
+    let tags = normalise_tags(metadata.tags.into_iter().chain(metadata.hierarchy).collect(),);
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if !tags.is_empty() { if old_tags.is_empty() {
         super::replace_asset_tags(&tx, asset_id, &tags)?; result.tags_imported = true;
@@ -262,11 +299,11 @@ pub(crate) fn import_sidecar(connection: &mut Connection, asset_id: &str) -> Res
             if manual { tx.execute("UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?2,manual_longitude=?3,location_source='manual' WHERE id=?1", params![asset_id,latitude,longitude])?; }
             else { tx.execute("UPDATE assets SET latitude=?2,longitude=?3,embedded_latitude=?2,embedded_longitude=?3,location_source='embedded' WHERE id=?1", params![asset_id,latitude,longitude])?; }
             result.location_imported = true;
-        } else if asset.latitude != Some(latitude) || asset.longitude != Some(longitude) { result.conflicts.push("Catalogue location already exists; sidecar location was not applied.".into()); }
+        } else if asset.latitude != Some(latitude) || asset.longitude != Some(longitude) { result.conflicts.push("Catalogue location already exists; sidecar location was not applied.".into(),); }
     }
     if let Some(decision) = metadata.decision.filter(|value| matches!(value.as_str(), "keep" | "undecided" | "discard")) {
-        if asset.decision == "undecided" && decision != "undecided" { tx.execute("UPDATE assets SET decision=?2 WHERE id=?1", params![asset_id,decision])?; result.triage_imported = true; }
-        else if asset.decision != decision { result.conflicts.push("Catalogue triage state already exists; sidecar triage was not applied.".into()); }
+        if asset.decision == "undecided" && decision != "undecided" { tx.execute("UPDATE assets SET decision=?2 WHERE id=?1", params![asset_id,decision],)?; result.triage_imported = true; }
+        else if asset.decision != decision { result.conflicts.push("Catalogue triage state already exists; sidecar triage was not applied.".into(),); }
     }
     if result.tags_imported || result.location_imported || result.triage_imported { tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'xmp_import',?2,?3,?4)", params![asset_id,json!({"tags":old_tags,"latitude":asset.latitude,"longitude":asset.longitude,"decision":asset.decision}).to_string(),json!({"tagsImported":result.tags_imported,"locationImported":result.location_imported,"triageImported":result.triage_imported}).to_string(),Utc::now().to_rfc3339()])?; }
     tx.commit()?;
@@ -275,45 +312,51 @@ pub(crate) fn import_sidecar(connection: &mut Connection, asset_id: &str) -> Res
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PortableVersion { id: String, kind: String, provider: Option<String>, state: String, created_at: String, source_hash: Option<String>, output_hash: Option<String>, relative_path: Option<String> }
+struct PortableVersion { id: String, kind: String, provider: Option<String>, state: String, created_at: String, source_hash: Option<String>, output_hash: Option<String>, relative_path: Option<String>, }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PortableAsset { id: String, filename: String, decision: String, captured_at: String, date_fallback: bool, camera: Option<String>, width: Option<i64>, height: Option<i64>, tags: Vec<String>, location: serde_json::Value, original: serde_json::Value, derived_versions: Vec<PortableVersion> }
+struct PortableAsset { id: String, filename: String, decision: String, captured_at: String, date_fallback: bool, camera: Option<String>, width: Option<i64>, height: Option<i64>, tags: Vec<String>, location: serde_json::Value, original: serde_json::Value,
+    develop_recipe: Option<serde_json::Value>, derived_versions: Vec<PortableVersion>, }
 
 fn relative_or_absolute(root: &Path, path: &str) -> Option<String> { Path::new(path).strip_prefix(root).ok().map(|relative| relative.to_string_lossy().replace('\\', "/")) }
 
 fn rebase_managed_path(root: &Path, path: &Path, anchors: &[&str]) -> Option<PathBuf> {
     let components = path.components().map(|component| component.as_os_str().to_owned()).collect::<Vec<_>>();
-    let index = components.iter().position(|component| anchors.iter().any(|anchor| component.to_string_lossy().eq_ignore_ascii_case(anchor)))?;
-    let candidate = components[index..].iter().fold(root.to_path_buf(), |joined, component| joined.join(component));
+    let index = components.iter().position(|component| { anchors.iter().any(|anchor| component.to_string_lossy().eq_ignore_ascii_case(anchor))
+    })?;
+    let candidate = components[index..].iter().fold(root.to_path_buf(), |joined, component| { joined.join(component)
+        });
     candidate.is_file().then_some(candidate)
 }
 
 /// Rebase only paths that can be verified inside a moved managed library.  This
 /// never searches arbitrary folders or accepts a non-matching hash.
-pub(crate) fn recover_moved_managed_paths(connection: &mut Connection, root: &Path) -> Result<usize> {
+pub(crate) fn recover_moved_managed_paths(connection: &mut Connection, root: &Path,) -> Result<usize> {
     let mut updates = 0usize;
-    let representations = connection.prepare("SELECT id,path,sha256 FROM representations")?.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?)))?
+    let representations = connection.prepare("SELECT id,path,sha256 FROM representations")?.query_map([], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (id, path, hash) in representations {
         if Path::new(&path).is_file() { continue; }
         let Some(candidate) = rebase_managed_path(root, Path::new(&path), &["Originals", "Edits"]) else { continue; };
-        if hash_file(&candidate)? == hash { tx.execute("UPDATE representations SET path=?2 WHERE id=?1", params![id,candidate.to_string_lossy()])?; updates += 1; }
+        if hash_file(&candidate)? == hash { tx.execute("UPDATE representations SET path=?2 WHERE id=?1", params![id,candidate.to_string_lossy()],)?; updates += 1; }
     }
-    let versions = tx.prepare("SELECT id,path,output_hash FROM versions WHERE output_hash IS NOT NULL")?.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?)))?
+    let versions = tx.prepare("SELECT id,path,output_hash FROM versions WHERE output_hash IS NOT NULL")?.query_map([], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for (id, path, hash) in versions {
         if Path::new(&path).is_file() { continue; }
         let Some(candidate) = rebase_managed_path(root, Path::new(&path), &["Edits"]) else { continue; };
-        if hash_file(&candidate)? == hash { tx.execute("UPDATE versions SET path=?2 WHERE id=?1", params![id,candidate.to_string_lossy()])?; updates += 1; }
+        if hash_file(&candidate)? == hash { tx.execute("UPDATE versions SET path=?2 WHERE id=?1", params![id,candidate.to_string_lossy()],)?; updates += 1; }
     }
-    let thumbnails = tx.prepare("SELECT id,thumbnail_path FROM assets")?.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?)))?
+    let thumbnails = tx.prepare("SELECT id,thumbnail_path FROM assets")?.query_map([], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for (id, path) in thumbnails {
         if !Path::new(&path).is_file() {
             if let Some(candidate) = rebase_managed_path(root, Path::new(&path), &[".keepframe"]) {
-                tx.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1", params![id,candidate.to_string_lossy()])?;
+                tx.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1", params![id,candidate.to_string_lossy()],)?;
                 updates += 1;
             }
         }
@@ -322,40 +365,66 @@ pub(crate) fn recover_moved_managed_paths(connection: &mut Connection, root: &Pa
     Ok(updates)
 }
 
-pub(crate) fn export_portable_catalogue(connection: &Connection, root: &Path, destination: &Path) -> Result<PathBuf> {
-    if !destination.is_dir() { return Err(KeepframeError::Message("Choose an existing folder for the portable catalogue export.".into())); }
-    let output = destination.join("keepframe-portable-catalogue-v1.json");
+pub(crate) fn export_portable_catalogue(connection: &Connection, root: &Path, destination: &Path,) -> Result<PathBuf> {
+    if !destination.is_dir() { return Err(KeepframeError::Message("Choose an existing folder for the portable catalogue export.".into(),)); }
+    let output = destination.join("keepframe-portable-catalogue-v2.json");
     let temporary = output.with_extension("json.partial");
     let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut tags = connection.prepare("SELECT at.asset_id,t.name FROM asset_tags at JOIN tags t ON t.id=at.tag_id ORDER BY at.asset_id,t.name COLLATE NOCASE")?;
-    for row in tags.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? { let (asset, tag) = row?; tag_map.entry(asset).or_default().push(tag); }
+    for row in tags.query_map([], |row| { Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? { let (asset, tag) = row?; tag_map.entry(asset).or_default().push(tag); }
     let mut version_map: HashMap<String, Vec<PortableVersion>> = HashMap::new();
     let mut versions = connection.prepare("SELECT asset_id,id,kind,provider,state,created_at,source_hash,output_hash,path FROM versions ORDER BY asset_id,created_at,id")?;
-    for row in versions.query_map([], |row| Ok((row.get::<_, String>(0)?, PortableVersion { id: row.get(1)?,kind: row.get(2)?,provider: row.get(3)?,state: row.get(4)?,created_at: row.get(5)?,source_hash: row.get(6)?,output_hash: row.get(7)?,relative_path: relative_or_absolute(root, &row.get::<_, String>(8)?)})))? { let (asset, version) = row?; version_map.entry(asset).or_default().push(version); }
+    for row in versions.query_map([], |row| { Ok((row.get::<_, String>(0)?, PortableVersion { id: row.get(1)?,kind: row.get(2)?,provider: row.get(3)?,state: row.get(4)?,created_at: row.get(5)?,source_hash: row.get(6)?,output_hash: row.get(7)?,relative_path: relative_or_absolute(root, &row.get::<_, String>(8)?),},))
+    })? { let (asset, version) = row?; version_map.entry(asset).or_default().push(version);
+    }
+    let mut recipe_map = HashMap::new();
+    let mut recipes =
+        connection.prepare("SELECT asset_id,recipe_json FROM develop_recipes ORDER BY asset_id")?;
+    for row in recipes.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (asset, recipe) = row?;
+        let value = serde_json::from_str::<DevelopRecipe>(&recipe)
+            .map_err(|error| {
+                KeepframeError::Message(format!(
+                    "Portable catalogue rejected an invalid Develop recipe for {asset}: {error}"
+                ))
+            })?
+            .validate()
+            .map_err(|error| {
+                KeepframeError::Message(format!(
+                    "Portable catalogue rejected an invalid Develop recipe for {asset}: {error}"
+                ))
+            })?;
+        recipe_map.insert(asset, serde_json::to_value(value)?); }
     let file = fs::File::create(&temporary)?;
     let mut writer = BufWriter::new(file);
     writer.write_all(format!("{{\"format\":\"keepframe-portable-catalogue\",\"schemaVersion\":{PORTABLE_CATALOGUE_SCHEMA_VERSION},\"exportedAt\":\"{}\",\"assets\":[", Utc::now().to_rfc3339()).as_bytes())?;
     let mut assets = connection.prepare("SELECT a.id,a.filename,a.decision,a.captured_at,a.date_fallback,a.camera,a.width,a.height,a.latitude,a.longitude,a.embedded_latitude,a.embedded_longitude,a.manual_latitude,a.manual_longitude,COALESCE(a.location_source,'none'),r.path,r.sha256,r.byte_size,r.extension,r.is_raw FROM assets a LEFT JOIN representations r ON r.id=(SELECT r2.id FROM representations r2 WHERE r2.asset_id=a.id ORDER BY r2.is_raw ASC,r2.path ASC LIMIT 1) ORDER BY a.captured_at DESC,a.id")?;
     let mut first = true;
-    for row in assets.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, i64>(4)?,row.get::<_, Option<String>>(5)?,row.get::<_, Option<i64>>(6)?,row.get::<_, Option<i64>>(7)?,row.get::<_, Option<f64>>(8)?,row.get::<_, Option<f64>>(9)?,row.get::<_, Option<f64>>(10)?,row.get::<_, Option<f64>>(11)?,row.get::<_, Option<f64>>(12)?,row.get::<_, Option<f64>>(13)?,row.get::<_, String>(14)?,row.get::<_, Option<String>>(15)?,row.get::<_, Option<String>>(16)?,row.get::<_, Option<i64>>(17)?,row.get::<_, Option<String>>(18)?,row.get::<_, Option<i64>>(19)?)))? {
-        let (id,filename,decision,captured_at,date_fallback,camera,width,height,latitude,longitude,embedded_latitude,embedded_longitude,manual_latitude,manual_longitude,location_source,path,sha256,byte_size,extension,is_raw) = row?;
-        let record = PortableAsset { id: id.clone(), filename, decision, captured_at, date_fallback: date_fallback != 0, camera, width, height, tags: tag_map.remove(&id).unwrap_or_default(), location: json!({"latitude":latitude,"longitude":longitude,"source":location_source,"embeddedLatitude":embedded_latitude,"embeddedLongitude":embedded_longitude,"manualLatitude":manual_latitude,"manualLongitude":manual_longitude}), original: json!({"path":path,"managedRelativePath":path.as_deref().and_then(|path| relative_or_absolute(root,path)),"sha256":sha256,"byteSize":byte_size,"extension":extension,"isRaw":is_raw.map(|value| value != 0)}), derived_versions: version_map.remove(&id).unwrap_or_default() };
+    for row in assets.query_map([], |row| { Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, i64>(4)?,row.get::<_, Option<String>>(5)?,row.get::<_, Option<i64>>(6)?,row.get::<_, Option<i64>>(7)?,row.get::<_, Option<f64>>(8)?,row.get::<_, Option<f64>>(9)?,row.get::<_, Option<f64>>(10)?,row.get::<_, Option<f64>>(11)?,row.get::<_, Option<f64>>(12)?,row.get::<_, Option<f64>>(13)?,row.get::<_, String>(14)?,row.get::<_, Option<String>>(15)?,row.get::<_, Option<String>>(16)?,row.get::<_, Option<i64>>(17)?,row.get::<_, Option<String>>(18)?,row.get::<_, Option<i64>>(19)?,))
+    })? {
+        let (id,filename,decision,captured_at,date_fallback,camera,width,height,latitude,longitude,embedded_latitude,embedded_longitude,manual_latitude,manual_longitude,location_source,path,sha256,byte_size,extension,is_raw,) = row?;
+        let record = PortableAsset { id: id.clone(), filename, decision, captured_at, date_fallback: date_fallback != 0, camera, width, height, tags: tag_map.remove(&id).unwrap_or_default(), location: json!({"latitude":latitude,"longitude":longitude,"source":location_source,"embeddedLatitude":embedded_latitude,"embeddedLongitude":embedded_longitude,"manualLatitude":manual_latitude,"manualLongitude":manual_longitude}), original: json!({"path":path,"managedRelativePath":path.as_deref().and_then(|path| relative_or_absolute(root,path)),"sha256":sha256,"byteSize":byte_size,"extension":extension,"isRaw":is_raw.map(|value| value != 0)}),
+            develop_recipe: recipe_map.remove(&id), derived_versions: version_map.remove(&id).unwrap_or_default(), };
         if !first { writer.write_all(b",")?; } first = false;
         serde_json::to_writer(&mut writer, &record)?;
     }
     writer.write_all(b"]}")?; writer.flush()?; drop(writer);
     fs::OpenOptions::new().read(true).write(true).open(&temporary)?.sync_all()?;
-    serde_json::from_reader::<_, serde_json::Value>(fs::File::open(&temporary)?).map_err(|error| KeepframeError::Message(format!("Portable catalogue validation failed: {error}")))?;
+    serde_json::from_reader::<_, serde_json::Value>(fs::File::open(&temporary)?).map_err(|error| KeepframeError::Message(format!("Portable catalogue validation failed: {error}")),)?;
     if output.exists() { let _ = fs::remove_file(&output); }
     fs::rename(&temporary, &output)?;
     Ok(output)
 }
 
 pub(crate) fn rescan_library(connection: &mut Connection, root: &Path) -> Result<IntegrityReport> {
-    let mut report = IntegrityReport { scanned_assets: 0, missing_originals: 0, missing_derived_versions: 0, modified_originals: 0, untracked_managed_files: 0, sidecar_conflicts: 0, findings: Vec::new() };
+    let mut report = IntegrityReport { scanned_assets: 0, missing_originals: 0, missing_derived_versions: 0, modified_originals: 0, untracked_managed_files: 0, sidecar_conflicts: 0, findings: Vec::new(), };
     let mut known_paths = HashSet::new();
     let mut asset_rows = connection.prepare("SELECT id,filename FROM assets WHERE trashed_at IS NULL ORDER BY id")?;
-    let assets = asset_rows.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let assets = asset_rows.query_map([], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
     drop(asset_rows);
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (asset_id, filename) in assets {
@@ -363,51 +432,57 @@ pub(crate) fn rescan_library(connection: &mut Connection, root: &Path) -> Result
         let mut state = "available";
         let mut has_representation = false;
         let mut representations = tx.prepare("SELECT path,sha256,byte_size FROM representations WHERE asset_id=?1")?;
-        for row in representations.query_map([&asset_id], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?)))? {
+        for row in representations.query_map([&asset_id], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?,))
+        })? {
             has_representation = true;
             let (path, hash, byte_size) = row?; known_paths.insert(PathBuf::from(&path));
             let candidate = PathBuf::from(&path);
-            if !candidate.is_file() { state = "original_missing"; report.missing_originals += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "original_missing".into(), detail: path }); }
-            else if fs::metadata(&candidate)?.len() as i64 != byte_size && hash_file(&candidate)? != hash { state = "modified"; report.modified_originals += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "original_modified".into(), detail: candidate.to_string_lossy().into() }); }
+            if !candidate.is_file() { state = "original_missing"; report.missing_originals += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "original_missing".into(), detail: path, }); }
+            else if fs::metadata(&candidate)?.len() as i64 != byte_size && hash_file(&candidate)? != hash { state = "modified"; report.modified_originals += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "original_modified".into(), detail: candidate.to_string_lossy().into(), }); }
         }
-        if !has_representation { state = "orphaned"; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "orphaned_catalogue_record".into(), detail: "No original representation is registered for this catalogue item.".into() }); }
+        if !has_representation { state = "orphaned"; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "orphaned_catalogue_record".into(), detail: "No original representation is registered for this catalogue item.".into(), }); }
         let mut versions = tx.prepare("SELECT path FROM versions WHERE asset_id=?1")?;
-        for row in versions.query_map([&asset_id], |row| row.get::<_, String>(0))? { let path = row?; known_paths.insert(PathBuf::from(&path)); if !Path::new(&path).is_file() { if state == "available" { state = "derived_missing"; } report.missing_derived_versions += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "derived_missing".into(), detail: path }); } }
-        tx.execute("UPDATE assets SET missing_state=?2,last_verified_at=?3 WHERE id=?1", params![asset_id,state,Utc::now().to_rfc3339()])?;
+        for row in versions.query_map([&asset_id], |row| row.get::<_, String>(0))? { let path = row?; known_paths.insert(PathBuf::from(&path)); if !Path::new(&path).is_file() { if state == "available" { state = "derived_missing"; } report.missing_derived_versions += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id.clone()), filename: Some(filename.clone()), kind: "derived_missing".into(), detail: path, }); } }
+        tx.execute("UPDATE assets SET missing_state=?2,last_verified_at=?3 WHERE id=?1", params![asset_id,state,Utc::now().to_rfc3339()],)?;
     }
     let mut sidecars = tx.prepare("SELECT s.asset_id,a.filename,s.path,s.content_hash FROM sidecar_exports s JOIN assets a ON a.id=s.asset_id")?;
-    for row in sidecars.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?)))? { let (asset_id, filename, path, hash) = row?; if !Path::new(&path).is_file() || hash_file(Path::new(&path)).ok().as_deref() != Some(&hash) { report.sidecar_conflicts += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id), filename: Some(filename), kind: "sidecar_conflict".into(), detail: path }); } }
-    for directory in [root.join("Originals"), root.join("Edits")] { if directory.is_dir() { for entry in walkdir::WalkDir::new(directory).into_iter().filter_map(std::result::Result::ok).filter(|entry| entry.file_type().is_file()) { let path = entry.path().to_path_buf(); if !known_paths.contains(&path) { report.untracked_managed_files += 1; report.findings.push(IntegrityFinding { asset_id: None, filename: path.file_name().map(|name| name.to_string_lossy().into()), kind: "untracked_managed_file".into(), detail: path.to_string_lossy().into() }); } } } }
+    for row in sidecars.query_map([], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,))
+    })? { let (asset_id, filename, path, hash) = row?; if !Path::new(&path).is_file() || hash_file(Path::new(&path)).ok().as_deref() != Some(&hash) { report.sidecar_conflicts += 1; report.findings.push(IntegrityFinding { asset_id: Some(asset_id), filename: Some(filename), kind: "sidecar_conflict".into(), detail: path, }); } }
+    for directory in [root.join("Originals"), root.join("Edits")] { if directory.is_dir() { for entry in walkdir::WalkDir::new(directory).into_iter().filter_map(std::result::Result::ok).filter(|entry| entry.file_type().is_file()) { let path = entry.path().to_path_buf(); if !known_paths.contains(&path) { report.untracked_managed_files += 1; report.findings.push(IntegrityFinding { asset_id: None, filename: path.file_name().map(|name| name.to_string_lossy().into()), kind: "untracked_managed_file".into(), detail: path.to_string_lossy().into(), }); } } } }
     drop(sidecars);
     tx.commit()?;
     Ok(report)
 }
 
-pub(crate) fn relink_candidates(connection: &Connection, asset_id: &str, directory: &Path) -> Result<Vec<RelinkCandidate>> {
-    if !directory.is_dir() { return Err(KeepframeError::Message("Choose an existing folder to search for a confirmed relink.".into())); }
+pub(crate) fn relink_candidates(connection: &Connection, asset_id: &str, directory: &Path,) -> Result<Vec<RelinkCandidate>> {
+    if !directory.is_dir() { return Err(KeepframeError::Message("Choose an existing folder to search for a confirmed relink.".into(),)); }
     let mut representations = connection.prepare("SELECT path,sha256,byte_size FROM representations WHERE asset_id=?1 ORDER BY is_raw ASC,path ASC")?;
-    let missing = representations.query_map([asset_id], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?)))?
+    let missing = representations.query_map([asset_id], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?,))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().find(|(path, _, _)| !Path::new(path).is_file());
     let Some((_missing_path, expected_hash, expected_size)) = missing else { return Ok(Vec::new()); };
     let mut matches = Vec::new();
     for entry in walkdir::WalkDir::new(directory).into_iter().filter_map(std::result::Result::ok).filter(|entry| entry.file_type().is_file()) {
-        let metadata = entry.metadata().map_err(|error| KeepframeError::Message(format!("Could not inspect a relink candidate: {error}")))?;
-        if metadata.len() as i64 == expected_size && hash_file(entry.path())? == expected_hash { matches.push(RelinkCandidate { path: entry.path().to_string_lossy().into(), sha256: expected_hash.clone() }); }
+        let metadata = entry.metadata().map_err(|error| { KeepframeError::Message(format!("Could not inspect a relink candidate: {error}"))
+        })?;
+        if metadata.len() as i64 == expected_size && hash_file(entry.path())? == expected_hash { matches.push(RelinkCandidate { path: entry.path().to_string_lossy().into(), sha256: expected_hash.clone(), }); }
     }
     Ok(matches)
 }
 
-pub(crate) fn relink_asset(connection: &mut Connection, asset_id: &str, replacement: &Path) -> Result<()> {
-    if !replacement.is_file() { return Err(KeepframeError::Message("The selected relink target is not a readable file.".into())); }
+pub(crate) fn relink_asset(connection: &mut Connection, asset_id: &str, replacement: &Path,) -> Result<()> {
+    if !replacement.is_file() { return Err(KeepframeError::Message("The selected relink target is not a readable file.".into(),)); }
     let mut representations = connection.prepare("SELECT id,path,sha256,byte_size FROM representations WHERE asset_id=?1 ORDER BY is_raw ASC,path ASC")?;
-    let target = representations.query_map([asset_id], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, i64>(3)?)))?
+    let target = representations.query_map([asset_id], |row| { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, i64>(3)?,))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().find(|(_, path, _, _)| !Path::new(path).is_file())
-        .ok_or_else(|| KeepframeError::Message("This asset has no missing original representation to relink.".into()))?;
+        .ok_or_else(|| { KeepframeError::Message("This asset has no missing original representation to relink.".into(),)
+        })?;
     drop(representations);
     if fs::metadata(replacement)?.len() as i64 != target.3 || hash_file(replacement)? != target.2 { return Err(KeepframeError::Message("Relink was rejected because the chosen file does not exactly match the catalogue hash.".into())); }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute("UPDATE representations SET path=?2 WHERE id=?1", params![target.0,replacement.to_string_lossy()])?;
-    tx.execute("UPDATE assets SET missing_state='available',last_verified_at=?2 WHERE id=?1", params![asset_id,Utc::now().to_rfc3339()])?;
+    tx.execute("UPDATE representations SET path=?2 WHERE id=?1", params![target.0,replacement.to_string_lossy()],)?;
+    tx.execute("UPDATE assets SET missing_state='available',last_verified_at=?2 WHERE id=?1", params![asset_id,Utc::now().to_rfc3339()],)?;
     tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'relink',?2,?3,?4)", params![asset_id,json!({"path":target.1}).to_string(),json!({"path":replacement}).to_string(),Utc::now().to_rfc3339()])?;
     Ok(tx.commit()?)
 }
@@ -455,7 +530,7 @@ mod tests {
         let (root, mut connection, asset_id, source) = fixture();
         fs::write(sidecar_path(&source), b"<rdf:RDF><bad>").unwrap();
         assert!(import_sidecar(&mut connection, &asset_id).is_err());
-        let state: String = connection.query_row("SELECT decision FROM assets WHERE id=?1", [&asset_id], |row| row.get(0)).unwrap();
+        let state: String = connection.query_row("SELECT decision FROM assets WHERE id=?1", [&asset_id], |row| row.get(0),).unwrap();
         assert_eq!(state, "undecided");
         drop(connection); let _ = fs::remove_dir_all(root);
     }
@@ -467,7 +542,7 @@ mod tests {
         fs::write(sidecar_path(&source), br#"<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:keepframe="https://keepframe.app/ns/1.0/" keepframe:triage="keep" keepframe:locationSource="manual"><dc:subject xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:Bag><rdf:li>People/Hazel</rdf:li></rdf:Bag></dc:subject><exif:GPSLatitude xmlns:exif="http://ns.adobe.com/exif/1.0/">56.0000</exif:GPSLatitude><exif:GPSLongitude xmlns:exif="http://ns.adobe.com/exif/1.0/">-3.0000</exif:GPSLongitude></rdf:Description></rdf:RDF>"#).unwrap();
         let result = import_sidecar(&mut connection, &asset_id).unwrap();
         assert!(result.tags_imported && result.location_imported && result.triage_imported);
-        let state: (String, Option<f64>, String) = connection.query_row("SELECT decision,manual_latitude,location_source FROM assets WHERE id=?1", [&asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        let state: (String, Option<f64>, String) = connection.query_row("SELECT decision,manual_latitude,location_source FROM assets WHERE id=?1", [&asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),).unwrap();
         assert_eq!(state, ("keep".into(), Some(56.0), "manual".into()));
         drop(connection); let _ = fs::remove_dir_all(root);
     }
@@ -476,11 +551,59 @@ mod tests {
     fn portable_catalogue_is_versioned_and_keeps_manual_location_provenance() {
         let (root, connection, asset_id, _source) = fixture();
         connection.execute("UPDATE assets SET latitude=56.0,longitude=-3.0,manual_latitude=56.0,manual_longitude=-3.0,location_source='manual' WHERE id=?1", [&asset_id]).unwrap();
+        let coverage =
+            image::GrayImage::from_fn(16, 16, |x, _| image::Luma([if x < 8 { 255 } else { 0 }]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(coverage)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let checksum = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let recipe = crate::DevelopRecipe {
+            schema_version: 2,
+            settings: crate::BasicAdjustments::neutral(),
+            masks: vec![crate::DevelopMask {
+                id: "semantic".into(),
+                name: "Sky".into(),
+                enabled: true,
+                inverted: false,
+                opacity: 1.0,
+                feather: 0.0,
+                geometry: crate::MaskGeometry::Semantic {
+                    width: 16,
+                    height: 16,
+                    coverage_png: payload.clone(),
+                    checksum,
+                    provenance: Box::new(crate::MaskProvenance {
+                        provider: "fixture".into(),
+                        provider_version: "1".into(),
+                        model: "fixture".into(),
+                        model_revision: "1".into(),
+                        model_sha256: "a".repeat(64),
+                        category: "sky".into(),
+                        execution_provider: "mock".into(),
+                    }),
+                    refinements: Vec::new(),
+                },
+                adjustments: crate::LocalAdjustments::default(),
+            }],
+        };
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,2,?2,'2026-01-02T03:04:05Z')", params![asset_id,serde_json::to_string(&recipe).unwrap()]).unwrap();
         let destination = root.join("portable"); fs::create_dir_all(&destination).unwrap();
         let output = export_portable_catalogue(&connection, &root, &destination).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert_eq!(value["schemaVersion"], PORTABLE_CATALOGUE_SCHEMA_VERSION);
         assert_eq!(value["assets"][0]["location"]["source"], "manual");
+        assert_eq!(
+            value["assets"][0]["developRecipe"]["masks"][0]["geometry"]["kind"],
+            "semantic"
+        );
+        assert_eq!(
+            value["assets"][0]["developRecipe"]["masks"][0]["geometry"]["coveragePng"],
+            payload);
         drop(connection); let _ = fs::remove_dir_all(root);
     }
 
@@ -505,9 +628,9 @@ mod tests {
     fn moved_managed_library_paths_rebase_only_after_hash_confirmation() {
         let (root, mut connection, _asset_id, source) = fixture();
         let old_path = PathBuf::from(r"Z:\FormerLibrary\Originals\2026\01\01\photo.jpg");
-        connection.execute("UPDATE representations SET path=?1 WHERE id='rep-m5'", [old_path.to_string_lossy().as_ref()]).unwrap();
+        connection.execute("UPDATE representations SET path=?1 WHERE id='rep-m5'", [old_path.to_string_lossy().as_ref()],).unwrap();
         assert_eq!(recover_moved_managed_paths(&mut connection, &root).unwrap(), 1);
-        let rebased: String = connection.query_row("SELECT path FROM representations WHERE id='rep-m5'", [], |row| row.get(0)).unwrap();
+        let rebased: String = connection.query_row("SELECT path FROM representations WHERE id='rep-m5'", [], |row| row.get(0),).unwrap();
         assert_eq!(PathBuf::from(rebased), source);
         drop(connection); let _ = fs::remove_dir_all(root);
     }

@@ -1,11 +1,14 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchJob, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchJob, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
+const intelligentMaskDemo = () => !tauri() && ["localhost", "127.0.0.1"].includes(window.location.hostname) && new URLSearchParams(window.location.search).has("intelligentMaskDemo");
+const browserMaskCoverage = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAYCAAAAAC+OKDoAAAAP0lEQVR4nGNgGAKAEZnzH4soEzZ5BgQLSe1/7EYjm4AVMOEwgOE/ySYMCQWMaBJEBxSyRqwxgGwCQhTdvgEGAKyOBxyY54qVAAAAAElFTkSuQmCC";
 let browserAssets = structuredClone(demoAssets);
 const browserDevelopRecipes = new Map<string, DevelopRecipe>();
 let browserDevelopPresets: DevelopPreset[] = [];
@@ -308,6 +311,23 @@ export const api = {
   async previewDevelopRecipe(assetId: string, recipe: DevelopRecipe): Promise<string> {
     return tauri() ? convertFileSrc(await invoke<string>("preview_develop_recipe", { assetId, recipe })) : "";
   },
+  async intelligentMaskHealth(): Promise<IntelligentMaskHealth> {
+    if (tauri()) return invoke("get_intelligent_mask_health");
+    if (intelligentMaskDemo()) return { available: true, installed: true, runtimeAvailable: true, loaded: true, busy: false, provider: "Deterministic browser UI fixture", providerVersion: "1.0.0", model: "fixture/semantic-mask", modelRevision: "1", licence: "generated fixture", source: "local test fixture", approximateBytes: 0, storagePath: "Browser memory only", executionProvider: "mock CPU", detail: "Browser UI fixture ready." };
+    return { available: false, installed: false, runtimeAvailable: false, loaded: false, busy: false, provider: "Keepframe BEiT semantic segmentation", providerVersion: "1.0.0", model: "microsoft/beit-base-finetuned-ade-640-640", modelRevision: "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2", licence: "Apache-2.0", source: "https://huggingface.co/microsoft/beit-base-finetuned-ade-640-640", approximateBytes: 899902905, storagePath: "D:\\AI Models\\Keepframe\\segmentation\\beit-base-ade20k-640", executionProvider: "unavailable", detail: "Intelligent masking model not installed. Manual masks remain available." };
+  },
+  async installIntelligentMaskModel(onProgress: (progress: { receivedBytes: number; totalBytes: number; file: string }) => void): Promise<IntelligentMaskHealth> {
+    if (!tauri()) return { available: false, installed: false, runtimeAvailable: false, loaded: false, busy: false, provider: "Keepframe BEiT semantic segmentation", providerVersion: "1.0.0", model: "microsoft/beit-base-finetuned-ade-640-640", modelRevision: "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2", licence: "Apache-2.0", source: "https://huggingface.co/microsoft/beit-base-finetuned-ade-640-640", approximateBytes: 899902905, storagePath: "D:\\AI Models\\Keepframe\\segmentation\\beit-base-ade20k-640", executionProvider: "unavailable", detail: "Intelligent masking is installed only in the desktop app. Manual masks remain available." };
+    const unlisten = await listen<{ receivedBytes: number; totalBytes: number; file: string }>("intelligent-mask-install-progress", (event) => onProgress(event.payload));
+    try { return await invoke("install_intelligent_mask_model"); } finally { unlisten(); }
+  },
+  async cancelIntelligentMaskInstall(): Promise<void> { if (tauri()) return invoke("cancel_intelligent_mask_install"); },
+  async proposeIntelligentMask(assetId: string, category: IntelligentMaskCategory): Promise<IntelligentMaskProposal> {
+    if (tauri()) return invoke("propose_intelligent_mask", { assetId, category });
+    if (intelligentMaskDemo()) { await new Promise((resolve) => window.setTimeout(resolve, 1000)); return { requestId: Date.now(), category, confidence: .88, coverageFraction: .34, elapsedMs: 1000, timings: { loadMs: 0, preprocessMs: 3, inferenceMs: 12, postprocessMs: 4 }, mask: { id: crypto.randomUUID(), name: category[0].toUpperCase()+category.slice(1), enabled: true, inverted: false, opacity: 1, feather: 0, geometry: { kind: "semantic", width: 32, height: 24, coveragePng: browserMaskCoverage, checksum: "0".repeat(64), provenance: { provider: "Deterministic browser UI fixture", providerVersion: "1.0.0", model: "fixture/semantic-mask", modelRevision: "1", modelSha256: "0".repeat(64), category, executionProvider: "mock CPU" }, refinements: [] }, adjustments: { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, lightBalance: 0, tint: 0, saturation: 0, clarity: 0, dehaze: 0, texture: 0 } } }; }
+    throw new Error("Intelligent masking model not installed.");
+  },
+  async cancelIntelligentMask(): Promise<void> { if (tauri()) return invoke("cancel_intelligent_mask"); },
   async developPresets(): Promise<DevelopPreset[]> { return tauri() ? invoke("list_develop_presets") : structuredClone([...browserBuiltInDevelopPresets, ...browserDevelopPresets]); },
   async saveDevelopPreset(preset: DevelopPreset): Promise<DevelopPreset> {
     if (tauri()) return invoke("save_develop_preset", { preset });

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import os
 import re
@@ -10,6 +11,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from PIL import Image
 
 from .schemas import AnalysisResponse, normalise_payload
+from . import segmentation
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 MODEL_ROOT = Path(os.environ.get("KEEPFRAME_MODEL_ROOT", r"D:\AI Models\Keepframe"))
@@ -59,10 +61,12 @@ def extract_json(text: str) -> dict:
 def health() -> dict:
     return {
         "ready": MODEL_PATH.exists(),
+        "analysisReady": MODEL_PATH.exists(),
         "loaded": _model is not None,
         "model": MODEL_ID,
         "modelPath": str(MODEL_PATH),
         "offline": True,
+        "segmentation": segmentation.status(),
     }
 
 
@@ -105,6 +109,7 @@ def unload() -> dict:
     global _model, _processor
     _model = None
     _processor = None
+    segmentation.unload()
     try:
         import torch
         if torch.cuda.is_available():
@@ -112,3 +117,28 @@ def unload() -> dict:
     except Exception:
         pass
     return {"unloaded": True}
+
+
+@app.post("/v1/segment", dependencies=[Depends(authorised)])
+def segment(image: UploadFile = File(...), category: str = Form(...)) -> dict:
+    data = image.file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="No image was supplied")
+    try:
+        result = segmentation.predict(Image.open(io.BytesIO(data)), category)
+        png = result.pop("png")
+        return {
+            **result,
+            "coveragePng": base64.b64encode(png).decode("ascii"),
+            "provider": segmentation.PROVIDER,
+            "providerVersion": segmentation.PROVIDER_VERSION,
+            "model": segmentation.MODEL_ID,
+            "modelRevision": segmentation.MODEL_REVISION,
+            "modelSha256": segmentation.MODEL_SHA256,
+        }
+    except segmentation.SegmentationNoResult as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Local segmentation failed: {exc}") from exc

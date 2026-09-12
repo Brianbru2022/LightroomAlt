@@ -1,6 +1,6 @@
 import { neutralLocalAdjustments, type BasicAdjustments, type DevelopMask, type MaskPoint } from "../types";
 
-export type MaskTool = "linear" | "radial" | "brush" | "erase" | null;
+export type MaskTool = "linear" | "radial" | "brush" | "erase" | "add" | "subtract" | null;
 
 export const createMask = (kind: "linear" | "radial" | "brush", index: number): DevelopMask => ({
   id: crypto.randomUUID(),

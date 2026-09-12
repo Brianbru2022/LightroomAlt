@@ -11,7 +11,7 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 3. Browse the timeline, tags and clustered full-library map; search configured places, select a marker, or place an unlocated photograph without changing its source metadata.
 4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
-6. Use Develop for non-destructive exposure, white balance, tonal, presence, colour, transform and crop edits; the catalogue recipe is authoritative and exports render it from the protected full-resolution source.
+6. Use Develop for non-destructive exposure, white balance, tonal, presence, colour, transform, crop and local-mask edits; optional local intelligent masking can propose Subject, combined People or Sky coverage for explicit acceptance into the same authoritative recipe.
 7. Choose a plain-language AI action such as **Improve photo**, **Improve lighting**, **Enhance colour**, **Restore old photo**, **Remove distraction** or **Custom instruction**.
 8. Choose a local edit when it is genuinely available, or prepare a manual ChatGPT/Gemini hand-off. Import the returned image as a traceable candidate version.
 
@@ -39,7 +39,7 @@ pnpm install
 pnpm check:all
 ```
 
-The command runs React tests, TypeScript/Vite production build, Rust tests, strict Clippy and the lightweight Python schema tests. It creates `ai-worker\.test-venv` with Pydantic only; PyTorch and model weights are not installed.
+The command runs React tests, TypeScript/Vite production build, Rust tests, strict Clippy and lightweight Python schema/segmentation-helper tests. It creates `ai-worker\.test-venv` with Pydantic and Pillow only; PyTorch and model weights are not installed.
 
 Run a disposable native profile:
 
@@ -80,6 +80,8 @@ See `MILESTONE_5_INTEROPERABILITY_GUIDE.md` for the metadata mapping, XMP subset
 
 See `MILESTONE_6_DEVELOP_GUIDE.md` for Develop controls, render order, recipe persistence, cache behaviour, shortcuts and current RAW/colour boundaries.
 
+See `MILESTONE_9_INTELLIGENT_MASKING_GUIDE.md` for the optional local segmentation model, explicit installation, accepted-mask format, privacy, provider behaviour, qualification and limitations.
+
 ## Optional local AI
 
 The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.
@@ -87,9 +89,10 @@ The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe r
 ```powershell
 .\scripts\setup-ai-worker.ps1
 .\scripts\download-analysis-model.ps1
+.\scripts\download-segmentation-model.ps1
 ```
 
-The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The model download is approximately 17.5 GB and requires explicit confirmation. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
+The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The optional Qwen analysis model is approximately 17.5 GB. The separate BEiT intelligent-masking model is approximately 900 MB. Both downloads require an explicit action. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
 
 When the vision model is absent, Keepframe labels the recipe as a deterministic controls-only fallback. Qwen-Image-Edit at port 7868 is a separate integration and is reported independently in Settings & Health.
 
@@ -105,7 +108,7 @@ For ChatGPT and Gemini, **Prepare image and instruction** creates a local sRGB P
 
 - Windows-only, single user.
 - HEIC catalogue previews depend on available decoding; full-resolution HEIC edit/export remains disabled unless decoding succeeds.
-- No conventional RAW development, local masks, face recognition, semantic search, video, full Lightroom catalogue compatibility, direct cloud APIs or cloud catalogue sync. XMP is a conservative keyword/location/triage sidecar subset, not a general XMP editor.
+- No conventional RAW development, face recognition, person identity/attribute inference, semantic search, video, full Lightroom catalogue compatibility, direct cloud APIs or cloud catalogue sync. Intelligent People masking is a combined semantic class, not instance or identity recognition. XMP is a conservative keyword/location/triage sidecar subset, not a general XMP editor.
 - The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
 
 See `BETA_TESTING.md`, `MILESTONE_3_VERIFICATION.md`, `MILESTONE_4_LOCATION_GUIDE.md`, `MILESTONE_5_INTEROPERABILITY_GUIDE.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

@@ -1,6 +1,7 @@
-mod migrations;
+mod interoperability;mod migrations;
 mod safety;
-mod interoperability;
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
@@ -19,7 +20,8 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},mpsc, Arc, Mutex,},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -29,6 +31,13 @@ use walkdir::WalkDir;
 
 const SCHEMA_VERSION: i64 = 9;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
+const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
+const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
+const SEGMENTATION_MODEL_SHA256: &str =
+    "e0747360d190bd7c0f53d2fe3b2ed560c304d3eefef94574af9c7e93aaf8e7a9";
+const SEGMENTATION_MODEL_BYTES: u64 = 899_902_905;
+const SEGMENTATION_PROVIDER: &str = "Keepframe BEiT semantic segmentation";
+const SEGMENTATION_PROVIDER_VERSION: &str = "1.0.0";
 const SUPPORTED: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "heic", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf",
     "rw2",
@@ -60,6 +69,8 @@ struct AppState {
     local_ai_url: Mutex<String>,
     health_cache: Mutex<Option<(Instant, ServiceHealth)>>,
     analysis_worker: Mutex<AnalysisWorker>,
+    mask_generation: AtomicU64,
+    mask_install_cancel: AtomicBool,
     folder_watcher: Mutex<Option<FolderWatcher>>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -232,7 +243,7 @@ impl BasicAdjustments {
     }
 
     fn normalised_crop(self) -> (f32, f32, f32, f32) {
-        (self.crop_left, self.crop_top, if self.crop_width == 0.0 { 1.0 } else { self.crop_width }, if self.crop_height == 0.0 { 1.0 } else { self.crop_height })
+        (self.crop_left, self.crop_top, if self.crop_width == 0.0 { 1.0 } else { self.crop_width }, if self.crop_height == 0.0 { 1.0 } else { self.crop_height },)
     }
 }
 
@@ -258,6 +269,54 @@ struct DevelopRecipe {
     masks: Vec<DevelopMask>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct IntelligentMaskHealth {
+    available: bool,
+    installed: bool,
+    runtime_available: bool,
+    loaded: bool,
+    busy: bool,
+    provider: String,
+    provider_version: String,
+    model: String,
+    model_revision: String,
+    licence: String,
+    source: String,
+    approximate_bytes: u64,
+    storage_path: String,
+    execution_provider: String,
+    detail: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerSegmentationResult {
+    width: u32,
+    height: u32,
+    confidence: f32,
+    coverage_fraction: f32,
+    coverage_png: String,
+    checksum: String,
+    execution_provider: String,
+    provider: String,
+    provider_version: String,
+    model: String,
+    model_revision: String,
+    model_sha256: String,
+    timings: Value,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntelligentMaskProposal {
+    request_id: u64,
+    category: String,
+    confidence: f32,
+    coverage_fraction: f32,
+    elapsed_ms: u128,
+    mask: DevelopMask,
+    timings: Value,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct LocalAdjustments {
@@ -267,9 +326,9 @@ struct LocalAdjustments {
 
 impl LocalAdjustments {
     fn validate(self) -> Result<Self> {
-        let values = [self.contrast,self.highlights,self.shadows,self.whites,self.blacks,self.light_balance,self.tint,self.saturation,self.clarity,self.dehaze,self.texture];
+        let values = [self.contrast,self.highlights,self.shadows,self.whites,self.blacks,self.light_balance,self.tint,self.saturation,self.clarity,self.dehaze,self.texture,];
         if !self.exposure.is_finite() || !(-3.0..=3.0).contains(&self.exposure) || values.iter().any(|value| !value.is_finite() || !(-100.0..=100.0).contains(value)) {
-            return Err(KeepframeError::Message("A local adjustment is outside the supported range.".into()));
+            return Err(KeepframeError::Message("A local adjustment is outside the supported range.".into(),));
         }
         Ok(self)
     }
@@ -277,20 +336,75 @@ impl LocalAdjustments {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
-struct MaskPoint { x: f32, y: f32 }
+struct MaskPoint { x: f32, y: f32, }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct BrushStroke { points: Vec<MaskPoint>, radius: f32, feather: f32, flow: f32, erase: bool }
+struct BrushStroke { points: Vec<MaskPoint>, radius: f32, feather: f32, flow: f32, erase: bool, }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum MaskGeometry {
-    Linear { start: MaskPoint, end: MaskPoint },
-    Radial { centre: MaskPoint, radius_x: f32, radius_y: f32, rotation: f32 },
-    Brush { strokes: Vec<BrushStroke> },
+    Linear { start: MaskPoint, end: MaskPoint, },
+    Radial { centre: MaskPoint, radius_x: f32, radius_y: f32, rotation: f32, },
+    Brush { strokes: Vec<BrushStroke>, },
+    Semantic {
+        width: u32,
+        height: u32,
+        coverage_png: String,
+        checksum: String,
+        provenance: Box<MaskProvenance>,
+        refinements: Vec<BrushStroke>,
+    },
 }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct DevelopMask { id: String, name: String, enabled: bool, inverted: bool, opacity: f32, feather: f32, geometry: MaskGeometry, adjustments: LocalAdjustments }
+struct MaskProvenance {
+    provider: String,
+    provider_version: String,
+    model: String,
+    model_revision: String,
+    model_sha256: String,
+    category: String,
+    execution_provider: String,
+}
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DevelopMask { id: String, name: String, enabled: bool, inverted: bool, opacity: f32, feather: f32, geometry: MaskGeometry, adjustments: LocalAdjustments,
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|value| value.is_ascii_hexdigit())
+}
+fn valid_strokes<F: Fn(&MaskPoint) -> bool>(strokes: &[BrushStroke], valid_point: &F) -> bool {
+    strokes.len() <= 5000
+        && strokes
+            .iter()
+            .map(|stroke| stroke.points.len())
+            .sum::<usize>()
+            <= 200_000
+        && strokes.iter().all(|stroke| {
+            !stroke.points.is_empty()
+                && stroke.points.iter().all(valid_point)
+                && stroke.radius.is_finite()
+                && (0.001..=0.5).contains(&stroke.radius)
+                && stroke.feather.is_finite()
+                && (0.0..=1.0).contains(&stroke.feather)
+                && stroke.flow.is_finite()
+                && (0.0..=1.0).contains(&stroke.flow)
+        })
+}
+fn decode_semantic_payload(coverage_png: &str, checksum: &str) -> Result<image::GrayImage> {
+    let bytes = BASE64.decode(coverage_png).map_err(|_| {
+        KeepframeError::Message("An intelligent mask contains invalid base64 coverage data.".into())
+    })?;
+    if bytes.len() > 3_000_000
+        || format!("{:x}", Sha256::digest(&bytes)) != checksum.to_ascii_lowercase()
+    {
+        return Err(KeepframeError::Message(
+            "An intelligent mask failed its coverage checksum.".into(),
+        ));
+    }
+    let image = image::load_from_memory_with_format(&bytes, ImageFormat::Png)?.to_luma8();
+    Ok(image) }
 
 const PRESET_CATEGORIES: &[&str] = &["whiteBalance", "tone", "presence", "colour"];
 
@@ -344,25 +458,46 @@ struct AutoProposal {
 }
 
 impl DevelopRecipe {
-    fn neutral() -> Self { Self { schema_version: 2, settings: BasicAdjustments::neutral(), masks: Vec::new() } }
+    fn neutral() -> Self { Self { schema_version: 2, settings: BasicAdjustments::neutral(), masks: Vec::new(), } }
     fn validate(mut self) -> Result<Self> {
         if self.schema_version == 1 && self.masks.is_empty() { self.schema_version = 2; }
         if self.schema_version != 2 {
-            return Err(KeepframeError::Message("This Develop recipe version is not supported by this build.".into()));
+            return Err(KeepframeError::Message("This Develop recipe version is not supported by this build.".into(),));
         }
         self.settings = self.settings.validate()?;
-        if self.masks.len() > 64 { return Err(KeepframeError::Message("A Develop recipe cannot contain more than 64 masks.".into())); }
+        if self.masks.len() > 64 { return Err(KeepframeError::Message("A Develop recipe cannot contain more than 64 masks.".into(),)); }
         let mut ids = std::collections::HashSet::new();
         for mask in &mut self.masks {
             mask.name = mask.name.trim().to_string();
-            if mask.id.trim().is_empty() || !ids.insert(mask.id.clone()) || mask.name.chars().count() > 80 || !mask.opacity.is_finite() || !(0.0..=1.0).contains(&mask.opacity) || !mask.feather.is_finite() || !(0.0..=1.0).contains(&mask.feather) { return Err(KeepframeError::Message("A mask definition is invalid.".into())); }
+            if mask.id.trim().is_empty() || !ids.insert(mask.id.clone()) || mask.name.chars().count() > 80 || !mask.opacity.is_finite() || !(0.0..=1.0).contains(&mask.opacity) || !mask.feather.is_finite() || !(0.0..=1.0).contains(&mask.feather) { return Err(KeepframeError::Message("A mask definition is invalid.".into(),)); }
             mask.adjustments = mask.adjustments.validate()?;
-            let valid_point = |point: &MaskPoint| point.x.is_finite() && point.y.is_finite() && (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y);
+            let valid_point = |point: &MaskPoint| { point.x.is_finite() && point.y.is_finite() && (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y)
+            };
             match &mask.geometry {
-                MaskGeometry::Linear { start, end } if valid_point(start) && valid_point(end) && ((start.x-end.x).powi(2)+(start.y-end.y).powi(2)).sqrt() >= 0.001 => {},
-                MaskGeometry::Radial { centre, radius_x, radius_y, rotation } if valid_point(centre) && radius_x.is_finite() && radius_y.is_finite() && (0.005..=2.0).contains(radius_x) && (0.005..=2.0).contains(radius_y) && rotation.is_finite() && (-360.0..=360.0).contains(rotation) => {},
-                MaskGeometry::Brush { strokes } if strokes.len() <= 5000 && strokes.iter().map(|stroke| stroke.points.len()).sum::<usize>() <= 200_000 && strokes.iter().all(|stroke| !stroke.points.is_empty() && stroke.points.iter().all(valid_point) && stroke.radius.is_finite() && (0.001..=0.5).contains(&stroke.radius) && stroke.feather.is_finite() && (0.0..=1.0).contains(&stroke.feather) && stroke.flow.is_finite() && (0.0..=1.0).contains(&stroke.flow)) => {},
-                _ => return Err(KeepframeError::Message("A mask has invalid geometry or stroke data.".into())),
+                MaskGeometry::Linear { start, end } if valid_point(start) && valid_point(end) && ((start.x-end.x).powi(2)+(start.y-end.y).powi(2)).sqrt() >= 0.001 => {}
+                MaskGeometry::Radial { centre, radius_x, radius_y, rotation, } if valid_point(centre) && radius_x.is_finite() && radius_y.is_finite() && (0.005..=2.0).contains(radius_x) && (0.005..=2.0).contains(radius_y) && rotation.is_finite() && (-360.0..=360.0).contains(rotation) => {}
+                MaskGeometry::Brush { strokes } if valid_strokes( strokes, &valid_point) => {}
+                MaskGeometry::Semantic {
+                    width,
+                    height,
+                    coverage_png,
+                    checksum,
+                    provenance,
+                    refinements,
+                } if (16..=2048).contains(width)
+                    && (16..=2048).contains(height)
+                    && coverage_png.len() <= 4_000_000 && is_sha256(checksum)
+                    && is_sha256(&provenance.model_sha256)
+                    && matches!(provenance.category.as_str(), "subject" | "people" | "sky")
+                    && !provenance.provider.trim().is_empty() && !provenance.provider_version.trim().is_empty() && !provenance.model.trim ().is_empty() && !provenance.model_revision.trim ().is_empty() && !provenance.execution_provider.trim ().is_empty()&& valid_strokes(refinements, &valid_point) => {
+                    let coverage = decode_semantic_payload(coverage_png, checksum)?;
+                    if coverage.dimensions() != (*width, *height) {
+                        return Err(KeepframeError::Message(
+                            "An intelligent mask has inconsistent canonical dimensions.".into(),
+                        ));}
+                }
+                _ => { return Err(KeepframeError::Message("A mask has invalid geometry or stroke data.".into(),))
+                }
             }
         }
         Ok(self)
@@ -373,16 +508,16 @@ impl DevelopRecipe {
 impl DevelopPreset {
     fn validate(mut self, user_authored: bool) -> Result<Self> {
         if self.schema_version != 1 {
-            return Err(KeepframeError::Message("This Develop preset version is not supported by this build.".into()));
+            return Err(KeepframeError::Message("This Develop preset version is not supported by this build.".into(),));
         }
         self.name = self.name.trim().to_string();
         if self.name.is_empty() || self.name.chars().count() > 80 || self.name.chars().any(char::is_control) {
-            return Err(KeepframeError::Message("Preset names must be 1 to 80 printable characters.".into()));
+            return Err(KeepframeError::Message("Preset names must be 1 to 80 printable characters.".into(),));
         }
         self.categories.sort();
         self.categories.dedup();
         if self.categories.is_empty() || self.categories.iter().any(|category| !PRESET_CATEGORIES.contains(&category.as_str())) {
-            return Err(KeepframeError::Message("A preset contains an unsupported settings category.".into()));
+            return Err(KeepframeError::Message("A preset contains an unsupported settings category.".into(),));
         }
         if user_authored && (self.built_in || self.id.trim().is_empty()) {
             return Err(KeepframeError::Message("User presets must have an application-generated id and cannot claim to be built in.".into()));
@@ -397,19 +532,19 @@ fn built_in_presets() -> Vec<DevelopPreset> {
         schema_version: 1, id: id.into(), name: name.into(), categories: categories.iter().map(|value| (*value).into()).collect(), settings, built_in: true,
     };
     vec![
-        preset("natural", "Natural", &["tone", "colour"], BasicAdjustments::neutral()),
-        preset("clean", "Clean", &["tone", "presence", "colour"], BasicAdjustments { contrast: 4.0, highlights: -8.0, shadows: 6.0, clarity: 3.0, colour_boost: 3.0, ..BasicAdjustments::neutral() }),
-        preset("warm", "Warm", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: 14.0, tint: 2.0, contrast: 4.0, colour_boost: 6.0, ..BasicAdjustments::neutral() }),
-        preset("cool", "Cool", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: -12.0, tint: -2.0, highlights: -8.0, colour_boost: 3.0, ..BasicAdjustments::neutral() }),
-        preset("high-contrast", "High Contrast", &["tone", "presence"], BasicAdjustments { contrast: 20.0, highlights: -8.0, shadows: -5.0, whites: 8.0, blacks: -10.0, clarity: 5.0, ..BasicAdjustments::neutral() }),
-        preset("soft-contrast", "Soft Contrast", &["tone", "presence"], BasicAdjustments { contrast: -14.0, highlights: -12.0, shadows: 12.0, texture: -5.0, ..BasicAdjustments::neutral() }),
-        preset("vivid", "Vivid", &["tone", "colour"], BasicAdjustments { contrast: 8.0, colour_boost: 20.0, saturation: 5.0, ..BasicAdjustments::neutral() }),
-        preset("muted", "Muted", &["tone", "colour"], BasicAdjustments { contrast: -4.0, colour_boost: -8.0, saturation: -22.0, ..BasicAdjustments::neutral() }),
-        preset("portrait", "Portrait", &["tone", "presence", "colour"], BasicAdjustments { contrast: -3.0, highlights: -10.0, shadows: 8.0, texture: -12.0, clarity: -5.0, colour_boost: 5.0, ..BasicAdjustments::neutral() }),
-        preset("landscape", "Landscape", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, highlights: -10.0, dehaze: 7.0, clarity: 8.0, colour_boost: 15.0, ..BasicAdjustments::neutral() }),
-        preset("black-and-white", "Black & White", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, clarity: 4.0, saturation: -100.0, ..BasicAdjustments::neutral() }),
-        preset("high-key-bw", "High-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: 0.45, contrast: -8.0, shadows: 18.0, blacks: 10.0, clarity: -3.0, saturation: -100.0, ..BasicAdjustments::neutral() }),
-        preset("low-key-bw", "Low-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: -0.45, contrast: 18.0, highlights: -15.0, blacks: -18.0, clarity: 6.0, saturation: -100.0, ..BasicAdjustments::neutral() }),
+        preset("natural", "Natural", &["tone", "colour"], BasicAdjustments::neutral(),),
+        preset("clean", "Clean", &["tone", "presence", "colour"], BasicAdjustments { contrast: 4.0, highlights: -8.0, shadows: 6.0, clarity: 3.0, colour_boost: 3.0, ..BasicAdjustments::neutral() },),
+        preset("warm", "Warm", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: 14.0, tint: 2.0, contrast: 4.0, colour_boost: 6.0, ..BasicAdjustments::neutral() },),
+        preset("cool", "Cool", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: -12.0, tint: -2.0, highlights: -8.0, colour_boost: 3.0, ..BasicAdjustments::neutral() },),
+        preset("high-contrast", "High Contrast", &["tone", "presence"], BasicAdjustments { contrast: 20.0, highlights: -8.0, shadows: -5.0, whites: 8.0, blacks: -10.0, clarity: 5.0, ..BasicAdjustments::neutral() },),
+        preset("soft-contrast", "Soft Contrast", &["tone", "presence"], BasicAdjustments { contrast: -14.0, highlights: -12.0, shadows: 12.0, texture: -5.0, ..BasicAdjustments::neutral() },),
+        preset("vivid", "Vivid", &["tone", "colour"], BasicAdjustments { contrast: 8.0, colour_boost: 20.0, saturation: 5.0, ..BasicAdjustments::neutral() },),
+        preset("muted", "Muted", &["tone", "colour"], BasicAdjustments { contrast: -4.0, colour_boost: -8.0, saturation: -22.0, ..BasicAdjustments::neutral() },),
+        preset("portrait", "Portrait", &["tone", "presence", "colour"], BasicAdjustments { contrast: -3.0, highlights: -10.0, shadows: 8.0, texture: -12.0, clarity: -5.0, colour_boost: 5.0, ..BasicAdjustments::neutral() },),
+        preset("landscape", "Landscape", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, highlights: -10.0, dehaze: 7.0, clarity: 8.0, colour_boost: 15.0, ..BasicAdjustments::neutral() },),
+        preset("black-and-white", "Black & White", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, clarity: 4.0, saturation: -100.0, ..BasicAdjustments::neutral() },),
+        preset("high-key-bw", "High-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: 0.45, contrast: -8.0, shadows: 18.0, blacks: 10.0, clarity: -3.0, saturation: -100.0, ..BasicAdjustments::neutral() },),
+        preset("low-key-bw", "Low-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: -0.45, contrast: 18.0, highlights: -15.0, blacks: -18.0, clarity: 6.0, saturation: -100.0, ..BasicAdjustments::neutral() },),
     ]
 }
 
@@ -931,7 +1066,8 @@ fn recover_interrupted_operations(root: &Path) -> Result<Option<String>> {
     let mut missing_trash = 0usize;
     let mut statement = connection.prepare("SELECT id,trash_path FROM trash_items WHERE state='moved'")?;
     let items = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| { Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
     for (id, path) in items {
@@ -1059,6 +1195,12 @@ async fn local_ai_health(url: &str) -> ServiceHealth {
 }
 
 fn analysis_runtime_path() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os("KEEPFRAME_ANALYSIS_PYTHON")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(configured);
+    }
     let durable = PathBuf::from(r"D:\AI Models\Keepframe\runtime\Scripts\python.exe");
     if durable.is_file() {
         return Some(durable);
@@ -1096,6 +1238,10 @@ fn ensure_analysis_worker_source() -> Result<PathBuf> {
             "schemas.py",
             include_str!("../../ai-worker/keepframe_worker/schemas.py"),
         ),
+        (
+            "segmentation.py",
+            include_str!("../../ai-worker/keepframe_worker/segmentation.py"),
+        ),
     ] {
         let destination = package.join(name);
         if fs::read_to_string(&destination).ok().as_deref() != Some(contents) {
@@ -1110,6 +1256,55 @@ fn analysis_installed() -> bool {
         || Path::new(r"D:\AI Models\Keepframe\huggingface\hub\models--Qwen--Qwen3-VL-8B-Instruct")
             .exists()
 }
+fn segmentation_model_path() -> PathBuf {
+    PathBuf::from(r"D:\AI Models\Keepframe\segmentation\beit-base-ade20k-640")
+}
+fn segmentation_model_installed() -> bool {
+    let root = segmentation_model_path();
+    root.join("config.json").is_file()
+        && root.join("preprocessor_config.json").is_file()
+        && fs::metadata(root.join("pytorch_model.bin"))
+            .is_ok_and(|metadata| metadata.len() == SEGMENTATION_MODEL_BYTES)
+        && fs::read_to_string(root.join("MODEL_SHA256.txt"))
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case(SEGMENTATION_MODEL_SHA256))
+}
+fn intelligent_mask_health_snapshot(
+    loaded: bool,
+    busy: bool,
+    execution_provider: &str,
+) -> IntelligentMaskHealth {
+    let installed = segmentation_model_installed();
+    let runtime_available = analysis_runtime_path().is_some();
+    let available = installed && runtime_available;
+    let detail = if !installed {
+        "Intelligent masking model not installed. Manual masks remain available."
+    } else if !runtime_available {
+        "Model installed, but the local AI runtime is missing. Run scripts\\setup-ai-worker.ps1."
+    } else if loaded {
+        "Intelligent masking is loaded and ready."
+    } else {
+        "Intelligent masking is installed and will load locally when first used."
+    };
+    IntelligentMaskHealth {
+        available,
+        installed,
+        runtime_available,
+        loaded,
+        busy,
+        provider: SEGMENTATION_PROVIDER.into(),
+        provider_version: SEGMENTATION_PROVIDER_VERSION.into(),
+        model: SEGMENTATION_MODEL_ID.into(),
+        model_revision: SEGMENTATION_MODEL_REVISION.into(),
+        licence: "Apache-2.0".into(),
+        source: format!(
+            "https://huggingface.co/{SEGMENTATION_MODEL_ID}/tree/{SEGMENTATION_MODEL_REVISION}"
+        ),
+        approximate_bytes: SEGMENTATION_MODEL_BYTES,
+        storage_path: segmentation_model_path().to_string_lossy().into(),
+        execution_provider: execution_provider.into(),
+        detail: detail.into(),
+    }
+}
 fn start_analysis_worker(state: &AppState) {
     if state
         .analysis_worker
@@ -1118,7 +1313,7 @@ fn start_analysis_worker(state: &AppState) {
     {
         return;
     }
-    if !analysis_installed() {
+    if !analysis_installed() && !segmentation_model_installed() {
         if let Ok(mut worker) = state.analysis_worker.lock() {
             worker.last_error = Some(analysis_installation_detail());
         }
@@ -1126,7 +1321,10 @@ fn start_analysis_worker(state: &AppState) {
     }
     let Some(worker_python) = analysis_runtime_path() else {
         if let Ok(mut worker) = state.analysis_worker.lock() {
-            worker.last_error = Some(analysis_installation_detail());
+            worker.last_error = Some(if segmentation_model_installed() {
+                "The intelligent-masking model is installed, but the Keepframe Python runtime is missing. Run scripts\\setup-ai-worker.ps1.".into()
+            } else {analysis_installation_detail()
+            });
         }
         return;
     };
@@ -1245,7 +1443,7 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
     }
 }
 #[tauri::command]
-async fn get_service_health(force: Option<bool>, state: State<'_, AppState>) -> Result<ServiceHealth> {
+async fn get_service_health(force: Option<bool>, state: State<'_, AppState>,) -> Result<ServiceHealth> {
     if !force.unwrap_or(false) {
         if let Ok(cache) = state.health_cache.lock() {
             if let Some((checked_at, health)) = cache.as_ref() {
@@ -1321,6 +1519,291 @@ async fn get_service_health(force: Option<bool>, state: State<'_, AppState>) -> 
     Ok(health)
 }
 
+fn analysis_worker_endpoint(state: &AppState) -> Result<(String, String)> {
+    start_analysis_worker(state);
+    state
+        .analysis_worker
+        .lock()
+        .map_err(|_| KeepframeError::Message("Local AI worker lock failed.".into()))
+        .and_then(|worker| match (worker.url.clone(), worker.token.clone()) {
+            (Some(url), Some(token)) => Ok((url, token)),
+            _ => Err(KeepframeError::Message(
+                worker.last_error.clone().unwrap_or_else(|| {
+                    "The local intelligent-masking worker is unavailable.".into()
+                }),
+            )),
+        })
+}
+
+#[tauri::command]
+async fn get_intelligent_mask_health(state: State<'_, AppState>) -> Result<IntelligentMaskHealth> {
+    if !segmentation_model_installed() || analysis_runtime_path().is_none() {
+        return Ok(intelligent_mask_health_snapshot(
+            false,
+            false,
+            "unavailable",
+        ));
+    }
+    let (url, token) = analysis_worker_endpoint(&state)?;
+    let client = reqwest::Client::new();
+    for _ in 0..12 {
+        if let Ok(response) = client
+            .get(format!("{url}/health"))
+            .header("X-Keepframe-Token", &token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(segmentation) = value.get("segmentation") {
+                        let loaded = segmentation
+                            .get("loaded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let busy = segmentation
+                            .get("busy")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let provider = segmentation
+                            .get("executionProvider")
+                            .and_then(Value::as_str)
+                            .unwrap_or("not loaded");
+                        return Ok(intelligent_mask_health_snapshot(loaded, busy, provider));
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mut health = intelligent_mask_health_snapshot(false, false, "starting");
+    health.available = false;
+    health.detail = "The intelligent-masking worker is starting or failed its health check.".into();
+    Ok(health)
+}
+
+#[tauri::command]
+fn cancel_intelligent_mask(state: State<'_, AppState>) {
+    state.mask_generation.fetch_add(1, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn cancel_intelligent_mask_install(state: State<'_, AppState>) {
+    state.mask_install_cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn install_intelligent_mask_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<IntelligentMaskHealth> {
+    if segmentation_model_installed() {
+        return Ok(intelligent_mask_health_snapshot(false, false, "not loaded"));
+    }
+    state.mask_install_cancel.store(false, Ordering::SeqCst);
+    let root = segmentation_model_path();
+    fs::create_dir_all(&root)?;
+    let files = [
+        ("config.json", 6_966_u64, None),
+        ("preprocessor_config.json", 276_u64, None),
+        (
+            "pytorch_model.bin",
+            SEGMENTATION_MODEL_BYTES,
+            Some(SEGMENTATION_MODEL_SHA256),
+        ),
+    ];
+    let client = reqwest::Client::new();
+    let mut overall = 0_u64;
+    for (name, expected, hash) in files {
+        let destination = root.join(name);
+        let partial = root.join(format!("{name}.partial"));
+        let url=format!("https://huggingface.co/{SEGMENTATION_MODEL_ID}/resolve/{SEGMENTATION_MODEL_REVISION}/{name}");
+        let mut response = client.get(url).send().await?.error_for_status()?;
+        let mut file = fs::File::create(&partial)?;
+        let mut digest = Sha256::new();
+        let mut received = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            if state.mask_install_cancel.load(Ordering::SeqCst) {
+                drop(file);
+                let _ = fs::remove_file(&partial);
+                return Err(KeepframeError::Message(
+                    "Intelligent masking model installation was cancelled.".into(),
+                ));
+            }
+            file.write_all(&chunk)?;
+            digest.update(&chunk);
+            received += chunk.len() as u64;
+            overall += chunk.len() as u64;
+            let _=app.emit("intelligent-mask-install-progress",json!({"file":name,"receivedBytes":overall,"currentFileBytes":received,"fileBytes":expected,"totalBytes":SEGMENTATION_MODEL_BYTES+7_242}));
+        }
+        file.sync_all()?;
+        drop(file);
+        if received != expected {
+            let _ = fs::remove_file(&partial);
+            return Err(KeepframeError::Message(format!(
+                "The downloaded {name} file was truncated."
+            )));
+        }
+        if let Some(expected_hash) = hash {
+            if format!("{:x}", digest.finalize()) != expected_hash {
+                let _ = fs::remove_file(&partial);
+                return Err(KeepframeError::Message(
+                    "The downloaded model failed SHA-256 verification.".into(),
+                ));
+            }
+        } else {
+            serde_json::from_slice::<Value>(&fs::read(&partial)?)?;
+        }
+        if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        fs::rename(&partial, &destination)?;
+    }
+    fs::write(
+        root.join("MODEL_SHA256.txt"),
+        format!("{SEGMENTATION_MODEL_SHA256}\n"),
+    )?;
+    Ok(intelligent_mask_health_snapshot(false, false, "not loaded"))
+}
+
+#[tauri::command]
+async fn propose_intelligent_mask(
+    asset_id: String,
+    category: String,
+    state: State<'_, AppState>,
+) -> Result<IntelligentMaskProposal> {
+    if !matches!(category.as_str(), "subject" | "people" | "sky") {
+        return Err(KeepframeError::Message(
+            "That intelligent mask category is unsupported.".into(),
+        ));
+    }
+    if !segmentation_model_installed() {
+        return Err(KeepframeError::Message(
+            "Intelligent masking model not installed.".into(),
+        ));
+    }
+    let request_id = state.mask_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let root = root_from(&state)?;
+    let connection = open_db(&root)?;
+    let preview: String = connection.query_row(
+        "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        [&asset_id],
+        |row| row.get(0),
+    )?;
+    drop(connection);
+    let source = image::open(preview)?.thumbnail(640, 640);
+    let analysis_width = source.width();
+    let analysis_height = source.height();
+    let png = encode_srgb_png(&image::DynamicImage::ImageRgb8(source.to_rgb8()))?;
+    let (url, token) = analysis_worker_endpoint(&state)?;
+    let started = Instant::now();
+    let form = multipart::Form::new()
+        .text("category", category.clone())
+        .part(
+            "image",
+            multipart::Part::bytes(png)
+                .file_name("analysis.png")
+                .mime_str("image/png")?,
+        );
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/segment"))
+        .header("X-Keepframe-Token", token)
+        .timeout(Duration::from_secs(300))
+        .multipart(form)
+        .send()
+        .await?;
+    if request_id != state.mask_generation.load(Ordering::SeqCst) || root_from(&state)? != root {
+        return Err(KeepframeError::Message(
+            "Intelligent mask request cancelled or superseded.".into(),
+        ));
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let detail = response
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "No credible segmentation result was found.".into());
+        return Err(KeepframeError::Message(detail));
+    }
+    let result = response
+        .error_for_status()?
+        .json::<WorkerSegmentationResult>()
+        .await?;
+    if result.width != analysis_width
+        || result.height != analysis_height
+        || !result.confidence.is_finite()
+        || !(0.0..=1.0).contains(&result.confidence)
+        || !result.coverage_fraction.is_finite()
+        || !(0.0..=1.0).contains(&result.coverage_fraction)
+    {
+        return Err(KeepframeError::Message(
+            "The segmentation provider returned invalid dimensions or confidence.".into(),
+        ));
+    }
+    let coverage = decode_semantic_payload(&result.coverage_png, &result.checksum)?;
+    if coverage.dimensions() != (result.width, result.height)
+        || result.model != SEGMENTATION_MODEL_ID
+        || result.model_revision != SEGMENTATION_MODEL_REVISION
+        || result.model_sha256 != SEGMENTATION_MODEL_SHA256
+    {
+        return Err(KeepframeError::Message(
+            "The segmentation provider returned incompatible model provenance.".into(),
+        ));
+    }
+    let provenance = MaskProvenance {
+        provider: result.provider,
+        provider_version: result.provider_version,
+        model: result.model,
+        model_revision: result.model_revision,
+        model_sha256: result.model_sha256,
+        category: category.clone(),
+        execution_provider: result.execution_provider,
+    };
+    let title = match category.as_str() {
+        "subject" => "Subject",
+        "people" => "People",
+        _ => "Sky",
+    };
+    let mask = DevelopMask {
+        id: Uuid::new_v4().to_string(),
+        name: title.into(),
+        enabled: true,
+        inverted: false,
+        opacity: 1.0,
+        feather: 0.0,
+        geometry: MaskGeometry::Semantic {
+            width: result.width,
+            height: result.height,
+            coverage_png: result.coverage_png,
+            checksum: result.checksum,
+            provenance: Box::new(provenance),
+            refinements: Vec::new(),
+        },
+        adjustments: LocalAdjustments::default(),
+    };
+    DevelopRecipe {
+        schema_version: 2,
+        settings: BasicAdjustments::neutral(),
+        masks: vec![mask.clone()],
+    }
+    .validate()?;
+    Ok(IntelligentMaskProposal {
+        request_id,
+        category,
+        confidence: result.confidence,
+        coverage_fraction: result.coverage_fraction,
+        elapsed_ms: started.elapsed().as_millis(),
+        mask,
+        timings: result.timings,
+    })
+}
+
 #[tauri::command]
 fn configure_local_ai(url: String, state: State<'_, AppState>) -> Result<()> {
     let url = validated_loopback_url(&url)?;
@@ -1345,7 +1828,7 @@ async fn initialise_library(
         return Err(error);
     }
     let relocated = interoperability::recover_moved_managed_paths(&mut open_db(&root)?, &root)?;
-    if relocated > 0 { append_runtime_log(&root, "managed_paths_rebased", &format!("{relocated} verified managed paths were rebased after opening this library.")); }
+    if relocated > 0 { append_runtime_log(&root, "managed_paths_rebased", &format!("{relocated} verified managed paths were rebased after opening this library."),); }
     let recovery_notice = recover_interrupted_operations(&root)?;
     *state
         .root
@@ -1515,26 +1998,27 @@ fn validate_local_output_path(output: &Path, intended_dir: &Path) -> Result<Path
 
 /// Accept only a complete, decodable, plausibly-sized image that is distinct
 /// from the protected source. The caller owns any failed output and removes it.
-fn validate_ai_output(output: &Path, source_hash: &str, expected: Option<(u32, u32)>) -> Result<String> {
+fn validate_ai_output(output: &Path, source_hash: &str, expected: Option<(u32, u32)>,) -> Result<String> {
     let metadata = fs::metadata(output).map_err(|_| KeepframeError::Message("The AI result file was not found.".into()))?;
     if !metadata.is_file() || metadata.len() == 0 {
-        return Err(KeepframeError::Message("The AI result is empty or incomplete.".into()));
+        return Err(KeepframeError::Message("The AI result is empty or incomplete.".into(),));
     }
-    let image = image::open(output).map_err(|_| KeepframeError::Message("The AI result is not a valid decodable image.".into()))?;
+    let image = image::open(output).map_err(|_| { KeepframeError::Message("The AI result is not a valid decodable image.".into())
+    })?;
     let (width, height) = image.dimensions();
     if width < 64 || height < 64 {
-        return Err(KeepframeError::Message("The AI result dimensions are implausibly small.".into()));
+        return Err(KeepframeError::Message("The AI result dimensions are implausibly small.".into(),));
     }
     if let Some((source_width, source_height)) = expected {
         let source_pixels = u64::from(source_width) * u64::from(source_height);
         let output_pixels = u64::from(width) * u64::from(height);
         if output_pixels < source_pixels / 100 || output_pixels > source_pixels.saturating_mul(100) {
-            return Err(KeepframeError::Message("The AI result dimensions are implausible for this photograph.".into()));
+            return Err(KeepframeError::Message("The AI result dimensions are implausible for this photograph.".into(),));
         }
     }
     let output_hash = hash_file(output)?;
     if output_hash == source_hash {
-        return Err(KeepframeError::Message("The returned image is identical to the protected source; no edit was imported.".into()));
+        return Err(KeepframeError::Message("The returned image is identical to the protected source; no edit was imported.".into(),));
     }
     Ok(output_hash)
 }
@@ -2012,7 +2496,7 @@ fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32, radius_divi
         let height = (image.height() as f32 * scale).round().max(1.0) as u32;
         let working = image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle);
         let small_blur = image::imageops::blur(&working, (sigma * scale).max(1.2));
-        image::imageops::resize(&small_blur, image.width(), image.height(), image::imageops::FilterType::Triangle)
+        image::imageops::resize(&small_blur, image.width(), image.height(), image::imageops::FilterType::Triangle,)
     } else {
         image::imageops::blur(image, sigma)
     };
@@ -2108,7 +2592,7 @@ fn apply_colour_adjustments_to_image(
     output
 }
 
-fn apply_adjustments_to_image(image: &image::DynamicImage, adjustments: BasicAdjustments) -> RgbImage {
+fn apply_adjustments_to_image(image: &image::DynamicImage, adjustments: BasicAdjustments,) -> RgbImage {
     let colour = apply_colour_adjustments_to_image(image, adjustments);
     apply_geometry(&colour, adjustments)
 }
@@ -2119,23 +2603,113 @@ fn segment_distance(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f3
     ((point.0-(start.0+dx*t)).powi(2)+(point.1-(start.1+dy*t)).powi(2)).sqrt()
 }
 
-fn mask_coverage(mask: &DevelopMask, x: u32, y: u32, width: u32, height: u32) -> f32 {
+fn brush_stroke_alpha(stroke: &BrushStroke, x: u32, y: u32, width: u32, height: u32) -> f32 {
+    let smallest = width.min(height).max(1) as f32;
+    let point = (x as f32, y as f32);
+    let radius = stroke.radius * smallest;
+    let distance = if stroke.points.len() == 1 {
+        let p = stroke.points[0];
+        segment_distance(
+            point,
+            (p.x * width as f32, p.y * height as f32),
+            (p.x * width as f32, p.y * height as f32),
+        )
+    } else {
+        stroke
+            .points
+            .windows(2)
+            .map(|pair| {
+                segment_distance(
+                    point,
+                    (pair[0].x * width as f32, pair[0].y * height as f32),
+                    (pair[1].x * width as f32, pair[1].y * height as f32),
+                )
+            })
+            .fold(f32::INFINITY, f32::min)
+    };
+    (1.0 - smoothstep(
+        radius * (1.0 - stroke.feather),
+        radius.max(0.000_001),
+        distance,
+    )) * stroke.flow
+}
+
+fn prepared_semantic_coverage(
+    mask: &DevelopMask,
+    width: u32,
+    height: u32,
+) -> Result<Option<image::GrayImage>> {
+    let MaskGeometry::Semantic {
+        coverage_png,
+        checksum,
+        ..
+    } = &mask.geometry
+    else {
+        return Ok(None);
+    };
+    let source = decode_semantic_payload(coverage_png, checksum)?;
+    let resized = image::imageops::resize(
+        &source,
+        width,
+        height,
+        image::imageops::FilterType::CatmullRom,
+    );
+    let sigma = (mask.feather * 0.005 * width.min(height) as f32).min(40.0);
+    Ok(Some(if sigma >= 0.1 {
+        image::imageops::blur(&resized, sigma)
+    } else {
+        resized
+    }))
+}
+
+fn mask_coverage_prepared(
+    mask: &DevelopMask,
+    semantic: Option<&image::GrayImage>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,) -> f32 {
     let nx=if width>1{x as f32/(width-1) as f32}else{0.0}; let ny=if height>1{y as f32/(height-1) as f32}else{0.0};
     let mut coverage=match &mask.geometry {
-        MaskGeometry::Linear{start,end}=>{let dx=end.x-start.x;let dy=end.y-start.y;let t=((nx-start.x)*dx+(ny-start.y)*dy)/(dx*dx+dy*dy).max(0.000_001);let half=mask.feather.max(0.001)*0.5;smoothstep(0.5-half,0.5+half,t)},
-        MaskGeometry::Radial{centre,radius_x,radius_y,rotation}=>{let(sin,cos)=rotation.to_radians().sin_cos();let dx=nx-centre.x;let dy=ny-centre.y;let rx=(cos*dx+sin*dy)/radius_x.max(0.000_001);let ry=(-sin*dx+cos*dy)/radius_y.max(0.000_001);1.0-smoothstep((1.0-mask.feather).clamp(0.0,0.999),1.0,(rx*rx+ry*ry).sqrt())},
-        MaskGeometry::Brush{strokes}=>{let smallest=width.min(height).max(1) as f32;let point=(x as f32,y as f32);let mut painted=0.0_f32;for stroke in strokes{let radius=stroke.radius*smallest;let distance=if stroke.points.len()==1{let p=stroke.points[0];segment_distance(point,(p.x*width as f32,p.y*height as f32),(p.x*width as f32,p.y*height as f32))}else{stroke.points.windows(2).map(|pair|segment_distance(point,(pair[0].x*width as f32,pair[0].y*height as f32),(pair[1].x*width as f32,pair[1].y*height as f32))).fold(f32::INFINITY,f32::min)};let alpha=(1.0-smoothstep(radius*(1.0-stroke.feather),radius.max(0.000_001),distance))*stroke.flow;painted=if stroke.erase{painted*(1.0-alpha)}else{painted+(1.0-painted)*alpha};}painted},
+        MaskGeometry::Linear{start,end}=>{let dx=end.x-start.x;let dy=end.y-start.y;let t=((nx-start.x)*dx+(ny-start.y)*dy)/(dx*dx+dy*dy).max(0.000_001);let half=mask.feather.max(0.001)*0.5;smoothstep(0.5-half,0.5+half,t)}
+        MaskGeometry::Radial{centre,radius_x,radius_y,rotation,}=>{let(sin,cos)=rotation.to_radians().sin_cos();let dx=nx-centre.x;let dy=ny-centre.y;let rx=(cos*dx+sin*dy)/radius_x.max(0.000_001);let ry=(-sin*dx+cos*dy)/radius_y.max(0.000_001);1.0-smoothstep((1.0-mask.feather).clamp(0.0,0.999),1.0,(rx*rx+ry*ry).sqrt(),)}
+        MaskGeometry::Brush{strokes}=>{let mut painted=0.0_f32;for stroke in strokes{let alpha= brush_stroke_alpha(stroke, x, y, width, height);painted=if stroke.erase{painted*(1.0-alpha)}else{painted+(1.0-painted)*alpha};}painted}
+        MaskGeometry::Semantic { refinements, .. } => {
+            let mut value = semantic
+                .map(|coverage| coverage.get_pixel(x, y)[0] as f32 / 255.0)
+                .unwrap_or(0.0);
+            for stroke in refinements {
+                let alpha = brush_stroke_alpha(stroke, x, y, width, height);
+                value = if stroke.erase {
+                    value * (1.0 - alpha)
+                } else {
+                    value + (1.0 - value) * alpha
+                };
+            }
+            value
+        }
     };
     if mask.inverted { coverage=1.0-coverage; }
     (coverage*mask.opacity).clamp(0.0,1.0)
+}
+
+#[cfg(test)]
+fn mask_coverage(mask: &DevelopMask, x: u32, y: u32, width: u32, height: u32) -> f32 {
+    let semantic = prepared_semantic_coverage(mask, width, height)
+        .ok()
+        .flatten();
+    mask_coverage_prepared(mask, semantic.as_ref(), x, y, width, height)
 }
 
 fn render_develop_recipe(image: &image::DynamicImage, recipe: &DevelopRecipe) -> RgbImage {
     // Deliberate order: EXIF-oriented source -> global colour/tone -> ordered local masks -> transform/crop.
     let mut output=apply_colour_adjustments_to_image(image,recipe.settings);let(width,height)=output.dimensions();
     for mask in recipe.masks.iter().filter(|mask|mask.enabled&&mask.opacity>0.0){
-        let adjusted=apply_colour_adjustments_to_image(&image::DynamicImage::ImageRgb8(output.clone()),mask.adjustments.as_basic());
-        for y in 0..height{for x in 0..width{let alpha=mask_coverage(mask,x,y,width,height);if alpha<=0.0{continue}let source=*output.get_pixel(x,y);let target=*adjusted.get_pixel(x,y);let pixel=output.get_pixel_mut(x,y);for channel in 0..3{pixel[channel]=(source[channel] as f32+(target[channel] as f32-source[channel] as f32)*alpha).round().clamp(0.0,255.0) as u8;}}}
+        let semantic = prepared_semantic_coverage(mask, width, height)
+            .ok()
+            .flatten();
+        let adjusted=apply_colour_adjustments_to_image(&image::DynamicImage::ImageRgb8(output.clone()),mask.adjustments.as_basic(),);
+        for y in 0..height{for x in 0..width{let alpha= mask_coverage_prepared(mask, semantic.as_ref(),x,y,width,height);if alpha<=0.0{continue;}let source=*output.get_pixel(x,y);let target=*adjusted.get_pixel(x,y);let pixel=output.get_pixel_mut(x,y);for channel in 0..3{pixel[channel]=(source[channel] as f32+(target[channel] as f32-source[channel] as f32)*alpha).round().clamp(0.0,255.0) as u8;}}}
     }
     apply_geometry(&output,recipe.settings)
 }
@@ -2192,7 +2766,7 @@ fn original_adjustment_input(connection: &Connection, asset_id: &str) -> Result<
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(AdjustmentInput { path: PathBuf::from(path), source_hash, captured_at: captured, expected_dimensions: width.zip(height) })
+    Ok(AdjustmentInput { path: PathBuf::from(path), source_hash, captured_at: captured, expected_dimensions: width.zip(height), })
 }
 
 fn image_statistics(image: &image::DynamicImage) -> ImageStatistics {
@@ -2201,7 +2775,7 @@ fn image_statistics(image: &image::DynamicImage) -> ImageStatistics {
     let mut luminance_bins = vec![0_u64; 64]; let mut red_bins = vec![0_u64; 64]; let mut green_bins = vec![0_u64; 64]; let mut blue_bins = vec![0_u64; 64];
     let mut luminances = Vec::new(); let mut saturation_total = 0.0_f32; let mut channel_total = [0.0_f32; 3]; let mut shadows = 0_u64; let mut highlights = 0_u64;
     for pixel in rgb.pixels().step_by(step) {
-        let channels = [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0];
+        let channels = [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0,];
         let luminance = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
         luminance_bins[(luminance * 63.0).round().clamp(0.0, 63.0) as usize] += 1;
         red_bins[(channels[0] * 63.0).round() as usize] += 1; green_bins[(channels[1] * 63.0).round() as usize] += 1; blue_bins[(channels[2] * 63.0).round() as usize] += 1;
@@ -2213,8 +2787,9 @@ fn image_statistics(image: &image::DynamicImage) -> ImageStatistics {
         luminances.push(luminance);
     }
     luminances.sort_by(|left, right| left.total_cmp(right)); let samples = luminances.len().max(1);
-    let percentile = |fraction: f32| luminances.get(((samples - 1) as f32 * fraction).round() as usize).copied().unwrap_or(0.5);
-    ImageStatistics { luminance_bins, red_bins, green_bins, blue_bins, samples: samples as u64, average_luminance: luminances.iter().sum::<f32>() / samples as f32, p01: percentile(0.01), p50: percentile(0.50), p99: percentile(0.99), shadow_clip_fraction: shadows as f32 / samples as f32, highlight_clip_fraction: highlights as f32 / samples as f32, average_saturation: saturation_total / samples as f32, red_green_blue: [channel_total[0] / samples as f32, channel_total[1] / samples as f32, channel_total[2] / samples as f32], dynamic_range: (percentile(0.99) - percentile(0.01)).max(0.0) }
+    let percentile = |fraction: f32| { luminances.get(((samples - 1) as f32 * fraction).round() as usize).copied().unwrap_or(0.5)
+    };
+    ImageStatistics { luminance_bins, red_bins, green_bins, blue_bins, samples: samples as u64, average_luminance: luminances.iter().sum::<f32>() / samples as f32, p01: percentile(0.01), p50: percentile(0.50), p99: percentile(0.99), shadow_clip_fraction: shadows as f32 / samples as f32, highlight_clip_fraction: highlights as f32 / samples as f32, average_saturation: saturation_total / samples as f32, red_green_blue: [channel_total[0] / samples as f32, channel_total[1] / samples as f32, channel_total[2] / samples as f32,], dynamic_range: (percentile(0.99) - percentile(0.01)).max(0.0), }
 }
 
 fn auto_proposal(image: &image::DynamicImage, current: BasicAdjustments) -> AutoProposal {
@@ -2233,12 +2808,12 @@ fn auto_proposal(image: &image::DynamicImage, current: BasicAdjustments) -> Auto
         let temperature = ((stats.red_green_blue[2] - stats.red_green_blue[0]) * 55.0).clamp(-12.0, 12.0);
         if temperature.abs() >= 2.0 { settings.light_balance = (current.light_balance + temperature).clamp(-100.0, 100.0); explanation.push(if temperature > 0.0 { "White balance warmed using a low-saturation grey-world estimate.".into() } else { "White balance cooled using a low-saturation grey-world estimate.".into() }); }
     } else { explanation.push("White balance unchanged because no reliable neutral estimate was found.".into()); }
-    if explanation.is_empty() { explanation.push("The image already falls within conservative Auto thresholds; no changes are proposed.".into()); }
+    if explanation.is_empty() { explanation.push("The image already falls within conservative Auto thresholds; no changes are proposed.".into(),); }
     let mut recommendations = Vec::new();
     if stats.average_saturation > 0.24 && stats.dynamic_range > 0.55 { recommendations.push("Landscape".into()); }
     if stats.average_saturation < 0.22 && stats.p50 > 0.38 && stats.p50 < 0.70 { recommendations.push("Portrait".into()); }
     if stats.dynamic_range < 0.45 { recommendations.push("Soft Contrast".into()); }
-    AutoProposal { settings, explanation, confidence: ((wb_confidence + (1.0 - stats.highlight_clip_fraction * 8.0).clamp(0.0, 1.0)) / 2.0).clamp(0.25, 1.0), statistics: stats, recommendations }
+    AutoProposal { settings, explanation, confidence: ((wb_confidence + (1.0 - stats.highlight_clip_fraction * 8.0).clamp(0.0, 1.0)) / 2.0).clamp(0.25, 1.0), statistics: stats, recommendations, }
 }
 
 fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments {
@@ -2255,7 +2830,7 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
         } else {
             0.0
         };
-        luminances.push((pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722) / 255.0);
+        luminances.push((pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722) / 255.0,);
         samples += 1;
     }
     luminances.sort_by(|left, right| left.total_cmp(right));
@@ -2380,7 +2955,7 @@ fn develop_recipe_in(connection: &Connection, asset_id: &str) -> Result<DevelopR
         |row| row.get(0),
     )?;
     if !exists {
-        return Err(KeepframeError::Message("That photograph is no longer available for Develop.".into()));
+        return Err(KeepframeError::Message("That photograph is no longer available for Develop.".into(),));
     }
     let recipe_json: Option<String> = connection.query_row(
         "SELECT recipe_json FROM develop_recipes WHERE asset_id=?1",
@@ -2402,7 +2977,7 @@ fn get_develop_recipe(asset_id: String, state: State<'_, AppState>) -> Result<De
 }
 
 #[tauri::command]
-fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>) -> Result<bool> {
+fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>,) -> Result<bool> {
     let recipe = recipe.validate()?;
     let mut connection = open_db(&root_from(&state)?)?;
     let _ = develop_recipe_in(&connection, &asset_id)?;
@@ -2420,7 +2995,7 @@ fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_,
 }
 
 #[tauri::command]
-async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>) -> Result<String> {
+async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>,) -> Result<String> {
     let recipe = recipe.validate()?;
     let root = root_from(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<String> {
@@ -2454,7 +3029,9 @@ fn list_develop_presets(state: State<'_, AppState>) -> Result<Vec<DevelopPreset>
     let mut presets = built_in_presets();
     let mut statement = connection.prepare("SELECT preset_json FROM develop_presets ORDER BY name COLLATE NOCASE")?;
     let user_presets = statement.query_map([], |row| row.get::<_, String>(0))?
-        .map(|row| row.map_err(KeepframeError::from).and_then(|json| serde_json::from_str::<DevelopPreset>(&json).map_err(KeepframeError::from)?.validate(true)))
+        .map(|row| { row.map_err(KeepframeError::from).and_then(|json| { serde_json::from_str::<DevelopPreset>(&json).map_err(KeepframeError::from)?.validate(true)
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     presets.extend(user_presets); Ok(presets)
 }
@@ -2469,34 +3046,35 @@ fn save_develop_preset(preset: DevelopPreset, state: State<'_, AppState>) -> Res
 
 #[tauri::command]
 fn delete_develop_preset(id: String, state: State<'_, AppState>) -> Result<()> {
-    if built_in_presets().iter().any(|preset| preset.id == id) { return Err(KeepframeError::Message("Built-in presets cannot be deleted.".into())); }
+    if built_in_presets().iter().any(|preset| preset.id == id) { return Err(KeepframeError::Message("Built-in presets cannot be deleted.".into(),)); }
     let connection = open_db(&root_from(&state)?)?; connection.execute("DELETE FROM develop_presets WHERE id=?1", [id])?; Ok(())
 }
 
 #[tauri::command]
 fn export_develop_preset(id: String, path: String, state: State<'_, AppState>) -> Result<()> {
     let preset = list_develop_presets(state)?.into_iter().find(|preset| preset.id == id).ok_or_else(|| KeepframeError::Message("The preset no longer exists.".into()))?;
-    let path = PathBuf::from(path); if !path.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("keepframe-preset")).unwrap_or(false) { return Err(KeepframeError::Message("Preset exports must use the .keepframe-preset extension.".into())); }
-    let file = PresetFile { schema_version: 1, name: preset.name, categories: preset.categories, settings: preset.settings };
+    let path = PathBuf::from(path); if !path.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("keepframe-preset")).unwrap_or(false) { return Err(KeepframeError::Message("Preset exports must use the .keepframe-preset extension.".into(),)); }
+    let file = PresetFile { schema_version: 1, name: preset.name, categories: preset.categories, settings: preset.settings, };
     fs::write(path, serde_json::to_vec_pretty(&file)?)?; Ok(())
 }
 
 #[tauri::command]
 fn import_develop_preset(path: String, state: State<'_, AppState>) -> Result<DevelopPreset> {
     let path = PathBuf::from(path); let metadata = fs::metadata(&path)?;
-    if metadata.len() > PRESET_FILE_MAX_BYTES { return Err(KeepframeError::Message("Preset file is larger than the 128 KiB safety limit.".into())); }
+    if metadata.len() > PRESET_FILE_MAX_BYTES { return Err(KeepframeError::Message("Preset file is larger than the 128 KiB safety limit.".into(),)); }
     let file: PresetFile = serde_json::from_slice(&fs::read(path)?)?;
-    let preset = DevelopPreset { schema_version: file.schema_version, id: Uuid::new_v4().to_string(), name: file.name, categories: file.categories, settings: file.settings, built_in: false };
+    let preset = DevelopPreset { schema_version: file.schema_version, id: Uuid::new_v4().to_string(), name: file.name, categories: file.categories, settings: file.settings, built_in: false, };
     save_develop_preset(preset, state)
 }
 
 #[tauri::command]
-async fn propose_develop_auto(asset_id: String, current: BasicAdjustments, state: State<'_, AppState>) -> Result<AutoProposal> {
+async fn propose_develop_auto(asset_id: String, current: BasicAdjustments, state: State<'_, AppState>,) -> Result<AutoProposal> {
     let current = current.validate()?; let root = root_from(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<AutoProposal> {
-        let connection = open_db(&root)?; let preview: String = connection.query_row("SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL", [&asset_id], |row| row.get(0))?;
+        let connection = open_db(&root)?; let preview: String = connection.query_row("SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL", [&asset_id], |row| row.get(0),)?;
         let image = image::open(preview)?.thumbnail(720, 540); Ok(auto_proposal(&image, current))
-    }).await.map_err(|error| KeepframeError::Message(format!("Automatic Develop analysis failed: {error}")))?
+    }).await.map_err(|error| { KeepframeError::Message(format!("Automatic Develop analysis failed: {error}"))
+    })?
 }
 
 #[tauri::command]
@@ -2523,7 +3101,7 @@ async fn apply_basic_adjustments(
         let output_hash = hash_file(&output)?;
         let now = Utc::now().to_rfc3339();
         let summary = format!(
-            "Exposure {:+.2} EV; temperature {:+.0}; tint {:+.0}; contrast {:+.0}; highlights {:+.0}; shadows {:+.0}; whites {:+.0}; blacks {:+.0}; texture {:+.0}; clarity {:+.0}; dehaze {:+.0}; vibrance {:+.0}; saturation {:+.0}",
+            "Exposure {:+0.2} EV; temperature {:+0.0}; tint {:+0.0}; contrast {:+0.0}; highlights {:+0.0}; shadows {:+0.0}; whites {:+0.0}; blacks {:+0.0}; texture {:+0.0}; clarity {:+0.0}; dehaze {:+0.0}; vibrance {:+0.0}; saturation {:+0.0}",
             adjustments.exposure, adjustments.light_balance, adjustments.tint,
             adjustments.contrast, adjustments.highlights, adjustments.shadows,
             adjustments.whites, adjustments.blacks, adjustments.texture,
@@ -2798,9 +3376,10 @@ async fn import_photos(
                 let source_action = if remove_source {
                     safety::delete_verified_external_source(
                         source,
-                        managed_path.as_deref().ok_or_else(|| KeepframeError::Message(
+                        managed_path.as_deref().ok_or_else(|| { KeepframeError::Message(
                             "No verified managed copy was available; the source was retained.".into(),
-                        ))?,
+                        )
+                        })?,
                         &source_hash,
                         &root,
                     )
@@ -3108,13 +3687,13 @@ fn get_asset(asset_id: String, state: State<'_, AppState>) -> Result<Option<Asse
 }
 
 #[tauri::command]
-fn export_xmp_sidecars(asset_ids: Vec<String>, replace_existing: bool, state: State<'_, AppState>) -> Result<interoperability::SidecarExportSummary> {
+fn export_xmp_sidecars(asset_ids: Vec<String>, replace_existing: bool, state: State<'_, AppState>,) -> Result<interoperability::SidecarExportSummary> {
     let mut connection = open_db(&root_from(&state)?)?;
     interoperability::export_sidecars(&mut connection, &asset_ids, replace_existing)
 }
 
 #[tauri::command]
-fn import_xmp_sidecar(asset_id: String, state: State<'_, AppState>) -> Result<interoperability::SidecarImportResult> {
+fn import_xmp_sidecar(asset_id: String, state: State<'_, AppState>,) -> Result<interoperability::SidecarImportResult> {
     let mut connection = open_db(&root_from(&state)?)?;
     interoperability::import_sidecar(&mut connection, &asset_id)
 }
@@ -3123,7 +3702,7 @@ fn import_xmp_sidecar(asset_id: String, state: State<'_, AppState>) -> Result<in
 fn export_portable_catalogue(destination: String, state: State<'_, AppState>) -> Result<String> {
     let root = root_from(&state)?;
     let connection = open_db(&root)?;
-    Ok(interoperability::export_portable_catalogue(&connection, &root, Path::new(&destination))?.to_string_lossy().into())
+    Ok(interoperability::export_portable_catalogue(&connection, &root, Path::new(&destination))?.to_string_lossy().into(),)
 }
 
 #[tauri::command]
@@ -3134,7 +3713,7 @@ fn rescan_library(state: State<'_, AppState>) -> Result<interoperability::Integr
 }
 
 #[tauri::command]
-fn find_relink_candidates(asset_id: String, directory: String, state: State<'_, AppState>) -> Result<Vec<interoperability::RelinkCandidate>> {
+fn find_relink_candidates(asset_id: String, directory: String, state: State<'_, AppState>,) -> Result<Vec<interoperability::RelinkCandidate>> {
     let connection = open_db(&root_from(&state)?)?;
     interoperability::relink_candidates(&connection, &asset_id, Path::new(&directory))
 }
@@ -3182,7 +3761,8 @@ fn restart_folder_watcher(root: &Path, state: &AppState) -> Result<()> {
             }
         }
     }).map_err(|error| KeepframeError::Message(format!("Folder watch could not start: {error}")))?;
-    for folder in &folders { watcher.watch(folder, RecursiveMode::Recursive).map_err(|error| KeepframeError::Message(format!("Could not watch {}: {error}", folder.display())))?; }
+    for folder in &folders { watcher.watch(folder, RecursiveMode::Recursive).map_err(|error| { KeepframeError::Message(format!("Could not watch {}: {error}", folder.display()))
+            })?; }
     let root_for_thread = root.to_path_buf();
     std::thread::spawn(move || {
         let mut pending: HashMap<(String, PathBuf, String), Instant> = HashMap::new();
@@ -3190,7 +3770,7 @@ fn restart_folder_watcher(root: &Path, state: &AppState) -> Result<()> {
             match receiver.recv_timeout(Duration::from_millis(150)) {
                 Ok((folder, path, kind)) => { pending.insert((folder, path, kind), Instant::now()); }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => {},
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             let due = pending.iter().filter(|(_, at)| at.elapsed() >= Duration::from_millis(600)).map(|(key, _)| key.clone()).collect::<Vec<_>>();
             for (folder, path, kind) in due { pending.remove(&(folder.clone(), path.clone(), kind.clone())); write_debounced_watch_event(&root_for_thread, &folder, &path, &kind); }
@@ -3203,8 +3783,9 @@ fn restart_folder_watcher(root: &Path, state: &AppState) -> Result<()> {
 #[tauri::command]
 fn configure_folder_watch(path: String, enabled: bool, state: State<'_, AppState>) -> Result<()> {
     let root = root_from(&state)?;
-    let folder = PathBuf::from(path).canonicalize().map_err(|_| KeepframeError::Message("Choose an existing source folder to watch.".into()))?;
-    if !folder.is_dir() || folder.parent().is_none() { return Err(KeepframeError::Message("Keepframe will not watch a drive root or system-wide location.".into())); }
+    let folder = PathBuf::from(path).canonicalize().map_err(|_| { KeepframeError::Message("Choose an existing source folder to watch.".into())
+    })?;
+    if !folder.is_dir() || folder.parent().is_none() { return Err(KeepframeError::Message("Keepframe will not watch a drive root or system-wide location.".into(),)); }
     let connection = open_db(&root)?;
     connection.execute("INSERT INTO watch_folders(path,enabled,created_at)VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET enabled=excluded.enabled", params![folder.to_string_lossy(),enabled as i64,Utc::now().to_rfc3339()])?;
     restart_folder_watcher(&root, &state)
@@ -3221,7 +3802,8 @@ fn disable_folder_watches(state: State<'_, AppState>) -> Result<()> {
 fn list_folder_watch_events(state: State<'_, AppState>) -> Result<Vec<WatchEventRecord>> {
     let connection = open_db(&root_from(&state)?)?;
     let mut statement = connection.prepare("SELECT id,folder_path,path,kind,observed_at FROM watch_events WHERE state='inbox' ORDER BY observed_at DESC,id DESC LIMIT 250")?;
-    let events = statement.query_map([], |row| Ok(WatchEventRecord { id: row.get(0)?,folder_path: row.get(1)?,path: row.get(2)?,kind: row.get(3)?,observed_at: row.get(4)? }))?
+    let events = statement.query_map([], |row| { Ok(WatchEventRecord { id: row.get(0)?,folder_path: row.get(1)?,path: row.get(2)?,kind: row.get(3)?,observed_at: row.get(4)?, })
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(events)
 }
@@ -3828,9 +4410,9 @@ fn update_location(
     update_location_in(&mut connection, &asset_id, latitude, longitude)
 }
 
-fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitude: f64, longitude: f64) -> Result<usize> {
+fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitude: f64, longitude: f64,) -> Result<usize> {
     if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
-        return Err(KeepframeError::Message("Coordinates are outside the valid range".into()));
+        return Err(KeepframeError::Message("Coordinates are outside the valid range".into(),));
     }
     let mut unique = HashSet::new();
     let ids = asset_ids.iter().filter(|id| unique.insert(id.as_str())).collect::<Vec<_>>();
@@ -3849,7 +4431,7 @@ fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitu
 }
 
 #[tauri::command]
-fn update_locations(asset_ids: Vec<String>, latitude: f64, longitude: f64, state: State<'_, AppState>) -> Result<usize> {
+fn update_locations(asset_ids: Vec<String>, latitude: f64, longitude: f64, state: State<'_, AppState>,) -> Result<usize> {
     let mut connection = open_db(&root_from(&state)?)?;
     update_locations_in(&mut connection, &asset_ids, latitude, longitude)
 }
@@ -4970,7 +5552,7 @@ fn unused_export_path(destination: &Path, stem: &str, extension: &str) -> PathBu
 
 fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Result<PathBuf> {
     if !destination.is_dir() {
-        return Err(KeepframeError::Message("Choose an existing export folder.".into()));
+        return Err(KeepframeError::Message("Choose an existing export folder.".into(),));
     }
     let connection = open_db(root)?;
     let (filename, width, height, preferred): (String, Option<u32>, Option<u32>, Option<String>) = connection.query_row(
@@ -5244,7 +5826,7 @@ fn import_returned_edit_in(
             params![batch_id, prompt, now],
         )?;
     } else {
-        tx.execute("UPDATE batches SET state='succeeded' WHERE id=?1", [&batch_id])?;
+        tx.execute("UPDATE batches SET state='succeeded' WHERE id=?1", [&batch_id],)?;
     }
     let recipe_json = recipe.as_ref().map(serde_json::to_string).transpose()?;
     if had_waiting {
@@ -5300,6 +5882,8 @@ pub fn run() {
             local_ai_url: Mutex::new("http://127.0.0.1:7868".into()),
             health_cache: Mutex::new(None),
             analysis_worker: Mutex::new(AnalysisWorker::default()),
+            mask_generation: AtomicU64::new(0),
+            mask_install_cancel: AtomicBool::new(false),
             folder_watcher: Mutex::new(None),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -5339,6 +5923,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_library_status,
             get_service_health,
+            get_intelligent_mask_health,
+            install_intelligent_mask_model,
+            cancel_intelligent_mask_install,
+            propose_intelligent_mask,
+            cancel_intelligent_mask,
             configure_local_ai,
             initialise_library,
             prepare_review_preview,
@@ -5417,9 +6006,48 @@ pub fn run() {
 mod tests {
     use super::*;
     fn local(exposure:f32)->LocalAdjustments{LocalAdjustments{exposure,..LocalAdjustments::default()}}
-    fn linear_mask(id:&str,exposure:f32)->DevelopMask{DevelopMask{id:id.into(),name:"Linear".into(),enabled:true,inverted:false,opacity:1.0,feather:1.0,geometry:MaskGeometry::Linear{start:MaskPoint{x:0.0,y:0.5},end:MaskPoint{x:1.0,y:0.5}},adjustments:local(exposure)}}
-    fn radial_mask(id:&str,exposure:f32)->DevelopMask{DevelopMask{id:id.into(),name:"Radial".into(),enabled:true,inverted:false,opacity:1.0,feather:0.5,geometry:MaskGeometry::Radial{centre:MaskPoint{x:0.5,y:0.5},radius_x:0.35,radius_y:0.25,rotation:25.0},adjustments:local(exposure)}}
-    fn brush_mask(id:&str,erase:bool)->DevelopMask{DevelopMask{id:id.into(),name:"Brush".into(),enabled:true,inverted:false,opacity:1.0,feather:0.5,geometry:MaskGeometry::Brush{strokes:vec![BrushStroke{points:vec![MaskPoint{x:0.2,y:0.5},MaskPoint{x:0.8,y:0.5}],radius:0.2,feather:0.5,flow:1.0,erase:false},BrushStroke{points:vec![MaskPoint{x:0.5,y:0.5}],radius:0.08,feather:0.2,flow:1.0,erase}]},adjustments:local(1.0)}}
+    fn linear_mask(id:&str,exposure:f32)->DevelopMask{DevelopMask{id:id.into(),name:"Linear".into(),enabled:true,inverted:false,opacity:1.0,feather:1.0,geometry:MaskGeometry::Linear{start:MaskPoint{x:0.0,y:0.5},end:MaskPoint{x:1.0,y:0.5},},adjustments:local(exposure),}}
+    fn radial_mask(id:&str,exposure:f32)->DevelopMask{DevelopMask{id:id.into(),name:"Radial".into(),enabled:true,inverted:false,opacity:1.0,feather:0.5,geometry:MaskGeometry::Radial{centre:MaskPoint{x:0.5,y:0.5},radius_x:0.35,radius_y:0.25,rotation:25.0,},adjustments:local(exposure),}}
+    fn brush_mask(id:&str,erase:bool)->DevelopMask{DevelopMask{id:id.into(),name:"Brush".into(),enabled:true,inverted:false,opacity:1.0,feather:0.5,geometry:MaskGeometry::Brush{strokes:vec![BrushStroke{points:vec![MaskPoint{x:0.2,y:0.5},MaskPoint{x:0.8,y:0.5}],radius:0.2,feather:0.5,flow:1.0,erase:false,},BrushStroke{points:vec![MaskPoint{x:0.5,y:0.5}],radius:0.08,feather:0.2,flow:1.0,erase,},],},adjustments:local(1.0),
+        }
+    }
+    fn semantic_mask(id: &str, exposure: f32) -> DevelopMask {
+        let coverage = image::GrayImage::from_fn(32, 24, |x, y| {
+            image::Luma([if (8..24).contains(&x) && (5..19).contains(&y) {
+                255
+            } else {
+                0
+            }])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(coverage)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        let bytes = bytes.into_inner();
+        DevelopMask {
+            id: id.into(),
+            name: "Subject".into(),
+            enabled: true,
+            inverted: false,
+            opacity: 1.0,
+            feather: 0.0,
+            geometry: MaskGeometry::Semantic {
+                width: 32,
+                height: 24,
+                coverage_png: BASE64.encode(&bytes),
+                checksum: format!("{:x}", Sha256::digest(&bytes)),
+                provenance: Box::new(MaskProvenance {
+                    provider: SEGMENTATION_PROVIDER.into(),
+                    provider_version: SEGMENTATION_PROVIDER_VERSION.into(),
+                    model: SEGMENTATION_MODEL_ID.into(),
+                    model_revision: SEGMENTATION_MODEL_REVISION.into(),
+                    model_sha256: SEGMENTATION_MODEL_SHA256.into(),
+                    category: "subject".into(),
+                    execution_provider: "mock CPU".into(),
+                }),
+                refinements: Vec::new(),
+            },
+            adjustments: local(exposure),}}
     #[test]
     fn supported_formats_are_lowercase_and_unique() {
         let mut values = SUPPORTED.to_vec();
@@ -5464,23 +6092,24 @@ mod tests {
         source.put_pixel(0, 1, image::Rgb([255, 255, 0]));
         source.put_pixel(1, 1, image::Rgb([0, 255, 255]));
         source.put_pixel(2, 1, image::Rgb([255, 0, 255]));
-        let rotated = apply_geometry(&source, BasicAdjustments { rotate_quadrants: 1, ..BasicAdjustments::default() });
+        let rotated = apply_geometry(&source, BasicAdjustments { rotate_quadrants: 1, ..BasicAdjustments::default() },);
         assert_eq!(rotated.dimensions(), (2, 3));
         assert_eq!(rotated.get_pixel(1, 0), &image::Rgb([255, 0, 0]));
-        let cropped = apply_geometry(&source, BasicAdjustments { crop_left: 1.0 / 3.0, crop_width: 2.0 / 3.0, crop_height: 1.0, ..BasicAdjustments::default() });
+        let cropped = apply_geometry(&source, BasicAdjustments { crop_left: 1.0 / 3.0, crop_width: 2.0 / 3.0, crop_height: 1.0, ..BasicAdjustments::default() },);
         assert_eq!(cropped.dimensions(), (2, 2));
         assert_eq!(cropped.get_pixel(0, 0), &image::Rgb([0, 255, 0]));
     }
 
     #[test]
     fn develop_recipe_is_versioned_deterministic_and_supports_flips() {
-        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.5, horizontal_flip: true, ..BasicAdjustments::neutral() }, masks: Vec::new() };
+        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.5, horizontal_flip: true, ..BasicAdjustments::neutral() }, masks: Vec::new(), };
         let round_trip: DevelopRecipe = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
         assert_eq!(round_trip.validate().unwrap(), recipe);
         assert!(recipe.is_edited());
-        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(3, 2, |x, y| image::Rgb([(x * 40) as u8, (y * 70) as u8, 30])));
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(3, 2, |x, y| { image::Rgb([(x * 40) as u8, (y * 70) as u8, 30])
+        }));
         assert_eq!(apply_adjustments_to_image(&source, recipe.settings), apply_adjustments_to_image(&source, recipe.settings));
-        let flipped = apply_geometry(&source.to_rgb8(), BasicAdjustments { horizontal_flip: true, ..BasicAdjustments::neutral() });
+        let flipped = apply_geometry(&source.to_rgb8(), BasicAdjustments { horizontal_flip: true, ..BasicAdjustments::neutral() },);
         assert_eq!(flipped.get_pixel(0, 0), source.to_rgb8().get_pixel(2, 0));
     }
 
@@ -5491,27 +6120,140 @@ mod tests {
 
     #[test]
     fn mask_geometry_round_trips_and_disabled_masks_still_count_as_edits() {
-        let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",1.0),radial_mask("radial",-0.5),brush_mask("brush",true)]};recipe.masks[0].enabled=false;let json=serde_json::to_string(&recipe).unwrap();let decoded=serde_json::from_str::<DevelopRecipe>(&json).unwrap().validate().unwrap();assert_eq!(decoded,recipe);assert!(decoded.is_edited());assert!(!json.contains("bitmap"));
+        let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",1.0),radial_mask("radial",-0.5),brush_mask("brush",true),
+                semantic_mask("subject", 0.4),],};recipe.masks[0].enabled=false;let json=serde_json::to_string(&recipe).unwrap();let decoded=serde_json::from_str::<DevelopRecipe>(&json).unwrap().validate().unwrap();assert_eq!(decoded,recipe);assert!(decoded.is_edited());assert!(!json.contains("bitmap"));
+        assert!(json.contains("coveragePng"));
+    }
+
+    #[test]
+    fn semantic_mask_payload_is_authoritative_and_rejects_corruption() {
+        let mask = semantic_mask("subject", 1.0);
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![mask.clone()],
+        };
+        let json = serde_json::to_string(&recipe).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DevelopRecipe>(&json)
+                .unwrap()
+                .validate()
+                .unwrap(),
+            recipe
+        );
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            320,
+            240,
+            image::Rgb([64, 64, 64]),
+        ));
+        let rendered = render_develop_recipe(&source, &recipe);
+        assert!(rendered.get_pixel(160, 120)[0] > rendered.get_pixel(10, 10)[0]);
+        let mut corrupt = mask;
+        if let MaskGeometry::Semantic { coverage_png, .. } = &mut corrupt.geometry {
+            coverage_png.push('A');
+        }
+        assert!(DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![corrupt]
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn semantic_add_subtract_opacity_and_invert_use_normalised_brushes() {
+        let mut base = semantic_mask("base", 1.0);
+        let left = mask_coverage(&base, 5, 12, 32, 24);
+        let centre = mask_coverage(&base, 16, 12, 32, 24);
+        assert!(left < 0.05 && centre > 0.95);
+        if let MaskGeometry::Semantic { refinements, .. } = &mut base.geometry {
+            refinements.push(BrushStroke {
+                points: vec![MaskPoint { x: 0.15, y: 0.5 }],
+                radius: 0.15,
+                feather: 0.0,
+                flow: 1.0,
+                erase: false,
+            });
+            refinements.push(BrushStroke {
+                points: vec![MaskPoint { x: 0.5, y: 0.5 }],
+                radius: 0.1,
+                feather: 0.0,
+                flow: 1.0,
+                erase: true,
+            });
+        }
+        assert!(mask_coverage(&base, 5, 12, 32, 24) > 0.9);
+        assert!(mask_coverage(&base, 16, 12, 32, 24) < 0.1);
+        base.opacity = 0.5;
+        assert!(mask_coverage(&base, 5, 12, 32, 24) < 0.51);
+        base.inverted = true;
+        assert!(mask_coverage(&base, 16, 12, 32, 24) > 0.45);
+    }
+
+    #[test]
+    fn semantic_mask_alignment_matches_preview_full_and_all_geometry_transforms() {
+        let mask = semantic_mask("subject", 0.7);
+        for (x, y) in [(0.1, 0.1), (0.5, 0.5), (0.8, 0.7)] {
+            let preview = mask_coverage(&mask, (x * 319.0) as u32, (y * 239.0) as u32, 320, 240);
+            let full = mask_coverage(&mask, (x * 3199.0) as u32, (y * 2399.0) as u32, 3200, 2400);
+            assert!(
+                (preview - full).abs() < 0.06,
+                "{x},{y}: {preview} vs {full}"
+            );
+        }
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(96, 64, |x, y| {
+            image::Rgb([(x * 2) as u8, (y * 3) as u8, 80])
+        }));
+        let settings = BasicAdjustments {
+            crop_left: 0.1,
+            crop_top: 0.1,
+            crop_width: 0.75,
+            crop_height: 0.8,
+            rotate_quadrants: 1,
+            straighten: 3.0,
+            horizontal_flip: true,
+            vertical_flip: true,
+            ..BasicAdjustments::neutral()
+        };
+        let before = render_develop_recipe(
+            &source,
+            &DevelopRecipe {
+                schema_version: 2,
+                settings: BasicAdjustments::neutral(),
+                masks: vec![mask.clone()],
+            },
+        );
+        let after = render_develop_recipe(
+            &source,
+            &DevelopRecipe {
+                schema_version: 2,
+                settings,
+                masks: vec![mask],
+            },
+        );
+        assert_eq!(after, apply_geometry(&before, settings));
     }
 
     #[test]
     fn linear_radial_and_inverted_masks_apply_bounded_local_adjustments() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(41,31,image::Rgb([80,80,80])));let linear=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",1.0)]};let output=render_develop_recipe(&source,&linear);assert!(output.get_pixel(38,15)[0]>output.get_pixel(2,15)[0]);let radial=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![radial_mask("radial",1.0)]};let inside=render_develop_recipe(&source,&radial);assert!(inside.get_pixel(20,15)[0]>inside.get_pixel(0,0)[0]);let mut inverted=radial.clone();inverted.masks[0].inverted=true;inverted.masks[0].opacity=0.5;let outside=render_develop_recipe(&source,&inverted);assert!(outside.get_pixel(0,0)[0]>outside.get_pixel(20,15)[0]);
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(41,31,image::Rgb([80,80,80])));let linear=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",1.0)],};let output=render_develop_recipe(&source,&linear);assert!(output.get_pixel(38,15)[0]>output.get_pixel(2,15)[0]);let radial=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![radial_mask("radial",1.0)],};let inside=render_develop_recipe(&source,&radial);assert!(inside.get_pixel(20,15)[0]>inside.get_pixel(0,0)[0]);let mut inverted=radial.clone();inverted.masks[0].inverted=true;inverted.masks[0].opacity=0.5;let outside=render_develop_recipe(&source,&inverted);assert!(outside.get_pixel(0,0)[0]>outside.get_pixel(20,15)[0]);
     }
 
     #[test]
     fn brush_erase_removes_coverage_and_one_stroke_is_compact() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(51,51,image::Rgb([64,64,64])));let paint=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![brush_mask("brush",false)]};let erased=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![brush_mask("brush",true)]};assert!(render_develop_recipe(&source,&paint).get_pixel(25,25)[0]>render_develop_recipe(&source,&erased).get_pixel(25,25)[0]);assert_eq!(match &erased.masks[0].geometry{MaskGeometry::Brush{strokes}=>strokes.len(),_=>0},2);
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(51,51,image::Rgb([64,64,64])));let paint=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![brush_mask("brush",false)],};let erased=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![brush_mask("brush",true)],};assert!(render_develop_recipe(&source,&paint).get_pixel(25,25)[0]>render_develop_recipe(&source,&erased).get_pixel(25,25)[0]);assert_eq!(match &erased.masks[0].geometry{MaskGeometry::Brush{strokes}=>strokes.len(),_=>0,},2);
     }
 
     #[test]
     fn overlapping_masks_compose_deterministically_after_global_edits() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(32,24,image::Rgb([90,100,110])));let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{contrast:10.0,..BasicAdjustments::neutral()},masks:vec![linear_mask("a",0.5),radial_mask("b",0.5)]};let first=render_develop_recipe(&source,&recipe);assert_eq!(first,render_develop_recipe(&source,&recipe));assert_ne!(first,source.to_rgb8());
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(32,24,image::Rgb([90,100,110]),));let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{contrast:10.0,..BasicAdjustments::neutral()},masks:vec![linear_mask("a",0.5),radial_mask("b",0.5)],};let first=render_develop_recipe(&source,&recipe);assert_eq!(first,render_develop_recipe(&source,&recipe));assert_ne!(first,source.to_rgb8());
     }
 
     #[test]
     fn masks_remain_attached_when_crop_rotation_and_flips_change() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(48,32,|x,y|image::Rgb([(x*3)as u8,(y*4)as u8,80])));let geometry=BasicAdjustments{crop_left:0.1,crop_top:0.1,crop_width:0.8,crop_height:0.8,rotate_quadrants:1,horizontal_flip:true,vertical_flip:true,..BasicAdjustments::neutral()};let recipe=DevelopRecipe{schema_version:2,settings:geometry,masks:vec![linear_mask("linear",0.7)]};let rendered=render_develop_recipe(&source,&recipe);let before=render_develop_recipe(&source,&DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:recipe.masks.clone()});assert_eq!(rendered,apply_geometry(&before,geometry));
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(48,32,|x,y| {image::Rgb([(x*3)as u8,(y*4)as u8,80])
+        }));let geometry=BasicAdjustments{crop_left:0.1,crop_top:0.1,crop_width:0.8,crop_height:0.8,rotate_quadrants:1,horizontal_flip:true,vertical_flip:true,..BasicAdjustments::neutral()};let recipe=DevelopRecipe{schema_version:2,settings:geometry,masks:vec![linear_mask("linear",0.7)],};let rendered=render_develop_recipe(&source,&recipe);let before=render_develop_recipe(&source,&DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:recipe.masks.clone(),},);assert_eq!(rendered,apply_geometry(&before,geometry));
     }
 
     #[test]
@@ -5521,20 +6263,39 @@ mod tests {
 
     #[test]
     fn disabling_a_mask_restores_the_global_render() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(24,18,image::Rgb([72,82,92])));let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{contrast:8.0,..BasicAdjustments::neutral()},masks:vec![linear_mask("linear",1.0)]};let enabled=render_develop_recipe(&source,&recipe);recipe.masks[0].enabled=false;let disabled=render_develop_recipe(&source,&recipe);assert_eq!(disabled,apply_adjustments_to_image(&source,recipe.settings));assert_ne!(enabled,disabled);
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(24,18,image::Rgb([72,82,92])));let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{contrast:8.0,..BasicAdjustments::neutral()},masks:vec![linear_mask("linear",1.0)],};let enabled=render_develop_recipe(&source,&recipe);recipe.masks[0].enabled=false;let disabled=render_develop_recipe(&source,&recipe);assert_eq!(disabled,apply_adjustments_to_image(&source,recipe.settings));assert_ne!(enabled,disabled);
     }
 
     #[test]
     fn mask_geometry_changes_preview_cache_identity() {
-        let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",0.5)]};let first=Sha256::digest(serde_json::to_vec(&recipe).unwrap());if let MaskGeometry::Linear{end,..}=&mut recipe.masks[0].geometry{end.x=0.8;}let second=Sha256::digest(serde_json::to_vec(&recipe).unwrap());assert_ne!(first,second);
+        let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",0.5)],};let first=Sha256::digest(serde_json::to_vec(&recipe).unwrap());if let MaskGeometry::Linear{end,..}=&mut recipe.masks[0].geometry{end.x=0.8;}let second=Sha256::digest(serde_json::to_vec(&recipe).unwrap());assert_ne!(first,second);
+        let mut semantic = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![semantic_mask("subject", 0.5)],
+        };
+        let accepted = Sha256::digest(serde_json::to_vec(&semantic).unwrap());
+        if let MaskGeometry::Semantic { refinements, .. } = &mut semantic.masks[0].geometry {
+            refinements.push(BrushStroke {
+                points: vec![MaskPoint { x: 0.5, y: 0.5 }],
+                radius: 0.1,
+                feather: 0.5,
+                flow: 1.0,
+                erase: true,
+            });
+        }
+        assert_ne!(
+            accepted,
+            Sha256::digest(serde_json::to_vec(&semantic).unwrap())
+        );
     }
 
     #[test]
     fn copied_develop_recipe_contains_no_asset_metadata() {
-        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.5, saturation: 12.0, ..BasicAdjustments::neutral() }, masks: Vec::new() };
+        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.5, saturation: 12.0, ..BasicAdjustments::neutral() }, masks: Vec::new(), };
         let copied: DevelopRecipe = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
         let stored = serde_json::to_string(&copied).unwrap();
-        for forbidden in ["filename", "capturedAt", "decision", "tags", "latitude", "longitude", "path", "assetId"] {
+        for forbidden in ["filename", "capturedAt", "decision", "tags", "latitude", "longitude", "path", "assetId",] {
             assert!(!stored.contains(forbidden), "copied Develop settings leaked {forbidden}");
         }
         assert_eq!(copied.settings, recipe.settings);
@@ -5552,7 +6313,8 @@ mod tests {
         connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','photo.png','2026-09-12T12:00:00Z',64,48,?1,'2026-09-12T12:00:00Z')", [original.to_string_lossy().as_ref()]).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)", params![original.to_string_lossy(), original_hash, fs::metadata(&original).unwrap().len()]).unwrap();
         let mut inverted_radial=radial_mask("radial",-0.3);inverted_radial.inverted=true;
-        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.75, crop_left: 0.1, crop_width: 0.8, rotate_quadrants: 1, ..BasicAdjustments::neutral() }, masks: vec![linear_mask("linear",0.5),inverted_radial,brush_mask("brush",true)] };
+        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.75, crop_left: 0.1, crop_width: 0.8, rotate_quadrants: 1, ..BasicAdjustments::neutral() }, masks: vec![linear_mask("linear",0.5),inverted_radial,brush_mask("brush",true),
+                semantic_mask("subject", 0.3),], };
         connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,?2)", params![serde_json::to_string(&recipe).unwrap(), Utc::now().to_rfc3339()]).unwrap();
         assert_eq!(develop_recipe_in(&connection, "asset").unwrap(), recipe);
         drop(connection);
@@ -5566,7 +6328,8 @@ mod tests {
     #[test]
     #[ignore = "manual performance checkpoint; run with --ignored --nocapture"]
     fn develop_render_performance_checkpoint() {
-        let preview = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])));
+        let preview = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| { image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        }));
         let recipe = BasicAdjustments { exposure: 0.35, highlights: -20.0, shadows: 18.0, texture: 10.0, clarity: 8.0, saturation: 6.0, ..BasicAdjustments::neutral() };
         let preview_started = Instant::now();
         let rendered_preview = apply_adjustments_to_image(&preview, recipe);
@@ -5574,9 +6337,9 @@ mod tests {
         let warm_started = Instant::now();
         let cache_key = Sha256::digest(serde_json::to_vec(&recipe).unwrap());
         let warm_elapsed = warm_started.elapsed();
-        let full = image::DynamicImage::ImageRgb8(image::imageops::resize(&rendered_preview, 2400, 1600, image::imageops::FilterType::Triangle));
+        let full = image::DynamicImage::ImageRgb8(image::imageops::resize(&rendered_preview, 2400, 1600, image::imageops::FilterType::Triangle,));
         let export_started = Instant::now();
-        let encoded = encode_srgb_png(&image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&full, recipe))).unwrap();
+        let encoded = encode_srgb_png(&image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&full, recipe,))).unwrap();
         let export_elapsed = export_started.elapsed();
         eprintln!("Develop checkpoint: 720x480 preview={preview_elapsed:?}; warm recipe/cache-key={warm_elapsed:?}; 2400x1600 render+PNG={export_elapsed:?}; output={} bytes", encoded.len());
         assert!(!cache_key.is_empty());
@@ -5587,7 +6350,82 @@ mod tests {
     #[test]
     #[ignore = "manual Milestone 8 renderer and masking profile; run with --ignored --nocapture"]
     fn mask_render_performance_checkpoint() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(720,480,|x,y|image::Rgb([(x%220)as u8+20,(y%210)as u8+20,((x+y)%200)as u8+30])));let bytes=encode_srgb_png(&source).unwrap();let started=Instant::now();let decoded=image::load_from_memory(&bytes).unwrap();let decode=started.elapsed();let started=Instant::now();let global=apply_colour_adjustments_to_image(&decoded,BasicAdjustments{exposure:0.2,clarity:5.0,..BasicAdjustments::neutral()});let global_elapsed=started.elapsed();let mask=linear_mask("profile",0.25);let started=Instant::now();let mut sum=0.0;for y in 0..decoded.height(){for x in 0..decoded.width(){sum+=mask_coverage(&mask,x,y,decoded.width(),decoded.height());}}let raster=started.elapsed();let mut times=Vec::new();for count in [1,5,10]{let masks=(0..count).map(|index|linear_mask(&format!("mask-{index}"),0.12)).collect();let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks};let started=Instant::now();let rendered=render_develop_recipe(&decoded,&recipe);times.push((count,started.elapsed(),rendered));}let started=Instant::now();let resized=image::imageops::resize(&global,360,240,image::imageops::FilterType::Triangle);let resize=started.elapsed();let started=Instant::now();let encoded=encode_srgb_png(&image::DynamicImage::ImageRgb8(times[0].2.clone())).unwrap();let encode=started.elapsed();eprintln!("Milestone 8 profile 720x480: decode={decode:?}; global={global_elapsed:?}; one-mask-raster={raster:?}; local-composite 1={:?} 5={:?} 10={:?}; resize={resize:?}; encode={encode:?}; coverage={sum:.1}; bytes={} resized={}x{}",times[0].1,times[1].1,times[2].1,encoded.len(),resized.width(),resized.height());assert!(times[2].1<Duration::from_secs(30));
+        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(720,480,|x,y| {image::Rgb([(x%220)as u8+20,(y%210)as u8+20,((x+y)%200)as u8+30,])
+        }));let bytes=encode_srgb_png(&source).unwrap();let started=Instant::now();let decoded=image::load_from_memory(&bytes).unwrap();let decode=started.elapsed();let started=Instant::now();let global=apply_colour_adjustments_to_image(&decoded,BasicAdjustments{exposure:0.2,clarity:5.0,..BasicAdjustments::neutral()},);let global_elapsed=started.elapsed();let mask=linear_mask("profile",0.25);let started=Instant::now();let mut sum=0.0;for y in 0..decoded.height(){for x in 0..decoded.width(){sum+=mask_coverage(&mask,x,y,decoded.width(),decoded.height());}}let raster=started.elapsed();let mut times=Vec::new();for count in [1,5,10]{let masks=(0..count).map(|index|linear_mask(&format!("mask-{index}"),0.12)).collect();let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks,};let started=Instant::now();let rendered=render_develop_recipe(&decoded,&recipe);times.push((count,started.elapsed(),rendered));}let started=Instant::now();let resized=image::imageops::resize(&global,360,240,image::imageops::FilterType::Triangle);let resize=started.elapsed();let started=Instant::now();let encoded=encode_srgb_png(&image::DynamicImage::ImageRgb8(times[0].2.clone())).unwrap();let encode=started.elapsed();eprintln!("Milestone 8 profile 720x480: decode={decode:?}; global={global_elapsed:?}; one-mask-raster={raster:?}; local-composite 1={:?} 5={:?} 10={:?}; resize={resize:?}; encode={encode:?}; coverage={sum:.1}; bytes={} resized={}x{}",times[0].1,times[1].1,times[2].1,encoded.len(),resized.width(),resized.height());assert!(times[2].1<Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "manual Milestone 9 accepted-mask performance checkpoint; run with --ignored --nocapture"]
+    fn semantic_mask_performance_checkpoint() {
+        let coverage = image::GrayImage::from_fn(640, 427, |x, y| {
+            image::Luma([if x > 120 && x < 520 && y < 230 {
+                255
+            } else {
+                0
+            }])
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(coverage)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        let mask = DevelopMask {
+            id: "semantic-profile".into(),
+            name: "Sky".into(),
+            enabled: true,
+            inverted: false,
+            opacity: 1.0,
+            feather: 0.0,
+            geometry: MaskGeometry::Semantic {
+                width: 640,
+                height: 427,
+                coverage_png: BASE64.encode(&encoded),
+                checksum: format!("{:x}", Sha256::digest(&encoded)),
+                provenance: Box::new(MaskProvenance {
+                    provider: SEGMENTATION_PROVIDER.into(),
+                    provider_version: SEGMENTATION_PROVIDER_VERSION.into(),
+                    model: SEGMENTATION_MODEL_ID.into(),
+                    model_revision: SEGMENTATION_MODEL_REVISION.into(),
+                    model_sha256: SEGMENTATION_MODEL_SHA256.into(),
+                    category: "sky".into(),
+                    execution_provider: "qualification fixture".into(),
+                }),
+                refinements: Vec::new(),
+            },
+            adjustments: local(0.25),
+        };
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![mask],
+        }
+        .validate()
+        .unwrap();
+        let started = Instant::now();
+        let prepared = prepared_semantic_coverage(&recipe.masks[0], 720, 480)
+            .unwrap()
+            .unwrap();
+        let overlay = started.elapsed();
+        assert_eq!(prepared.dimensions(), (720, 480));
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE develop_recipes(asset_id TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,recipe_json TEXT NOT NULL,updated_at TEXT NOT NULL);").unwrap();
+        let serialised = serde_json::to_string(&recipe).unwrap();
+        let started = Instant::now();
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,'2026-09-12T00:00:00Z')",[&serialised]).unwrap();
+        let persist = started.elapsed();
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| {
+            image::Rgb([
+                (x % 220) as u8 + 20,
+                (y % 210) as u8 + 20,
+                ((x + y) % 200) as u8 + 30,
+            ])
+        }));
+        let started = Instant::now();
+        let rendered = render_develop_recipe(&source, &recipe);
+        let preview = started.elapsed();
+        eprintln!("Milestone 9 semantic profile 640x427 -> 720x480: overlay/raster={overlay:?}; accepted-payload persistence={persist:?}; preview render={preview:?}; compressed={} bytes; JSON={} bytes; temporary coverage={} bytes",encoded.len(),serialised.len(),640*427);
+        assert_eq!(rendered.dimensions(), (720, 480));
+        assert!(preview < Duration::from_secs(10));
     }
 
     #[test]
@@ -5696,16 +6534,16 @@ mod tests {
 
     #[test]
     fn untrusted_preset_rejects_unknown_categories_and_out_of_range_values() {
-        let invalid_category = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["filesystem".into()], settings: BasicAdjustments::neutral(), built_in: false };
+        let invalid_category = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["filesystem".into()], settings: BasicAdjustments::neutral(), built_in: false, };
         assert!(invalid_category.validate(true).is_err());
-        let invalid_value = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["tone".into()], settings: BasicAdjustments { exposure: 99.0, ..BasicAdjustments::neutral() }, built_in: false };
+        let invalid_value = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["tone".into()], settings: BasicAdjustments { exposure: 99.0, ..BasicAdjustments::neutral() }, built_in: false, };
         assert!(invalid_value.validate(true).is_err());
     }
 
     #[test]
     fn auto_analysis_is_image_dependent_conservative_and_preserves_geometry() {
         let dark = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([45, 18, 8])));
-        let bright = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([245, 245, 245])));
+        let bright = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([245, 245, 245]),));
         let current = BasicAdjustments { crop_left: 0.1, crop_top: 0.1, crop_width: 0.8, crop_height: 0.8, rotate_quadrants: 1, ..BasicAdjustments::neutral() };
         let dark_proposal = auto_proposal(&dark, current); let bright_proposal = auto_proposal(&bright, current);
         assert!(dark_proposal.settings.exposure > current.exposure);
@@ -5728,7 +6566,8 @@ mod tests {
     #[test]
     #[ignore = "manual Milestone 7 performance checkpoint; run with --ignored --nocapture"]
     fn intelligent_editing_performance_checkpoint() {
-        let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * 3 + y) % 256) as u8])));
+        let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| { image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * 3 + y) % 256) as u8])
+        }));
         let histogram_started = Instant::now(); let statistics = image_statistics(&image); let histogram_elapsed = histogram_started.elapsed();
         let auto_started = Instant::now(); let proposal = auto_proposal(&image, BasicAdjustments::neutral()); let auto_elapsed = auto_started.elapsed();
         let preview_started = Instant::now(); let _preview = apply_adjustments_to_image(&image, proposal.settings); let preview_elapsed = preview_started.elapsed();
@@ -5808,7 +6647,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         let recorded: i64 = connection
-            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=5", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=5", [], |row| row.get(0),)
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(recorded, 1);
@@ -5823,7 +6662,7 @@ mod tests {
         connection.execute("INSERT INTO assets(id,captured_at,latitude,longitude)VALUES('embedded','2026-09-12T12:00:00Z',56.2,-3.0),('none','2026-09-12T12:00:00Z',NULL,NULL)", []).unwrap();
         migrations::apply_v5(&mut connection, true, 4).unwrap();
         let embedded: (Option<f64>, Option<f64>, String) = connection.query_row("SELECT embedded_latitude,embedded_longitude,location_source FROM assets WHERE id='embedded'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        let none: String = connection.query_row("SELECT location_source FROM assets WHERE id='none'", [], |row| row.get(0)).unwrap();
+        let none: String = connection.query_row("SELECT location_source FROM assets WHERE id='none'", [], |row| row.get(0),).unwrap();
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         assert_eq!(embedded, (Some(56.2), Some(-3.0), "embedded".into()));
         assert_eq!(none, "none");
@@ -5852,7 +6691,8 @@ mod tests {
 
         let notice = recover_interrupted_operations(&root).unwrap().unwrap();
         let connection = open_db(&root).unwrap();
-        let state: String = connection.query_row("SELECT state FROM imports WHERE id='import-1'", [], |row| row.get(0)).unwrap();
+        let state: String = connection.query_row("SELECT state FROM imports WHERE id='import-1'", [], |row| { row.get(0)
+            }).unwrap();
         assert_eq!(state, "needs_attention");
         assert!(notice.contains("Original source files were not deleted"));
         assert_eq!(fs::read(&staged).unwrap(), b"staged pixels");
@@ -5881,7 +6721,7 @@ mod tests {
 
         let notice = recover_interrupted_operations(&root).unwrap().unwrap();
         let connection = open_db(&root).unwrap();
-        let is_trashed: Option<String> = connection.query_row("SELECT trashed_at FROM assets WHERE id='asset-1'", [], |row| row.get(0)).unwrap();
+        let is_trashed: Option<String> = connection.query_row("SELECT trashed_at FROM assets WHERE id='asset-1'", [], |row| row.get(0),).unwrap();
         assert!(is_trashed.is_some());
         assert!(notice.contains("without deleting files"));
         assert_eq!(fs::read(&trashed).unwrap(), b"managed pixels");
@@ -5896,7 +6736,7 @@ mod tests {
         let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(24, 12, |x, y| {
             image::Rgb([(x * 10) as u8, (y * 20) as u8, 90])
         }));
-        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff)] {
+        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff),] {
             let source = root.join(name);
             let thumbnail = root.join(format!("{name}.thumbnail.jpg"));
             image.save_with_format(&source, format).unwrap();
@@ -5919,7 +6759,7 @@ mod tests {
             image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8])
         }));
         let adjustments = BasicAdjustments { crop_left: 0.2, crop_top: 0.1, crop_width: 0.5, crop_height: 0.75, rotate_quadrants: 1, straighten: 3.0, ..BasicAdjustments::default() }.validate().unwrap();
-        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff)] {
+        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff),] {
             let source = root.join(name);
             source_image.save_with_format(&source, format).unwrap();
             let before_hash = hash_file(&source).unwrap();
@@ -5929,7 +6769,7 @@ mod tests {
             assert_eq!(candidate.dimensions(), (10, 23), "{name}");
             assert_eq!(candidate, preview, "{name}");
             let output = root.join(format!("{name}.candidate.png"));
-            fs::write(&output, encode_srgb_png(&image::DynamicImage::ImageRgb8(candidate)).unwrap()).unwrap();
+            fs::write(&output, encode_srgb_png(&image::DynamicImage::ImageRgb8(candidate)).unwrap(),).unwrap();
             let rendered = image::open(&output).unwrap();
             assert_eq!((rendered.width(), rendered.height()), (10, 23), "{name}");
             assert_eq!(hash_file(&source).unwrap(), before_hash, "{name} source was modified");
@@ -5986,7 +6826,7 @@ mod tests {
     }
 
     fn map_filter() -> AssetFilter {
-        AssetFilter { decision: "all".into(), search: String::new(), year: None, tag: None, date_from: None, date_to: None, camera: None, tagged: None, located: None, trashed: Some(false) }
+        AssetFilter { decision: "all".into(), search: String::new(), year: None, tag: None, date_from: None, date_to: None, camera: None, tagged: None, located: None, trashed: Some(false), }
     }
 
     #[test]
@@ -5994,14 +6834,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("keepframe-map-query-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let connection = open_db(&root).unwrap();
-        for (id, decision, latitude, longitude) in [("keep", "keep", 56.12, -3.1), ("discard", "discard", 56.15, -3.2), ("bad", "keep", 95.0, -3.3), ("none", "keep", 0.0, 0.0)] {
+        for (id, decision, latitude, longitude) in [("keep", "keep", 56.12, -3.1), ("discard", "discard", 56.15, -3.2), ("bad", "keep", 95.0, -3.3), ("none", "keep", 0.0, 0.0),] {
             connection.execute("INSERT INTO assets(id,filename,decision,captured_at,latitude,longitude,location_source,thumbnail_path,created_at)VALUES(?1,?1,?2,'2026-09-12T12:00:00Z',?3,?4,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", params![id, decision, latitude, longitude]).unwrap();
         }
         connection.execute("UPDATE assets SET latitude=NULL,longitude=NULL,location_source='none' WHERE id='none'", []).unwrap();
-        let all = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None }).unwrap();
+        let all = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None, },).unwrap();
         assert_eq!(all.len(), 2);
         let mut keep = map_filter(); keep.decision = "keep".into();
-        let bounded = query_map_assets_in(&connection, &MapQuery { filter: keep, bounds: Some(MapBounds { south: 56.0, west: -3.15, north: 56.13, east: -3.0 }) }).unwrap();
+        let bounded = query_map_assets_in(&connection, &MapQuery { filter: keep, bounds: Some(MapBounds { south: 56.0, west: -3.15, north: 56.13, east: -3.0, }), },).unwrap();
         assert_eq!(bounded.len(), 1);
         assert_eq!(bounded[0].id, "keep");
         assert!(query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: Some(MapBounds { south: 20.0, west: 0.0, north: -20.0, east: 1.0 }) }).is_err());
@@ -6036,7 +6876,7 @@ mod tests {
             }
             tx.commit().unwrap();
             let started = Instant::now();
-            let markers = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None }).unwrap();
+            let markers = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None, },).unwrap();
             assert_eq!(markers.len(), expected);
             assert!(started.elapsed() < Duration::from_secs(5), "lightweight marker query should remain responsive");
         }
@@ -6493,7 +7333,8 @@ mod tests {
         assert_eq!(image::open(&prepared).unwrap().dimensions(), (128, 96));
         assert_eq!(fs::read_to_string(prepared.with_extension("prompt.txt")).unwrap(), "Improve the lighting naturally.");
         let connection = open_db(&root).unwrap();
-        let waiting: String = connection.query_row("SELECT state FROM jobs WHERE asset_id='asset'", [], |row| row.get(0)).unwrap();
+        let waiting: String = connection.query_row("SELECT state FROM jobs WHERE asset_id='asset'", [], |row| { row.get(0)
+            }).unwrap();
         assert_eq!(waiting, "waiting_external");
         drop(connection);
 
@@ -6509,7 +7350,7 @@ mod tests {
         let mut returned_pixels = image::RgbImage::new(128, 96);
         returned_pixels.put_pixel(127, 95, image::Rgb([200, 180, 160]));
         returned_pixels.save(&returned).unwrap();
-        let job = import_returned_edit_in(&root, "asset", &returned, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).unwrap();
+        let job = import_returned_edit_in(&root, "asset", &returned, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset")),).unwrap();
         assert_eq!(job.state, "succeeded");
         assert_eq!(job.recipe.unwrap().asset_id, "asset");
         let connection = open_db(&root).unwrap();
@@ -6523,7 +7364,7 @@ mod tests {
         assert_eq!(version_state, "candidate");
         assert_eq!(hash_file(&original).unwrap(), original_hash);
         assert_eq!(transition_job_in(&connection, &job.id, "accept").unwrap(), "accepted");
-        let preferred: String = connection.query_row("SELECT preferred_version_id FROM assets WHERE id='asset'", [], |row| row.get(0)).unwrap();
+        let preferred: String = connection.query_row("SELECT preferred_version_id FROM assets WHERE id='asset'", [], |row| row.get(0),).unwrap();
         assert!(!preferred.is_empty());
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
