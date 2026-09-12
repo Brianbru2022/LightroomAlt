@@ -340,6 +340,72 @@ export function App() {
       }
     } catch (error) { setNotice(`Could not import replacement: ${String(error)}`); }
   };
+  const exportSidecars = async (scope: "selected" | "filtered" | "library", replaceExisting: boolean) => {
+    try {
+      const ids = scope === "selected" && selected ? [selected.id] : await api.assetIds(scope === "library" ? { decision: "all", search: "" } : effectiveFilter);
+      if (!ids.length) { setNotice("No photographs match that sidecar export scope."); return; }
+      if (scope === "library" && !window.confirm(`Export XMP sidecars for all ${ids.length} catalogue photographs? This writes local metadata files beside originals and may include GPS coordinates.`)) return;
+      const replace = replaceExisting || window.confirm("Replace any existing XMP sidecars in this explicit export? Choose Cancel to preserve existing sidecars.");
+      setBusy(true);
+      const summary = await api.exportSidecars(ids, replace);
+      const failures = summary.failed.length ? ` ${summary.failed.length} could not be written.` : "";
+      setNotice(`${summary.written} XMP sidecar${summary.written === 1 ? "" : "s"} written; ${summary.preservedExisting} existing sidecar${summary.preservedExisting === 1 ? "" : "s"} preserved.${failures}`);
+    } catch (error) { setNotice(`XMP export failed: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const importSidecar = async () => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const result = await api.importSidecar(selected.id);
+      await refreshCatalogue();
+      const changes = [result.tagsImported && "tags", result.locationImported && "location", result.triageImported && "triage"].filter(Boolean);
+      setNotice(`${changes.length ? `Sidecar imported: ${changes.join(", ")}.` : "Sidecar contained no safe catalogue changes."}${result.conflicts.length ? ` ${result.conflicts.join(" ")}` : ""}`);
+    } catch (error) { setNotice(`XMP import failed: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const exportPortableCatalogue = async () => {
+    setBusy(true);
+    try { const path = await api.exportPortableCatalogue(); if (path) setNotice(`Portable catalogue exported to ${path}`); }
+    catch (error) { setNotice(`Portable catalogue export failed: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const rescanLibrary = async () => {
+    setBusy(true);
+    try {
+      const report = await api.rescanLibrary();
+      await refreshCatalogue();
+      setNotice(`Rescan checked ${report.scannedAssets} assets: ${report.missingOriginals} missing originals, ${report.missingDerivedVersions} missing derived versions, ${report.modifiedOriginals} modified originals, ${report.untrackedManagedFiles} untracked managed files, ${report.sidecarConflicts} sidecar conflicts.`);
+    } catch (error) { setNotice(`Library rescan failed: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const relinkSelected = async () => {
+    if (!selected) return;
+    setBusy(true);
+    try { const path = await api.relinkSelectedAsset(selected.id); if (path) { await refreshCatalogue(); setNotice(`Selected photograph relinked after hash confirmation: ${path}`); } }
+    catch (error) { setNotice(`Relink failed: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const addFolderWatch = async () => {
+    setBusy(true);
+    try { if (await api.addFolderWatch()) setNotice("Folder watch enabled. Changes will appear in the local Changes-detected Inbox; no files are imported automatically."); }
+    catch (error) { setNotice(`Folder watch could not be enabled: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const disableFolderWatches = async () => {
+    setBusy(true);
+    try { await api.disableFolderWatches(); setNotice("All folder watches are disabled. Existing Inbox findings were retained."); }
+    catch (error) { setNotice(`Folder watches could not be disabled: ${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const showFolderWatchEvents = async () => {
+    try {
+      const events = await api.folderWatchEvents();
+      if (!events.length) { setNotice("The Changes-detected Inbox is empty."); return; }
+      const counts = events.reduce<Record<string, number>>((value, event) => ({ ...value, [event.kind]: (value[event.kind] ?? 0) + 1 }), {});
+      setNotice(`Changes-detected Inbox: ${events.length} finding${events.length === 1 ? "" : "s"} (${counts.new_file ?? 0} new, ${counts.file_changed ?? 0} changed, ${counts.file_removed ?? 0} removed).`);
+    } catch (error) { setNotice(`Could not read folder-watch findings: ${String(error)}`); }
+  };
 
   if (busy && !status.configured) return <div className="app-loading"><span className="brand-mark">K</span><p>Opening Keepframe…</p></div>;
   if (!status.configured) return <SetupScreen issue={status.libraryIssue} onChoose={api.chooseLibrary} onCreate={async (path) => { setBusy(true); try { setStatus(await api.initialiseLibrary(path)); } catch (error) { setNotice(`Could not open the library: ${String(error)}`); } finally { setBusy(false); } }} />;
@@ -354,7 +420,7 @@ export function App() {
         {view === "map" ? <MapView assets={assets} mapAssets={mapAssets} mapLoading={mapLoading} total={visibleTotal} selected={selected} onSelect={selectMapAsset} onLocations={saveLocations} onClearManualLocation={clearManualLocation} onOpenSelected={() => setView("triage")} onLocatedFilter={(located) => { setSpatialBounds(undefined); setFilter((value) => ({ ...value, located })); }} spatialBounds={spatialBounds} onUseVisibleBounds={setSpatialBounds} onClearSpatialBounds={() => setSpatialBounds(undefined)} /> : null}
         {view === "workshop" ? <WorkshopView asset={selected} assets={assets} jobs={jobs} serviceHealth={health} onAnalyse={(asset, intent: EditIntent, action, brief) => api.analyse(asset, intent, action, brief)} onPrompts={api.prompts} onCopy={api.copy} onPrepare={async (assetId, provider, prompt) => { const path = await api.prepareCloud(assetId, provider, prompt); setJobs(await api.jobs()); setNotice(`Prepared a local PNG and provider-specific instruction at ${path}. Upload it yourself, then import the returned image.`); }} onExportExternal={async (assetId, provider, prompt) => { const path = await api.exportExternal(assetId, provider, prompt); if (path) setNotice(`External AI image and prompt exported to ${path}`); }} onImportReturned={async (assetId, provider, prompt, recipe) => { const job = await api.importReturned(assetId, provider, prompt, recipe); if (job) { setJobs(await api.jobs()); setNotice("Returned edit validated and imported as a candidate version. The original is unchanged."); } }} onLoadVersions={api.versions} onSetPreferred={async (assetId, versionId) => { await api.setPreferredVersion(assetId, versionId); await refreshCatalogue(); setNotice("Preferred display version updated; catalogue metadata is unchanged."); }} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={async (asset, adjustments: BasicAdjustments) => { const version = await api.applyBasicAdjustments(asset, adjustments); setNotice("Adjustment saved as a candidate version; the protected original is unchanged."); return version; }} onEnqueue={enqueue} onRunLocal={runLocal} onJob={updateJob} onSaveJobReview={saveJobReview} onApproveJobs={approveJobs} /> : null}
         {view === "trash" ? <LibraryView mode="trash" assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={(asset) => setSelectedId(asset.id)} onRestoreAll={restoreAllTrash} onEmptyTrash={emptyAllTrash} /> : null}
-        {view === "settings" ? <SettingsView status={status} health={health} busy={busy} onRefreshAi={async () => { setHealth(await api.serviceHealth(true)); }} onConfigureAi={async (url) => { await api.configureLocalAi(url); setHealth(await api.serviceHealth(true)); setNotice("Local AI service address saved. Keepframe permits loopback addresses only."); }} onIntegrity={async () => { setBusy(true); try { setNotice(`Catalogue integrity: ${await api.catalogueIntegrity()}.`); } catch (error) { setNotice(`Integrity check failed: ${String(error)}`); } finally { setBusy(false); } }} onBackup={async () => { setBusy(true); try { setNotice(`Verified backup created at ${await api.createBackup()}`); } catch (error) { setNotice(`Backup failed: ${String(error)}`); } finally { setBusy(false); } }} onRestore={async () => { if (!window.confirm("Restore a catalogue backup? Keepframe will first create a safety backup of the current catalogue.")) return; setBusy(true); try { if (await api.restoreBackup()) { await refreshCatalogue(); setNotice("Catalogue backup restored and verified."); } } catch (error) { setNotice(`Restore failed: ${String(error)}`); } finally { setBusy(false); } }} onRebuild={async () => { setBusy(true); try { const count = await api.rebuildThumbnails(); await refreshCatalogue(); setNotice(`${count} thumbnails rebuilt.`); } catch (error) { setNotice(`Thumbnail rebuild failed: ${String(error)}`); } finally { setBusy(false); } }} onDiagnostics={async () => { setBusy(true); try { const path = await api.exportDiagnostics(); if (path) setNotice(`Privacy-safe diagnostics exported to ${path}`); } catch (error) { setNotice(`Diagnostics export failed: ${String(error)}`); } finally { setBusy(false); } }} /> : null}
+        {view === "settings" ? <SettingsView status={status} health={health} busy={busy} selectedAssetName={selected?.filename} onExportSidecars={exportSidecars} onImportSidecar={importSidecar} onExportPortableCatalogue={exportPortableCatalogue} onRescanLibrary={rescanLibrary} onRelinkSelected={relinkSelected} onAddFolderWatch={addFolderWatch} onDisableFolderWatches={disableFolderWatches} onShowFolderWatchEvents={showFolderWatchEvents} onRefreshAi={async () => { setHealth(await api.serviceHealth(true)); }} onConfigureAi={async (url) => { await api.configureLocalAi(url); setHealth(await api.serviceHealth(true)); setNotice("Local AI service address saved. Keepframe permits loopback addresses only."); }} onIntegrity={async () => { setBusy(true); try { setNotice(`Catalogue integrity: ${await api.catalogueIntegrity()}.`); } catch (error) { setNotice(`Integrity check failed: ${String(error)}`); } finally { setBusy(false); } }} onBackup={async () => { setBusy(true); try { setNotice(`Verified backup created at ${await api.createBackup()}`); } catch (error) { setNotice(`Backup failed: ${String(error)}`); } finally { setBusy(false); } }} onRestore={async () => { if (!window.confirm("Restore a catalogue backup? Keepframe will first create a safety backup of the current catalogue.")) return; setBusy(true); try { if (await api.restoreBackup()) { await refreshCatalogue(); setNotice("Catalogue backup restored and verified."); } } catch (error) { setNotice(`Restore failed: ${String(error)}`); } finally { setBusy(false); } }} onRebuild={async () => { setBusy(true); try { const count = await api.rebuildThumbnails(); await refreshCatalogue(); setNotice(`${count} thumbnails rebuilt.`); } catch (error) { setNotice(`Thumbnail rebuild failed: ${String(error)}`); } finally { setBusy(false); } }} onDiagnostics={async () => { setBusy(true); try { const path = await api.exportDiagnostics(); if (path) setNotice(`Privacy-safe diagnostics exported to ${path}`); } catch (error) { setNotice(`Diagnostics export failed: ${String(error)}`); } finally { setBusy(false); } }} /> : null}
       </div>
       {tagAsset ? <TagDialog asset={tagAsset} onClose={() => setTagAsset(null)} onSave={saveTags} /> : null}
       {importPaths.length ? <ImportDialog sourceCount={importPaths.length} onClose={() => setImportPaths([])} onStart={startImport} /> : null}

@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type ImportOptions, type ImportSummary, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type ServiceHealth, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntegrityReport, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -16,7 +16,7 @@ type BrowserHistory =
 const history: BrowserHistory[] = [];
 
 const withAssetUrls = (asset: Asset): Asset => {
-  const normalised = { ...asset, latitude: asset.latitude ?? undefined, longitude: asset.longitude ?? undefined, locationSource: asset.locationSource ?? (asset.latitude != null && asset.longitude != null ? "embedded" : "none") };
+  const normalised = { ...asset, latitude: asset.latitude ?? undefined, longitude: asset.longitude ?? undefined, locationSource: asset.locationSource ?? (asset.latitude != null && asset.longitude != null ? "embedded" : "none"), missingState: asset.missingState ?? "available" };
   if (!tauri()) return normalised;
   const toUrl = (value: string) => value.startsWith("data:") || value.startsWith("http") ? value : convertFileSrc(value);
   return {
@@ -78,6 +78,56 @@ export const api = {
     const path = await invoke<string>("export_diagnostics", { destination });
     await revealItemInDir(path);
     return path;
+  },
+  async exportSidecars(assetIds: string[], replaceExisting = false): Promise<SidecarExportSummary> {
+    if (!tauri()) return { requested: assetIds.length, written: assetIds.length, preservedExisting: 0, failed: [] };
+    return invoke("export_xmp_sidecars", { assetIds, replaceExisting });
+  },
+  async importSidecar(assetId: string): Promise<SidecarImportResult> {
+    if (!tauri()) return { tagsImported: false, locationImported: false, triageImported: false, conflicts: [] };
+    return invoke("import_xmp_sidecar", { assetId });
+  },
+  async exportPortableCatalogue(): Promise<string | null> {
+    if (!tauri()) return "D:\\Photo Library\\keepframe-portable-catalogue-v1.json";
+    const destination = await open({ directory: true, multiple: false, title: "Choose a local folder for the portable catalogue export" });
+    if (typeof destination !== "string") return null;
+    const path = await invoke<string>("export_portable_catalogue", { destination });
+    await revealItemInDir(path);
+    return path;
+  },
+  async rescanLibrary(): Promise<IntegrityReport> {
+    if (!tauri()) return { scannedAssets: browserAssets.length, missingOriginals: 0, missingDerivedVersions: 0, modifiedOriginals: 0, untrackedManagedFiles: 0, sidecarConflicts: 0, findings: [] };
+    return invoke("rescan_library");
+  },
+  async relinkSelectedAsset(assetId: string): Promise<string | null> {
+    if (!tauri()) return null;
+    const directory = await open({ directory: true, multiple: false, title: "Choose a folder to search for an exact relink match" });
+    if (typeof directory !== "string") return null;
+    const candidates = await invoke<RelinkCandidate[]>("find_relink_candidates", { assetId, directory });
+    if (!candidates.length) throw new Error("No hash-confirmed relink candidate was found in that folder.");
+    let path = candidates[0].path;
+    if (candidates.length > 1) {
+      const options = candidates.map((candidate, index) => `${index + 1}. ${candidate.path}`).join("\n");
+      const choice = window.prompt(`Multiple exact hash matches were found. Enter the number to relink; cancel leaves the catalogue unchanged.\n\n${options}`, "1");
+      const index = Number(choice) - 1;
+      if (!Number.isInteger(index) || index < 0 || index >= candidates.length) return null;
+      path = candidates[index].path;
+    }
+    await invoke("relink_asset", { assetId, path });
+    return path;
+  },
+  async addFolderWatch(): Promise<boolean> {
+    if (!tauri()) return true;
+    const path = await open({ directory: true, multiple: false, title: "Choose a source folder to watch for changes" });
+    if (typeof path !== "string") return false;
+    await invoke("configure_folder_watch", { path, enabled: true });
+    return true;
+  },
+  async disableFolderWatches(): Promise<void> {
+    if (tauri()) await invoke("disable_folder_watches");
+  },
+  async folderWatchEvents(): Promise<FolderWatchEvent[]> {
+    return tauri() ? invoke("list_folder_watch_events") : [];
   },
   async chooseLibrary(): Promise<string | null> {
     if (!tauri()) return "D:\\Photo Library";

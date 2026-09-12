@@ -54,6 +54,7 @@ export type Asset = {
   latitude?: number;
   longitude?: number;
   locationSource?: "embedded" | "manual" | "none" | string;
+  missingState?: "available" | "original_missing" | "derived_missing" | "modified" | string;
   tags: string[];
   representationCount: number;
   preferredVersionUrl?: string;
@@ -223,3 +224,10 @@ export type TrashSummary = {
   affected: number;
   failed: number;
 };
+
+export type SidecarExportSummary = { requested: number; written: number; preservedExisting: number; failed: string[] };
+export type SidecarImportResult = { tagsImported: boolean; locationImported: boolean; triageImported: boolean; conflicts: string[] };
+export type IntegrityFinding = { assetId?: string; filename?: string; kind: string; detail: string };
+export type IntegrityReport = { scannedAssets: number; missingOriginals: number; missingDerivedVersions: number; modifiedOriginals: number; untrackedManagedFiles: number; sidecarConflicts: number; findings: IntegrityFinding[] };
+export type RelinkCandidate = { path: string; sha256: string };
+export type FolderWatchEvent = { id: number; folderPath: string; path: string; kind: "new_file" | "file_changed" | "file_removed" | string; observedAt: string };

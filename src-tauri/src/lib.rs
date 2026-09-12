@@ -1,23 +1,25 @@
 mod migrations;
 mod safety;
+mod interoperability;
 
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
 use image::{GenericImageView, ImageDecoder, ImageFormat, RgbImage};
+use notify::{EventKind, RecursiveMode, Watcher};
 use reqwest::multipart;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs,
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -25,7 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SUPPORTED: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "heic", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf",
     "rw2",
@@ -57,7 +59,21 @@ struct AppState {
     local_ai_url: Mutex<String>,
     health_cache: Mutex<Option<(Instant, ServiceHealth)>>,
     analysis_worker: Mutex<AnalysisWorker>,
+    folder_watcher: Mutex<Option<FolderWatcher>>,
     gpu_gate: Arc<tokio::sync::Mutex<()>>,
+}
+struct FolderWatcher {
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchEventRecord {
+    id: i64,
+    folder_path: String,
+    path: String,
+    kind: String,
+    observed_at: String,
 }
 
 #[derive(Debug, Error)]
@@ -250,6 +266,7 @@ struct Asset {
     latitude: Option<f64>,
     longitude: Option<f64>,
     location_source: String,
+    missing_state: String,
     tags: Vec<String>,
     representation_count: i64,
     preferred_version_url: Option<String>,
@@ -630,7 +647,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     }
     connection.execute_batch(r#"
       CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, embedded_latitude REAL, embedded_longitude REAL, manual_latitude REAL, manual_longitude REAL, location_source TEXT NOT NULL DEFAULT 'none', thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
+      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, embedded_latitude REAL, embedded_longitude REAL, manual_latitude REAL, manual_longitude REAL, location_source TEXT NOT NULL DEFAULT 'none', missing_state TEXT NOT NULL DEFAULT 'available', last_verified_at TEXT, thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
       CREATE TABLE IF NOT EXISTS representations(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, path TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, extension TEXT NOT NULL, stem TEXT NOT NULL, byte_size INTEGER NOT NULL, is_raw INTEGER NOT NULL DEFAULT 0, UNIQUE(asset_id,path));
       CREATE INDEX IF NOT EXISTS idx_representations_hash ON representations(sha256);
       CREATE INDEX IF NOT EXISTS idx_representations_asset ON representations(asset_id,is_raw,path);
@@ -641,6 +658,10 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE INDEX IF NOT EXISTS idx_assets_decision_captured_at ON assets(decision,captured_at DESC);
       CREATE INDEX IF NOT EXISTS idx_assets_location ON assets(latitude,longitude,captured_at DESC);
       CREATE INDEX IF NOT EXISTS idx_assets_location_source ON assets(location_source,captured_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_assets_missing_state ON assets(missing_state,captured_at DESC);
+      CREATE TABLE IF NOT EXISTS sidecar_exports(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,path TEXT NOT NULL,content_hash TEXT NOT NULL,exported_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS watch_folders(path TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS watch_events(id INTEGER PRIMARY KEY AUTOINCREMENT,folder_path TEXT NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('new_file','file_changed','file_removed')),observed_at TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'inbox',UNIQUE(folder_path,path,kind,state));
       CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, discovered INTEGER NOT NULL DEFAULT 0, imported INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, unsupported INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'running', mode TEXT NOT NULL DEFAULT 'copy', duplicate_policy TEXT NOT NULL DEFAULT 'retain', cancel_requested INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), source_path TEXT NOT NULL, representation_id TEXT, state TEXT NOT NULL, error TEXT, staging_path TEXT, managed_path TEXT, source_hash TEXT, source_size INTEGER, source_modified TEXT, source_action TEXT);
       CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, kind TEXT NOT NULL, path TEXT NOT NULL, provider TEXT, prompt TEXT, recipe_json TEXT, source_hash TEXT, output_hash TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -656,6 +677,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     "#)?;
     migrations::apply_v4(&mut connection, existed, version)?;
     migrations::apply_v5(&mut connection, existed, version)?;
+    migrations::apply_v6(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -1131,6 +1153,8 @@ async fn initialise_library(
         *state.library_issue.lock().unwrap() = Some(error.to_string());
         return Err(error);
     }
+    let relocated = interoperability::recover_moved_managed_paths(&mut open_db(&root)?, &root)?;
+    if relocated > 0 { append_runtime_log(&root, "managed_paths_rebased", &format!("{relocated} verified managed paths were rebased after opening this library.")); }
     let recovery_notice = recover_interrupted_operations(&root)?;
     *state
         .root
@@ -1141,6 +1165,7 @@ async fn initialise_library(
     *state.library_issue.lock().unwrap() = None;
     *state.recovery_notice.lock().unwrap() = recovery_notice;
     allow_media_scope(&app, &root)?;
+    restart_folder_watcher(&root, &state)?;
     let url = state.local_ai_url.lock().unwrap().clone();
     save_settings(&root, &url)?;
     get_library_status(state)
@@ -2559,7 +2584,8 @@ fn query_assets_in(
          (SELECT path FROM representations r WHERE r.asset_id=a.id ORDER BY is_raw ASC,path ASC LIMIT 1),
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
-         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END)
+         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
+         COALESCE(a.missing_state,'available')
          FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id LIMIT ? OFFSET ?"
     );
     let mut page_values = values;
@@ -2591,6 +2617,7 @@ fn query_assets_in(
                 tag_string.split('\u{1f}').map(str::to_string).collect()
             },
             location_source: row.get(15)?,
+            missing_state: row.get(16)?,
         })
     })?;
     let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2610,7 +2637,8 @@ fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>
          (SELECT path FROM representations r WHERE r.asset_id=a.id ORDER BY is_raw ASC,path ASC LIMIT 1),
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
-         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END)
+         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
+         COALESCE(a.missing_state,'available')
          FROM assets a WHERE a.id=?1",
     )?;
     statement.query_row([asset_id], |row| {
@@ -2622,7 +2650,7 @@ fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>
             width: row.get::<_, Option<i64>>(6)?.map(|value| value as u32), height: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
             latitude: row.get(8)?, longitude: row.get(9)?, preview_url: thumbnail.clone(), thumbnail_url: thumbnail,
             representation_count: row.get(11)?, source_path: row.get(12)?, preferred_version_url: row.get(13)?,
-            tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?,
+            tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?, missing_state: row.get(16)?,
         })
     }).optional().map_err(KeepframeError::from)
 }
@@ -2642,6 +2670,125 @@ fn query_assets(
 fn get_asset(asset_id: String, state: State<'_, AppState>) -> Result<Option<Asset>> {
     let connection = open_db(&root_from(&state)?)?;
     get_asset_in(&connection, &asset_id)
+}
+
+#[tauri::command]
+fn export_xmp_sidecars(asset_ids: Vec<String>, replace_existing: bool, state: State<'_, AppState>) -> Result<interoperability::SidecarExportSummary> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    interoperability::export_sidecars(&mut connection, &asset_ids, replace_existing)
+}
+
+#[tauri::command]
+fn import_xmp_sidecar(asset_id: String, state: State<'_, AppState>) -> Result<interoperability::SidecarImportResult> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    interoperability::import_sidecar(&mut connection, &asset_id)
+}
+
+#[tauri::command]
+fn export_portable_catalogue(destination: String, state: State<'_, AppState>) -> Result<String> {
+    let root = root_from(&state)?;
+    let connection = open_db(&root)?;
+    Ok(interoperability::export_portable_catalogue(&connection, &root, Path::new(&destination))?.to_string_lossy().into())
+}
+
+#[tauri::command]
+fn rescan_library(state: State<'_, AppState>) -> Result<interoperability::IntegrityReport> {
+    let root = root_from(&state)?;
+    let mut connection = open_db(&root)?;
+    interoperability::rescan_library(&mut connection, &root)
+}
+
+#[tauri::command]
+fn find_relink_candidates(asset_id: String, directory: String, state: State<'_, AppState>) -> Result<Vec<interoperability::RelinkCandidate>> {
+    let connection = open_db(&root_from(&state)?)?;
+    interoperability::relink_candidates(&connection, &asset_id, Path::new(&directory))
+}
+
+#[tauri::command]
+fn relink_asset(asset_id: String, path: String, state: State<'_, AppState>) -> Result<()> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    interoperability::relink_asset(&mut connection, &asset_id, Path::new(&path))
+}
+
+fn watch_kind(kind: &EventKind) -> Option<&'static str> {
+    match kind {
+        EventKind::Create(_) => Some("new_file"),
+        EventKind::Modify(_) => Some("file_changed"),
+        EventKind::Remove(_) => Some("file_removed"),
+        _ => None,
+    }
+}
+
+fn write_debounced_watch_event(root: &Path, folder: &str, path: &Path, kind: &str) {
+    let Ok(connection) = open_db(root) else { return; };
+    let _ = connection.execute(
+        "INSERT INTO watch_events(folder_path,path,kind,observed_at,state)VALUES(?1,?2,?3,?4,'inbox') ON CONFLICT(folder_path,path,kind,state) DO UPDATE SET observed_at=excluded.observed_at",
+        params![folder,path.to_string_lossy(),kind,Utc::now().to_rfc3339()],
+    );
+}
+
+fn restart_folder_watcher(root: &Path, state: &AppState) -> Result<()> {
+    let connection = open_db(root)?;
+    let mut statement = connection.prepare("SELECT path FROM watch_folders WHERE enabled=1 ORDER BY path")?;
+    let folders = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter().map(PathBuf::from).filter(|path| path.is_dir()).collect::<Vec<_>>();
+    drop(statement);
+    let mut watcher_slot = state.folder_watcher.lock().map_err(|_| KeepframeError::Message("Folder watch state lock failed".into()))?;
+    *watcher_slot = None;
+    if folders.is_empty() { return Ok(()); }
+    let (sender, receiver) = mpsc::channel::<(String, PathBuf, String)>();
+    let watched_roots = folders.clone();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return; };
+        let Some(kind) = watch_kind(&event.kind) else { return; };
+        for path in event.paths {
+            if let Some(folder) = watched_roots.iter().find(|folder| path.starts_with(folder)) {
+                let _ = sender.send((folder.to_string_lossy().into(), path, kind.into()));
+            }
+        }
+    }).map_err(|error| KeepframeError::Message(format!("Folder watch could not start: {error}")))?;
+    for folder in &folders { watcher.watch(folder, RecursiveMode::Recursive).map_err(|error| KeepframeError::Message(format!("Could not watch {}: {error}", folder.display())))?; }
+    let root_for_thread = root.to_path_buf();
+    std::thread::spawn(move || {
+        let mut pending: HashMap<(String, PathBuf, String), Instant> = HashMap::new();
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(150)) {
+                Ok((folder, path, kind)) => { pending.insert((folder, path, kind), Instant::now()); }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {},
+            }
+            let due = pending.iter().filter(|(_, at)| at.elapsed() >= Duration::from_millis(600)).map(|(key, _)| key.clone()).collect::<Vec<_>>();
+            for (folder, path, kind) in due { pending.remove(&(folder.clone(), path.clone(), kind.clone())); write_debounced_watch_event(&root_for_thread, &folder, &path, &kind); }
+        }
+    });
+    *watcher_slot = Some(FolderWatcher { _watcher: watcher });
+    Ok(())
+}
+
+#[tauri::command]
+fn configure_folder_watch(path: String, enabled: bool, state: State<'_, AppState>) -> Result<()> {
+    let root = root_from(&state)?;
+    let folder = PathBuf::from(path).canonicalize().map_err(|_| KeepframeError::Message("Choose an existing source folder to watch.".into()))?;
+    if !folder.is_dir() || folder.parent().is_none() { return Err(KeepframeError::Message("Keepframe will not watch a drive root or system-wide location.".into())); }
+    let connection = open_db(&root)?;
+    connection.execute("INSERT INTO watch_folders(path,enabled,created_at)VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET enabled=excluded.enabled", params![folder.to_string_lossy(),enabled as i64,Utc::now().to_rfc3339()])?;
+    restart_folder_watcher(&root, &state)
+}
+
+#[tauri::command]
+fn disable_folder_watches(state: State<'_, AppState>) -> Result<()> {
+    let root = root_from(&state)?;
+    open_db(&root)?.execute("UPDATE watch_folders SET enabled=0", [])?;
+    restart_folder_watcher(&root, &state)
+}
+
+#[tauri::command]
+fn list_folder_watch_events(state: State<'_, AppState>) -> Result<Vec<WatchEventRecord>> {
+    let connection = open_db(&root_from(&state)?)?;
+    let mut statement = connection.prepare("SELECT id,folder_path,path,kind,observed_at FROM watch_events WHERE state='inbox' ORDER BY observed_at DESC,id DESC LIMIT 250")?;
+    let events = statement.query_map([], |row| Ok(WatchEventRecord { id: row.get(0)?,folder_path: row.get(1)?,path: row.get(2)?,kind: row.get(3)?,observed_at: row.get(4)? }))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(events)
 }
 
 fn append_map_clause(where_sql: &mut String, clause: &str) {
@@ -4701,6 +4848,7 @@ pub fn run() {
             local_ai_url: Mutex::new("http://127.0.0.1:7868".into()),
             health_cache: Mutex::new(None),
             analysis_worker: Mutex::new(AnalysisWorker::default()),
+            folder_watcher: Mutex::new(None),
             gpu_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
         .setup(|app| {
@@ -4711,11 +4859,14 @@ pub fn run() {
                         Ok(lock)
                     }) {
                         Ok(lock) => {
+                            let relocated = interoperability::recover_moved_managed_paths(&mut open_db(&root)?, &root)?;
+                            if relocated > 0 { append_runtime_log(&root, "managed_paths_rebased", &format!("{relocated} verified managed paths were rebased after opening this library.")); }
                             let recovery_notice = recover_interrupted_operations(&root)?;
                             allow_media_scope(app.handle(), &root)?;
-                            *app.state::<AppState>().root.lock().unwrap() = Some(root);
+                            *app.state::<AppState>().root.lock().unwrap() = Some(root.clone());
                             *app.state::<AppState>().library_lock.lock().unwrap() = Some(lock);
                             *app.state::<AppState>().recovery_notice.lock().unwrap() = recovery_notice;
+                            restart_folder_watcher(&root, &app.state::<AppState>())?;
                         }
                         Err(error) => {
                             *app.state::<AppState>().library_issue.lock().unwrap() =
@@ -4749,6 +4900,15 @@ pub fn run() {
             resume_import,
             query_assets,
             get_asset,
+            export_xmp_sidecars,
+            import_xmp_sidecar,
+            export_portable_catalogue,
+            rescan_library,
+            find_relink_candidates,
+            relink_asset,
+            configure_folder_watch,
+            disable_folder_watches,
+            list_folder_watch_events,
             query_map_assets,
             query_asset_ids,
             set_decision,
@@ -5819,6 +5979,22 @@ mod tests {
         assert_eq!(hash_file(&first).unwrap(), original_hash);
         assert_eq!(hash_file(&second).unwrap(), original_hash);
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn folder_watch_inbox_deduplicates_debounced_events() {
+        let root = std::env::temp_dir().join(format!("keepframe-watch-test-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let path = root.join("external/new-photo.jpg");
+        write_debounced_watch_event(&root, r"D:\Camera", &path, "new_file");
+        write_debounced_watch_event(&root, r"D:\Camera", &path, "new_file");
+        let connection = open_db(&root).unwrap();
+        let count: i64 = connection.query_row("SELECT count(*) FROM watch_events WHERE folder_path=?1 AND path=?2 AND kind='new_file'", params![r"D:\Camera",path.to_string_lossy()], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(watch_kind(&EventKind::Create(notify::event::CreateKind::File)), Some("new_file"));
+        assert_eq!(watch_kind(&EventKind::Remove(notify::event::RemoveKind::File)), Some("file_removed"));
+        drop(connection);
         fs::remove_dir_all(&root).unwrap();
     }
 }

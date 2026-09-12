@@ -72,6 +72,12 @@ Map markers use an independent lightweight catalogue query, so they represent al
 
 Keepframe preserves imported embedded GPS separately from a manual catalogue pin. Moving or clearing a manual pin never writes source EXIF and restores the embedded point where available. Tile providers and optional place search are build-time configurable; no geocoder is enabled by default. See `MILESTONE_4_LOCATION_GUIDE.md` for configuration, privacy and offline behaviour.
 
+## Portability and library resilience
+
+**Settings & Library Health** provides explicit local XMP sidecar export/import, a versioned portable catalogue JSON export, integrity/rescan, hash-confirmed relinking and an optional Changes-detected Inbox for folders you choose to watch. These operations do not rewrite original image pixels, auto-import files, delete catalogue records or silently relink an uncertain match. XMP and catalogue exports may include GPS coordinates, paths, filenames, tags and hashes, so share them deliberately.
+
+See `MILESTONE_5_INTEROPERABILITY_GUIDE.md` for the metadata mapping, XMP subset, export schema, moved-library path rebasing, folder-watch behaviour and known limits.
+
 ## Optional local AI
 
 The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.
@@ -97,7 +103,7 @@ For ChatGPT and Gemini, **Prepare image and instruction** creates a local sRGB P
 
 - Windows-only, single user.
 - HEIC catalogue previews depend on available decoding; full-resolution HEIC edit/export remains disabled unless decoding succeeds.
-- No conventional RAW development, local masks, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
+- No conventional RAW development, local masks, face recognition, semantic search, video, full Lightroom catalogue compatibility, direct cloud APIs or cloud catalogue sync. XMP is a conservative keyword/location/triage sidecar subset, not a general XMP editor.
 - The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
 
-See `BETA_TESTING.md`, `MILESTONE_3_VERIFICATION.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.
+See `BETA_TESTING.md`, `MILESTONE_3_VERIFICATION.md`, `MILESTONE_4_LOCATION_GUIDE.md`, `MILESTONE_5_INTEROPERABILITY_GUIDE.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

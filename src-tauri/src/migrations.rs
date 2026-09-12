@@ -112,3 +112,74 @@ pub(crate) fn apply_v5(connection: &mut Connection, existed: bool, version: i64)
     tx.pragma_update(None, "user_version", 5)?;
     tx.commit()
 }
+
+/// Version 6 records non-destructive library-health observations and the hashes
+/// of sidecars Keepframe explicitly exported.  It does not alter image or XMP
+/// contents and remains safe to apply to a copied/moved library.
+pub(crate) fn apply_v6(connection: &mut Connection, existed: bool, version: i64) -> rusqlite::Result<()> {
+    if !existed {
+        connection.execute(
+            "INSERT INTO schema_migrations(version,applied_at)VALUES(?1,?2)",
+            params![6, Utc::now().to_rfc3339()],
+        )?;
+        connection.pragma_update(None, "user_version", 6)?;
+        return Ok(());
+    }
+    if version >= 6 {
+        return Ok(());
+    }
+
+    let additions = [
+        ("missing_state", "ALTER TABLE assets ADD COLUMN missing_state TEXT NOT NULL DEFAULT 'available'"),
+        ("last_verified_at", "ALTER TABLE assets ADD COLUMN last_verified_at TEXT"),
+    ];
+    let missing = additions
+        .iter()
+        .map(|(column, sql)| Ok((*sql, !column_exists(connection, "assets", column)?)))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let tx = connection.transaction()?;
+    for (sql, should_add) in missing {
+        if should_add {
+            tx.execute(sql, [])?;
+        }
+    }
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS sidecar_exports(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,path TEXT NOT NULL,content_hash TEXT NOT NULL,exported_at TEXT NOT NULL)",
+        [],
+    )?;
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS watch_folders(path TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL)",
+        [],
+    )?;
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS watch_events(id INTEGER PRIMARY KEY AUTOINCREMENT,folder_path TEXT NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('new_file','file_changed','file_removed')),observed_at TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'inbox',UNIQUE(folder_path,path,kind,state))",
+        [],
+    )?;
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_assets_missing_state ON assets(missing_state,captured_at DESC)", [])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(6,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.pragma_update(None, "user_version", 6)?;
+    tx.commit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v6_migration_is_idempotent_and_creates_resilience_tables() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE assets(id TEXT PRIMARY KEY,captured_at TEXT NOT NULL);").unwrap();
+        apply_v6(&mut connection, true, 5).unwrap();
+        apply_v6(&mut connection, true, 6).unwrap();
+        assert!(column_exists(&connection, "assets", "missing_state").unwrap());
+        assert!(column_exists(&connection, "assets", "last_verified_at").unwrap());
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 6);
+        let sidecars: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sidecar_exports'", [], |row| row.get(0)).unwrap();
+        let watches: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='watch_events'", [], |row| row.get(0)).unwrap();
+        assert_eq!((sidecars, watches), (1, 1));
+    }
+}

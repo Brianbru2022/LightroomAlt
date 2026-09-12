@@ -1,4 +1,4 @@
-import { Activity, Archive, FileHeart, HardDrive, RefreshCw, ShieldCheck } from "lucide-react";
+import { Activity, Archive, Eye, FileHeart, FileOutput, HardDrive, Link2, RefreshCw, ScanSearch, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { LibraryStatus, ServiceHealth } from "../types";
 
@@ -13,9 +13,18 @@ type Props = {
   onDiagnostics: () => void;
   onRefreshAi: () => Promise<void>;
   onConfigureAi: (url: string) => Promise<void>;
+  selectedAssetName?: string;
+  onExportSidecars: (scope: "selected" | "filtered" | "library", replace: boolean) => void;
+  onImportSidecar: () => void;
+  onExportPortableCatalogue: () => void;
+  onRescanLibrary: () => void;
+  onRelinkSelected: () => void;
+  onAddFolderWatch: () => void;
+  onDisableFolderWatches: () => void;
+  onShowFolderWatchEvents: () => void;
 };
 
-export function SettingsView({ status, health, busy, onIntegrity, onBackup, onRestore, onRebuild, onDiagnostics, onRefreshAi, onConfigureAi }: Props) {
+export function SettingsView({ status, health, busy, onIntegrity, onBackup, onRestore, onRebuild, onDiagnostics, onRefreshAi, onConfigureAi, selectedAssetName, onExportSidecars, onImportSidecar, onExportPortableCatalogue, onRescanLibrary, onRelinkSelected, onAddFolderWatch, onDisableFolderWatches, onShowFolderWatchEvents }: Props) {
   const [url, setUrl] = useState(health.localAiUrl);
   useEffect(() => setUrl(health.localAiUrl), [health.localAiUrl]);
   return <main className="view settings-view">
@@ -26,6 +35,10 @@ export function SettingsView({ status, health, busy, onIntegrity, onBackup, onRe
       <section className="settings-card"><Archive size={22} /><div><h2>Verified backup</h2><p>Creates a WAL-consistent backup and checks it before reporting success.</p><div className="settings-actions"><button className="quiet-button" disabled={busy} onClick={onBackup}>Create backup</button><button className="quiet-button" disabled={busy} onClick={onRestore}>Restore backup…</button></div></div></section>
       <section className="settings-card"><RefreshCw size={22} /><div><h2>Disposable previews</h2><p>Rebuild thumbnails from catalogued originals. Decisions, tags and locations are untouched.</p><button className="quiet-button" disabled={busy} onClick={onRebuild}>Rebuild thumbnails</button></div></section>
       <section className="settings-card"><FileHeart size={22} /><div><h2>Support diagnostics</h2><p>Exports version, schema, integrity and counts. No pixels, prompts or recipes are included.</p><button className="quiet-button" disabled={busy} onClick={onDiagnostics}>Export diagnostics…</button></div></section>
+      <section className="settings-card"><FileOutput size={22} /><div><h2>Portable metadata</h2><p>XMP sidecars are explicit, local and never alter the photograph. Existing sidecars are preserved unless you deliberately replace them.</p><div className="settings-actions"><button className="quiet-button" disabled={busy || !selectedAssetName} onClick={() => onExportSidecars("selected", false)}>Export selected XMP</button><button className="quiet-button" disabled={busy} onClick={() => onExportSidecars("filtered", false)}>Export filtered XMP</button><button className="quiet-button" disabled={busy} onClick={() => onExportSidecars("library", false)}>Export all XMP…</button><button className="quiet-button" disabled={busy || !selectedAssetName} onClick={onImportSidecar}>Read selected XMP</button></div><small>{selectedAssetName ? `Selected: ${selectedAssetName}` : "Select a photograph to export or read one sidecar."}</small></div></section>
+      <section className="settings-card"><Archive size={22} /><div><h2>Portable catalogue</h2><p>Exports a versioned JSON record of organisation, paths, hashes and version provenance. No image pixels or AI prompts are included.</p><button className="quiet-button" disabled={busy} onClick={onExportPortableCatalogue}>Export catalogue JSON…</button></div></section>
+      <section className="settings-card"><ScanSearch size={22} /><div><h2>Library rescan</h2><p>Checks missing or changed originals, derived versions, untracked managed files and previously exported sidecars. It never removes or relinks anything automatically.</p><div className="settings-actions"><button className="quiet-button" disabled={busy} onClick={onRescanLibrary}>Scan library</button><button className="quiet-button" disabled={busy || !selectedAssetName} onClick={onRelinkSelected}><Link2 size={14} /> Relink selected…</button></div></div></section>
+      <section className="settings-card"><Eye size={22} /><div><h2>Changes-detected Inbox</h2><p>Watch only folders you choose. New, changed and removed files are debounced into a local Inbox; nothing is imported, removed or relinked automatically.</p><div className="settings-actions"><button className="quiet-button" disabled={busy} onClick={onAddFolderWatch}>Watch a folder…</button><button className="quiet-button" disabled={busy} onClick={onShowFolderWatchEvents}>Show findings</button><button className="quiet-button" disabled={busy} onClick={onDisableFolderWatches}>Disable watches</button></div></div></section>
       <section className="settings-card"><ShieldCheck size={22} /><div><h2>Local image editor</h2><p>{health.localAiDetail}</p><small>State: {health.localAiState.replaceAll("_", " ")}. {health.localAiModel ?? "Qwen-Image-Edit is optional."}</small><label className="ai-url-field"><span>Loopback service address</span><input value={url} onChange={(event) => setUrl(event.target.value)} aria-label="Local AI service address" /><button className="quiet-button" disabled={busy} onClick={() => void onConfigureAi(url)}>Save address</button><button className="quiet-button" disabled={busy} onClick={() => void onRefreshAi()}>Refresh status</button></label></div></section>
       <section className="settings-card"><Activity size={22} /><div><h2>Image analysis</h2><p>{health.analysisDetail}</p><small>{health.analysisAvailable ? "Photographs are analysed locally." : "Build Recipe remains available using your selected controls and brief."}</small></div></section>
     </div>

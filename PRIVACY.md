@@ -12,4 +12,10 @@ Keepframe is local-first. Catalogue operations, triage, tags, GPS placement, det
 
 Diagnostics are exported only on explicit request. They contain application/schema versions, catalogue integrity and aggregate counts; they exclude image pixels, prompts, recipes and model inputs.
 
+## Portability exports and folder watching
+
+- **XMP sidecars and portable catalogue JSON:** created only after an explicit local action. They can contain filenames, managed-relative or original paths, hashes, tags, triage state, derived-version provenance and GPS coordinates. Keepframe does not upload these exports, but anyone you share them with can read that metadata.
+- **XMP import:** reads a conservative local subset and does not upload a sidecar. Unknown XMP is left untouched; existing differing catalogue values are reported as conflicts rather than overwritten.
+- **Folder watching:** disabled unless a user chooses a folder in Settings. Native filesystem notifications stay local and are recorded only as a Changes-detected Inbox. Keepframe does not automatically import, delete, hash every file continuously, or transmit watcher findings.
+
 The selected master library and optional models are external user data. Uninstalling Keepframe must not remove either.

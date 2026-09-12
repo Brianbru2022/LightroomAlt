@@ -29,6 +29,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 walkdir = "2"
+quick-xml = "0.37"
+notify = "8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 png = "0.18"
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
