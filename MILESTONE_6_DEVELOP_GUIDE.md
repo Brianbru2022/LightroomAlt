@@ -8,6 +8,8 @@ The recipe supports Exposure (-3 to +3 EV); Contrast, Highlights, Shadows, White
 
 Each control has a keyboard-accessible slider, a numeric input, and a per-control reset. The complete recipe can be reset. A recipe is marked edited only when it differs from the central defaults.
 
+The current importer does not retain a camera-specific as-shot white-balance pair, so **Reset all** restores neutral temperature and tint. It is therefore the reliable as-shot reset for catalogue edits, not a claim of camera-calibrated RAW white balance.
+
 ## Recipe and render order
 
 `develop_recipes` is introduced by atomic catalogue migration v7. Each asset has at most one record:
