@@ -5232,15 +5232,18 @@ mod tests {
         let root = std::env::temp_dir().join(format!("keepframe-map-scale-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let mut connection = open_db(&root).unwrap();
-        let tx = connection.transaction().unwrap();
-        for number in 0..10_000 {
-            tx.execute("INSERT INTO assets(id,filename,captured_at,latitude,longitude,location_source,thumbnail_path,created_at)VALUES(?1,?2,'2026-09-12T12:00:00Z',?3,?4,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", params![format!("asset-{number}"), format!("photo-{number}.jpg"), 55.0 + (number % 500) as f64 / 1000.0, -4.0 + (number % 500) as f64 / 1000.0]).unwrap();
+        for range in [0..2_000, 2_000..10_000] {
+            let expected: usize = if range.start == 0 { 2_000 } else { 10_000 };
+            let tx = connection.transaction().unwrap();
+            for number in range {
+                tx.execute("INSERT INTO assets(id,filename,captured_at,latitude,longitude,location_source,thumbnail_path,created_at)VALUES(?1,?2,'2026-09-12T12:00:00Z',?3,?4,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", params![format!("asset-{number}"), format!("photo-{number}.jpg"), 55.0 + (number % 500) as f64 / 1000.0, -4.0 + (number % 500) as f64 / 1000.0]).unwrap();
+            }
+            tx.commit().unwrap();
+            let started = Instant::now();
+            let markers = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None }).unwrap();
+            assert_eq!(markers.len(), expected);
+            assert!(started.elapsed() < Duration::from_secs(5), "lightweight marker query should remain responsive");
         }
-        tx.commit().unwrap();
-        let started = Instant::now();
-        let markers = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None }).unwrap();
-        assert_eq!(markers.len(), 10_000);
-        assert!(started.elapsed() < Duration::from_secs(5), "lightweight marker query should remain responsive");
         drop(connection); fs::remove_dir_all(root).unwrap();
     }
     #[test]
