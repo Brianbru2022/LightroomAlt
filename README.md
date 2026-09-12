@@ -94,4 +94,4 @@ For ChatGPT and Gemini, **Prepare image and instruction** creates a local sRGB P
 - No conventional RAW development, local masks, face recognition, semantic search, video, XMP writing, direct cloud APIs or cloud catalogue sync.
 - The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
 
-See `BETA_TESTING.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.
+See `BETA_TESTING.md`, `MILESTONE_3_VERIFICATION.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

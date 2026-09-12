@@ -4316,16 +4316,14 @@ fn export_external_edit(
     Ok(output.to_string_lossy().into())
 }
 
-#[tauri::command]
-fn prepare_cloud_export(
-    asset_id: String,
-    provider: String,
-    prompt: String,
-    state: State<'_, AppState>,
-) -> Result<String> {
-    validated_provider(&provider)?;
-    let root = root_from(&state)?;
-    let connection = open_db(&root)?;
+fn prepare_cloud_handoff_in(
+    root: &Path,
+    asset_id: &str,
+    provider: &str,
+    prompt: &str,
+) -> Result<PathBuf> {
+    validated_provider(provider)?;
+    let connection = open_db(root)?;
     let (filename, source, width, height): (String, String, Option<u32>, Option<u32>) = connection
         .query_row(
             "SELECT a.filename,r.path,a.width,a.height
@@ -4338,7 +4336,7 @@ fn prepare_cloud_export(
            ELSE 2
          END, r.path ASC
          LIMIT 1",
-            [&asset_id],
+            [asset_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
     let image = prepare_full_resolution_image(
@@ -4351,7 +4349,7 @@ fn prepare_cloud_export(
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    let safe_provider = provider.clone();
+    let safe_provider = provider;
     let output = root.join("Exports").join(format!(
         "{}-{}-{}.png",
         Local::now().format("%Y%m%d-%H%M%S"),
@@ -4359,7 +4357,7 @@ fn prepare_cloud_export(
         safe_provider
     ));
     fs::write(&output, png)?;
-    fs::write(output.with_extension("prompt.txt"), &prompt)?;
+    fs::write(output.with_extension("prompt.txt"), prompt)?;
     let now = Utc::now().to_rfc3339();
     let batch_id = Uuid::new_v4().to_string();
     let job_id = Uuid::new_v4().to_string();
@@ -4371,25 +4369,34 @@ fn prepare_cloud_export(
         "INSERT INTO jobs(id,batch_id,asset_id,state,prompt,model,created_at,updated_at)VALUES(?1,?2,?3,'waiting_external',?4,?5,?6,?6)",
         params![job_id, batch_id, asset_id, prompt, provider, now],
     )?;
-    Ok(output.to_string_lossy().into())
+    Ok(output)
 }
 
 #[tauri::command]
-fn import_returned_edit(
+fn prepare_cloud_export(
     asset_id: String,
-    path: String,
     provider: String,
     prompt: String,
-    recipe: Option<EditRecipe>,
     state: State<'_, AppState>,
+) -> Result<String> {
+    prepare_cloud_handoff_in(&root_from(&state)?, &asset_id, &provider, &prompt)
+        .map(|output| output.to_string_lossy().into_owned())
+}
+
+fn import_returned_edit_in(
+    root: &Path,
+    asset_id: &str,
+    path: &Path,
+    provider: &str,
+    prompt: &str,
+    recipe: Option<EditRecipe>,
 ) -> Result<BatchJob> {
-    validated_provider(&provider)?;
-    let root = root_from(&state)?;
-    let mut connection = open_db(&root)?;
+    validated_provider(provider)?;
+    let mut connection = open_db(root)?;
     if let Some(recipe) = recipe.as_ref() {
-        validate_recipe(recipe, &asset_id)?;
+        validate_recipe(recipe, asset_id)?;
     }
-    let (captured,source_hash,asset_name,width,height):(String,String,String,Option<u32>,Option<u32>)=connection.query_row("SELECT a.captured_at,r.sha256,a.filename,a.width,a.height FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 LIMIT 1",[&asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let (captured,source_hash,asset_name,width,height):(String,String,String,Option<u32>,Option<u32>)=connection.query_row("SELECT a.captured_at,r.sha256,a.filename,a.width,a.height FROM assets a JOIN representations r ON r.asset_id=a.id WHERE a.id=?1 LIMIT 1",[asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let date = DateTime::parse_from_rfc3339(&captured)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -4398,9 +4405,9 @@ fn import_returned_edit(
         .join(format!("{:04}", date.year()))
         .join(format!("{:02}", date.month()))
         .join(format!("{:02}", date.day()))
-        .join(&asset_id);
+        .join(asset_id);
     fs::create_dir_all(&output_dir)?;
-    let source = PathBuf::from(path);
+    let source = path.to_path_buf();
     let extension = source
         .extension()
         .and_then(|e| e.to_str())
@@ -4432,7 +4439,7 @@ fn import_returned_edit(
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional()?;
     let had_waiting = waiting.is_some();
-    let (batch_id, job_id) = waiting.unwrap_or_else(|| (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()));
+    let (job_id, batch_id) = waiting.unwrap_or_else(|| (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()));
     let tx = connection.transaction()?;
     if !had_waiting {
         tx.execute(
@@ -4453,15 +4460,34 @@ fn import_returned_edit(
     Ok(BatchJob {
         id: job_id,
         batch_id,
-        asset_id,
+        asset_id: asset_id.into(),
         asset_name,
         state: "succeeded".into(),
-        prompt,
-        recipe: None,
+        prompt: prompt.into(),
+        recipe,
         attempts: Vec::new(),
         error: None,
         output_url: Some(output.to_string_lossy().into()),
     })
+}
+
+#[tauri::command]
+fn import_returned_edit(
+    asset_id: String,
+    path: String,
+    provider: String,
+    prompt: String,
+    recipe: Option<EditRecipe>,
+    state: State<'_, AppState>,
+) -> Result<BatchJob> {
+    import_returned_edit_in(
+        &root_from(&state)?,
+        &asset_id,
+        Path::new(&path),
+        &provider,
+        &prompt,
+        recipe,
+    )
 }
 
 pub fn run() {
@@ -5346,6 +5372,16 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_loopback_service_fails_closed_without_claiming_readiness() {
+        let health = tauri::async_runtime::block_on(local_ai_health("http://127.0.0.1:9"));
+        assert!(!health.service_reachable);
+        assert!(!health.local_ai_available);
+        assert!(!health.local_ai_busy);
+        assert_eq!(health.local_ai_state, "service_not_running");
+        assert!(health.local_ai_detail.contains("No local image service"));
+    }
+
+    #[test]
     fn ai_results_must_be_distinct_decodable_and_plausibly_sized() {
         let root = std::env::temp_dir().join(format!("keepframe-ai-output-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -5363,6 +5399,61 @@ mod tests {
         assert!(validate_ai_output(&same, &source_hash, Some((128, 96))).is_err());
         assert!(validate_ai_output(&tiny, &source_hash, Some((128, 96))).is_err());
         assert!(validate_ai_output(&changed, &source_hash, Some((128, 96))).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn manual_handoff_creates_a_waiting_job_and_imports_a_safe_traceable_version() {
+        let root = std::env::temp_dir().join(format!("keepframe-handoff-test-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let original = root.join("Originals/2026/09/08/original.png");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        let mut original_pixels = image::RgbImage::new(128, 96);
+        original_pixels.put_pixel(0, 0, image::Rgb([20, 40, 60]));
+        original_pixels.save(&original).unwrap();
+        let original_hash = hash_file(&original).unwrap();
+        let connection = open_db(&root).unwrap();
+        connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','original.png','2026-09-08T12:00:00Z',128,96,?1,'2026-09-08T12:00:00Z')", [original.to_string_lossy().as_ref()]).unwrap();
+        connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','original',1,0)", params![original.to_string_lossy(),original_hash]).unwrap();
+        drop(connection);
+
+        let prepared = prepare_cloud_handoff_in(&root, "asset", "chatgpt", "Improve the lighting naturally.").unwrap();
+        assert_eq!(image::open(&prepared).unwrap().dimensions(), (128, 96));
+        assert_eq!(fs::read_to_string(prepared.with_extension("prompt.txt")).unwrap(), "Improve the lighting naturally.");
+        let connection = open_db(&root).unwrap();
+        let waiting: String = connection.query_row("SELECT state FROM jobs WHERE asset_id='asset'", [], |row| row.get(0)).unwrap();
+        assert_eq!(waiting, "waiting_external");
+        drop(connection);
+
+        let malformed = root.join("returned-malformed.png");
+        fs::write(&malformed, b"not an image").unwrap();
+        assert!(import_returned_edit_in(&root, "asset", &malformed, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).is_err());
+        assert!(import_returned_edit_in(&root, "asset", &original, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).is_err());
+        let tiny = root.join("returned-tiny.png");
+        image::DynamicImage::new_rgb8(4, 4).save(&tiny).unwrap();
+        assert!(import_returned_edit_in(&root, "asset", &tiny, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).is_err());
+
+        let returned = root.join("returned-edited.png");
+        let mut returned_pixels = image::RgbImage::new(128, 96);
+        returned_pixels.put_pixel(127, 95, image::Rgb([200, 180, 160]));
+        returned_pixels.save(&returned).unwrap();
+        let job = import_returned_edit_in(&root, "asset", &returned, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).unwrap();
+        assert_eq!(job.state, "succeeded");
+        assert_eq!(job.recipe.unwrap().asset_id, "asset");
+        let connection = open_db(&root).unwrap();
+        let (job_state, batch_state): (String, String) = connection.query_row("SELECT j.state,b.state FROM jobs j JOIN batches b ON b.id=j.batch_id WHERE j.id=?1", [&job.id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((job_state, batch_state), ("succeeded".into(), "succeeded".into()));
+        let (provider, prompt, recipe_json, source_hash, version_state): (String, String, String, String, String) = connection.query_row("SELECT provider,prompt,recipe_json,source_hash,state FROM versions WHERE asset_id='asset'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(provider, "chatgpt");
+        assert_eq!(prompt, "Improve the lighting naturally.");
+        assert!(recipe_json.contains("restore_old_photo"));
+        assert_eq!(source_hash, original_hash);
+        assert_eq!(version_state, "candidate");
+        assert_eq!(hash_file(&original).unwrap(), original_hash);
+        assert_eq!(transition_job_in(&connection, &job.id, "accept").unwrap(), "accepted");
+        let preferred: String = connection.query_row("SELECT preferred_version_id FROM assets WHERE id='asset'", [], |row| row.get(0)).unwrap();
+        assert!(!preferred.is_empty());
+        drop(connection);
         fs::remove_dir_all(&root).unwrap();
     }
 
