@@ -65,3 +65,50 @@ pub(crate) fn apply_v4(connection: &mut Connection, existed: bool, version: i64)
     tx.pragma_update(None, "user_version", 4)?;
     tx.commit()
 }
+
+/// Version 5 preserves embedded GPS separately from catalogue-level placement.
+/// This lets a user move or clear a manual pin without rewriting source-derived
+/// metadata, and adds the indexes used by the lightweight map query.
+pub(crate) fn apply_v5(connection: &mut Connection, existed: bool, version: i64) -> rusqlite::Result<()> {
+    if !existed {
+        connection.execute(
+            "INSERT INTO schema_migrations(version,applied_at)VALUES(?1,?2)",
+            params![5, Utc::now().to_rfc3339()],
+        )?;
+        connection.pragma_update(None, "user_version", 5)?;
+        return Ok(());
+    }
+    if version >= 5 {
+        return Ok(());
+    }
+
+    let additions = [
+        ("embedded_latitude", "ALTER TABLE assets ADD COLUMN embedded_latitude REAL"),
+        ("embedded_longitude", "ALTER TABLE assets ADD COLUMN embedded_longitude REAL"),
+        ("manual_latitude", "ALTER TABLE assets ADD COLUMN manual_latitude REAL"),
+        ("manual_longitude", "ALTER TABLE assets ADD COLUMN manual_longitude REAL"),
+        ("location_source", "ALTER TABLE assets ADD COLUMN location_source TEXT NOT NULL DEFAULT 'none'"),
+    ];
+    let missing = additions
+        .iter()
+        .map(|(column, sql)| Ok((*sql, !column_exists(connection, "assets", column)?)))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let tx = connection.transaction()?;
+    for (sql, should_add) in missing {
+        if should_add {
+            tx.execute(sql, [])?;
+        }
+    }
+    tx.execute(
+        "UPDATE assets SET embedded_latitude=latitude,embedded_longitude=longitude,location_source=CASE WHEN latitude IS NULL OR longitude IS NULL THEN 'none' ELSE 'embedded' END WHERE embedded_latitude IS NULL AND embedded_longitude IS NULL",
+        [],
+    )?;
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_assets_location ON assets(latitude,longitude,captured_at DESC)", [])?;
+    tx.execute("CREATE INDEX IF NOT EXISTS idx_assets_location_source ON assets(location_source,captured_at DESC)", [])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(5,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()
+}

@@ -6,7 +6,7 @@ import { TagDialog } from "./components/TagDialog";
 import { Topbar } from "./components/Topbar";
 import { api } from "./lib/bridge";
 import { decisionLabel } from "./lib/format";
-import type { Asset, AssetFilter, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryStatus, ServiceHealth, ViewName } from "./types";
+import type { Asset, AssetFilter, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryStatus, MapAsset, MapBounds, ServiceHealth, ViewName } from "./types";
 import { LibraryView } from "./views/LibraryView";
 import { MapView } from "./views/MapView";
 import { TriageView } from "./views/TriageView";
@@ -25,6 +25,9 @@ export function App() {
   const [visibleTotal, setVisibleTotal] = useState(0);
   const [hasMoreAssets, setHasMoreAssets] = useState(false);
   const [loadingAssets, setLoadingAssets] = useState(true);
+  const [mapAssets, setMapAssets] = useState<MapAsset[]>([]);
+  const [mapLoading, setMapLoading] = useState(false);
+  const [spatialBounds, setSpatialBounds] = useState<MapBounds | undefined>();
   const [jobs, setJobs] = useState<BatchJob[]>([]);
   const [view, setView] = useState<ViewName>("library");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -84,6 +87,13 @@ export function App() {
     setStatus(currentStatus);
   }, [loadFirstPage]);
 
+  const loadMapAssets = useCallback(async () => {
+    setMapLoading(true);
+    try { setMapAssets(await api.mapAssets(effectiveFilter, spatialBounds)); }
+    catch (error) { setNotice(`Could not load map markers: ${String(error)}`); }
+    finally { setMapLoading(false); }
+  }, [effectiveFilter, spatialBounds]);
+
   const undoCatalogue = useCallback(async () => {
     try {
       const changed = await api.undo();
@@ -106,6 +116,9 @@ export function App() {
       .finally(() => active && setBusy(false));
     return () => { active = false; };
   }, []);
+  useEffect(() => {
+    if (status.configured && view === "map") void loadMapAssets();
+  }, [loadMapAssets, status.configured, view]);
   useEffect(() => {
     if (status.configured && status.recoveryNotice) setNotice(status.recoveryNotice);
   }, [status.configured, status.recoveryNotice]);
@@ -275,7 +288,30 @@ export function App() {
     } catch (error) { setNotice(`Empty Trash failed: ${String(error)}`); } finally { setBusy(false); }
   };
   const saveTags = async (tags: string[]) => { if (!tagAsset) return; await api.updateTags(tagAsset.id, tags); setTagAsset(null); setNotice("Tags updated. Ctrl+Z to undo."); await refreshCatalogue(); };
-  const saveLocation = async (id: string, latitude: number, longitude: number) => { await api.updateLocation(id, latitude, longitude); setNotice("Map location updated. Ctrl+Z to undo."); await refreshCatalogue(); };
+  const saveLocations = async (ids: string[], latitude: number, longitude: number) => {
+    try {
+      const updated = await api.updateLocations(ids, latitude, longitude);
+      setNotice(`${updated} ${updated === 1 ? "map location updated" : "map locations updated"}. Ctrl+Z reverses one catalogue action at a time.`);
+      await refreshCatalogue(); await loadMapAssets();
+    } catch (error) { setNotice(`Could not update map location: ${String(error)}`); }
+  };
+  const clearManualLocation = async (id: string) => {
+    try {
+      const cleared = await api.clearManualLocation(id);
+      setNotice(cleared ? "Manual map pin cleared; embedded GPS was restored where available." : "This photograph has no manual map pin to clear.");
+      await refreshCatalogue(); await loadMapAssets();
+    } catch (error) { setNotice(`Could not clear manual map pin: ${String(error)}`); }
+  };
+  const selectMapAsset = async (id: string) => {
+    const existing = assets.find((asset) => asset.id === id);
+    if (existing) { setSelectedId(id); return; }
+    try {
+      const asset = await api.asset(id);
+      if (!asset) { setNotice("That map photograph is no longer in the catalogue."); return; }
+      setAssets((current) => current.some((item) => item.id === id) ? current : [asset, ...current]);
+      setSelectedId(id);
+    } catch (error) { setNotice(`Could not select map photograph: ${String(error)}`); }
+  };
   const openAsset = (asset: Asset) => { setSelectedId(asset.id); setView("triage"); };
   const enqueue = async (assetIds: string[], brief: string) => { const unique = [...new Set(assetIds)]; if (!unique.length) return; await api.enqueue(unique, brief); setJobs(await api.jobs()); setNotice(`${unique.length} ${unique.length === 1 ? "photograph is" : "photographs are"} being analysed for individual recipe review.`); };
   const runLocal = async (assetId: string, recipe: EditRecipe, prompt: string) => {
@@ -315,7 +351,7 @@ export function App() {
         <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => setFilter((value) => ({ ...value, search }))} onDecision={(decision) => setFilter((value) => ({ ...value, decision }))} tags={knownTags} selectedTag={filter.tag} onTag={(tag) => setFilter((value) => ({ ...value, tag }))} dateFrom={filter.dateFrom} dateTo={filter.dateTo} onDateRange={(dateFrom, dateTo) => setFilter((value) => ({ ...value, dateFrom, dateTo }))} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={moveAllDiscarded} />
         {view === "library" ? <LibraryView assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={openAsset} /> : null}
         {view === "triage" ? <TriageView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onDecision={decide} onWorkshop={() => setView("workshop")} onMap={() => setView("map")} onTags={setTagAsset} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={api.applyBasicAdjustments} onAdjustmentSaved={() => setNotice("Adjustment saved as a candidate version; the protected original is unchanged.")} /> : null}
-        {view === "map" ? <MapView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onLocation={saveLocation} /> : null}
+        {view === "map" ? <MapView assets={assets} mapAssets={mapAssets} mapLoading={mapLoading} total={visibleTotal} selected={selected} onSelect={selectMapAsset} onLocations={saveLocations} onClearManualLocation={clearManualLocation} onOpenSelected={() => setView("triage")} onLocatedFilter={(located) => { setSpatialBounds(undefined); setFilter((value) => ({ ...value, located })); }} spatialBounds={spatialBounds} onUseVisibleBounds={setSpatialBounds} onClearSpatialBounds={() => setSpatialBounds(undefined)} /> : null}
         {view === "workshop" ? <WorkshopView asset={selected} assets={assets} jobs={jobs} serviceHealth={health} onAnalyse={(asset, intent: EditIntent, action, brief) => api.analyse(asset, intent, action, brief)} onPrompts={api.prompts} onCopy={api.copy} onPrepare={async (assetId, provider, prompt) => { const path = await api.prepareCloud(assetId, provider, prompt); setJobs(await api.jobs()); setNotice(`Prepared a local PNG and provider-specific instruction at ${path}. Upload it yourself, then import the returned image.`); }} onExportExternal={async (assetId, provider, prompt) => { const path = await api.exportExternal(assetId, provider, prompt); if (path) setNotice(`External AI image and prompt exported to ${path}`); }} onImportReturned={async (assetId, provider, prompt, recipe) => { const job = await api.importReturned(assetId, provider, prompt, recipe); if (job) { setJobs(await api.jobs()); setNotice("Returned edit validated and imported as a candidate version. The original is unchanged."); } }} onLoadVersions={api.versions} onSetPreferred={async (assetId, versionId) => { await api.setPreferredVersion(assetId, versionId); await refreshCatalogue(); setNotice("Preferred display version updated; catalogue metadata is unchanged."); }} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={async (asset, adjustments: BasicAdjustments) => { const version = await api.applyBasicAdjustments(asset, adjustments); setNotice("Adjustment saved as a candidate version; the protected original is unchanged."); return version; }} onEnqueue={enqueue} onRunLocal={runLocal} onJob={updateJob} onSaveJobReview={saveJobReview} onApproveJobs={approveJobs} /> : null}
         {view === "trash" ? <LibraryView mode="trash" assets={assets} total={visibleTotal} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSelectedId(asset.id)} onOpen={(asset) => setSelectedId(asset.id)} onRestoreAll={restoreAllTrash} onEmptyTrash={emptyAllTrash} /> : null}
         {view === "settings" ? <SettingsView status={status} health={health} busy={busy} onRefreshAi={async () => { setHealth(await api.serviceHealth(true)); }} onConfigureAi={async (url) => { await api.configureLocalAi(url); setHealth(await api.serviceHealth(true)); setNotice("Local AI service address saved. Keepframe permits loopback addresses only."); }} onIntegrity={async () => { setBusy(true); try { setNotice(`Catalogue integrity: ${await api.catalogueIntegrity()}.`); } catch (error) { setNotice(`Integrity check failed: ${String(error)}`); } finally { setBusy(false); } }} onBackup={async () => { setBusy(true); try { setNotice(`Verified backup created at ${await api.createBackup()}`); } catch (error) { setNotice(`Backup failed: ${String(error)}`); } finally { setBusy(false); } }} onRestore={async () => { if (!window.confirm("Restore a catalogue backup? Keepframe will first create a safety backup of the current catalogue.")) return; setBusy(true); try { if (await api.restoreBackup()) { await refreshCatalogue(); setNotice("Catalogue backup restored and verified."); } } catch (error) { setNotice(`Restore failed: ${String(error)}`); } finally { setBusy(false); } }} onRebuild={async () => { setBusy(true); try { const count = await api.rebuildThumbnails(); await refreshCatalogue(); setNotice(`${count} thumbnails rebuilt.`); } catch (error) { setNotice(`Thumbnail rebuild failed: ${String(error)}`); } finally { setBusy(false); } }} onDiagnostics={async () => { setBusy(true); try { const path = await api.exportDiagnostics(); if (path) setNotice(`Privacy-safe diagnostics exported to ${path}`); } catch (error) { setNotice(`Diagnostics export failed: ${String(error)}`); } finally { setBusy(false); } }} /> : null}

@@ -53,9 +53,22 @@ export type Asset = {
   height?: number;
   latitude?: number;
   longitude?: number;
+  locationSource?: "embedded" | "manual" | "none" | string;
   tags: string[];
   representationCount: number;
   preferredVersionUrl?: string;
+};
+
+export type MapBounds = { south: number; west: number; north: number; east: number };
+export type MapAsset = {
+  id: string;
+  filename: string;
+  latitude: number;
+  longitude: number;
+  capturedAt: string;
+  thumbnailUrl: string;
+  decision: Decision;
+  locationSource: "embedded" | "manual" | "none" | string;
 };
 
 export type LibraryStatus = {

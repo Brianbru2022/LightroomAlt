@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type ImportOptions, type ImportSummary, type LibraryStatus, type PromptSet, type ServiceHealth, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type BasicAdjustments, type BatchJob, type Decision, type EditIntent, type EditRecipe, type ImportOptions, type ImportSummary, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type ServiceHealth, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -16,7 +16,7 @@ type BrowserHistory =
 const history: BrowserHistory[] = [];
 
 const withAssetUrls = (asset: Asset): Asset => {
-  const normalised = { ...asset, latitude: asset.latitude ?? undefined, longitude: asset.longitude ?? undefined };
+  const normalised = { ...asset, latitude: asset.latitude ?? undefined, longitude: asset.longitude ?? undefined, locationSource: asset.locationSource ?? (asset.latitude != null && asset.longitude != null ? "embedded" : "none") };
   if (!tauri()) return normalised;
   const toUrl = (value: string) => value.startsWith("data:") || value.startsWith("http") ? value : convertFileSrc(value);
   return {
@@ -26,6 +26,9 @@ const withAssetUrls = (asset: Asset): Asset => {
     preferredVersionUrl: normalised.preferredVersionUrl ? toUrl(normalised.preferredVersionUrl) : undefined,
   };
 };
+const withMapAssetUrl = (asset: MapAsset): MapAsset => tauri()
+  ? { ...asset, thumbnailUrl: convertFileSrc(asset.thumbnailUrl) }
+  : asset;
 const withJobUrls = (job: BatchJob): BatchJob => {
   if (!tauri()) return job;
   return {
@@ -113,6 +116,21 @@ export const api = {
     const items = matching.slice(offset, offset + limit);
     return { items, total: matching.length, offset, limit, hasMore: offset + items.length < matching.length };
   },
+  async asset(id: string): Promise<Asset | null> {
+    if (tauri()) {
+      const asset = await invoke<Asset | null>("get_asset", { assetId: id });
+      return asset ? withAssetUrls(asset) : null;
+    }
+    return browserAssets.find((asset) => asset.id === id) ?? null;
+  },
+  async mapAssets(filter: AssetFilter, bounds?: MapBounds): Promise<MapAsset[]> {
+    if (tauri()) return (await invoke<MapAsset[]>("query_map_assets", { query: { filter, bounds } })).map(withMapAssetUrl);
+    const page = await this.assets({ ...filter, located: true }, 0, Number.MAX_SAFE_INTEGER);
+    return page.items
+      .filter((asset) => asset.latitude != null && asset.longitude != null)
+      .filter((asset) => !bounds || (asset.latitude! >= bounds.south && asset.latitude! <= bounds.north && (bounds.west <= bounds.east ? asset.longitude! >= bounds.west && asset.longitude! <= bounds.east : asset.longitude! >= bounds.west || asset.longitude! <= bounds.east)))
+      .map((asset) => ({ id: asset.id, filename: asset.filename, latitude: asset.latitude!, longitude: asset.longitude!, capturedAt: asset.capturedAt, thumbnailUrl: asset.thumbnailUrl, decision: asset.decision, locationSource: asset.locationSource ?? "embedded" }));
+  },
   async assetIds(filter: AssetFilter): Promise<string[]> {
     if (tauri()) return invoke("query_asset_ids", { filter });
     const page = await this.assets(filter, 0, Number.MAX_SAFE_INTEGER);
@@ -161,7 +179,19 @@ export const api = {
   },
   async updateLocation(id: string, latitude: number, longitude: number): Promise<void> {
     if (tauri()) return invoke("update_location", { assetId: id, latitude, longitude });
-    const asset = browserAssets.find((item) => item.id === id); if (asset) { history.push({ kind: "location", id, latitude: asset.latitude, longitude: asset.longitude }); asset.latitude = latitude; asset.longitude = longitude; }
+    const asset = browserAssets.find((item) => item.id === id); if (asset) { history.push({ kind: "location", id, latitude: asset.latitude, longitude: asset.longitude }); asset.latitude = latitude; asset.longitude = longitude; asset.locationSource = "manual"; }
+  },
+  async updateLocations(ids: string[], latitude: number, longitude: number): Promise<number> {
+    if (tauri()) return invoke("update_locations", { assetIds: ids, latitude, longitude });
+    for (const id of ids) await this.updateLocation(id, latitude, longitude);
+    return ids.length;
+  },
+  async clearManualLocation(id: string): Promise<boolean> {
+    if (tauri()) return invoke("clear_manual_location", { assetId: id });
+    const asset = browserAssets.find((item) => item.id === id);
+    if (!asset || asset.locationSource !== "manual") return false;
+    asset.latitude = undefined; asset.longitude = undefined; asset.locationSource = "none";
+    return true;
   },
   async analyse(asset: Asset, intent: EditIntent, action?: AiAction, commonBrief?: string): Promise<EditRecipe> {
     if (tauri()) return invoke("create_edit_recipe", { assetId: asset.id, intent, action, commonBrief });

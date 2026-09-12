@@ -25,7 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SUPPORTED: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "heic", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf",
     "rw2",
@@ -249,9 +249,38 @@ struct Asset {
     height: Option<u32>,
     latitude: Option<f64>,
     longitude: Option<f64>,
+    location_source: String,
     tags: Vec<String>,
     representation_count: i64,
     preferred_version_url: Option<String>,
+}
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MapBounds {
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MapQuery {
+    filter: AssetFilter,
+    bounds: Option<MapBounds>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapAsset {
+    id: String,
+    filename: String,
+    latitude: f64,
+    longitude: f64,
+    captured_at: String,
+    thumbnail_url: String,
+    decision: String,
+    location_source: String,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -601,7 +630,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     }
     connection.execute_batch(r#"
       CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
+      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, filename TEXT NOT NULL, decision TEXT NOT NULL DEFAULT 'undecided' CHECK(decision IN('keep','undecided','discard')), captured_at TEXT NOT NULL, date_fallback INTEGER NOT NULL DEFAULT 0, camera TEXT, width INTEGER, height INTEGER, latitude REAL, longitude REAL, embedded_latitude REAL, embedded_longitude REAL, manual_latitude REAL, manual_longitude REAL, location_source TEXT NOT NULL DEFAULT 'none', thumbnail_path TEXT NOT NULL, preferred_version_id TEXT, created_at TEXT NOT NULL, trashed_at TEXT);
       CREATE TABLE IF NOT EXISTS representations(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, path TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, extension TEXT NOT NULL, stem TEXT NOT NULL, byte_size INTEGER NOT NULL, is_raw INTEGER NOT NULL DEFAULT 0, UNIQUE(asset_id,path));
       CREATE INDEX IF NOT EXISTS idx_representations_hash ON representations(sha256);
       CREATE INDEX IF NOT EXISTS idx_representations_asset ON representations(asset_id,is_raw,path);
@@ -610,6 +639,8 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE INDEX IF NOT EXISTS idx_asset_tags_tag_asset ON asset_tags(tag_id,asset_id);
       CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at DESC);
       CREATE INDEX IF NOT EXISTS idx_assets_decision_captured_at ON assets(decision,captured_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_assets_location ON assets(latitude,longitude,captured_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_assets_location_source ON assets(location_source,captured_at DESC);
       CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, discovered INTEGER NOT NULL DEFAULT 0, imported INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, unsupported INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'running', mode TEXT NOT NULL DEFAULT 'copy', duplicate_policy TEXT NOT NULL DEFAULT 'retain', cancel_requested INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS import_items(id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), source_path TEXT NOT NULL, representation_id TEXT, state TEXT NOT NULL, error TEXT, staging_path TEXT, managed_path TEXT, source_hash TEXT, source_size INTEGER, source_modified TEXT, source_action TEXT);
       CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE, kind TEXT NOT NULL, path TEXT NOT NULL, provider TEXT, prompt TEXT, recipe_json TEXT, source_hash TEXT, output_hash TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -624,6 +655,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE INDEX IF NOT EXISTS idx_trash_items_asset ON trash_items(asset_id,state);
     "#)?;
     migrations::apply_v4(&mut connection, existed, version)?;
+    migrations::apply_v5(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -2265,7 +2297,8 @@ async fn import_photos(
             let persist_result = (|| -> Result<()> {
                 let tx = connection.transaction()?;
                 if !asset_exists {
-                    tx.execute("INSERT INTO assets(id,filename,captured_at,date_fallback,camera,width,height,latitude,longitude,thumbnail_path,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![asset_id,original_name,captured_string,meta.fallback,meta.camera,meta.width,meta.height,meta.latitude,meta.longitude,thumb.to_string_lossy(),Utc::now().to_rfc3339()])?;
+                    let location_source = if meta.latitude.is_some() && meta.longitude.is_some() { "embedded" } else { "none" };
+                    tx.execute("INSERT INTO assets(id,filename,captured_at,date_fallback,camera,width,height,latitude,longitude,embedded_latitude,embedded_longitude,location_source,thumbnail_path,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?8,?9,?10,?11,?12)",params![asset_id,original_name,captured_string,meta.fallback,meta.camera,meta.width,meta.height,meta.latitude,meta.longitude,location_source,thumb.to_string_lossy(),Utc::now().to_rfc3339()])?;
                 }
                 tx.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![representation_id,asset_id,target.to_string_lossy(),source_hash,extension,stem,byte_size,RAW.contains(&extension.as_str())])?;
                 for name in meta.keywords {
@@ -2525,7 +2558,8 @@ fn query_assets_in(
          (SELECT count(*) FROM representations r WHERE r.asset_id=a.id),
          (SELECT path FROM representations r WHERE r.asset_id=a.id ORDER BY is_raw ASC,path ASC LIMIT 1),
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
-         COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),'')
+         COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
+         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END)
          FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id LIMIT ? OFFSET ?"
     );
     let mut page_values = values;
@@ -2556,6 +2590,7 @@ fn query_assets_in(
             } else {
                 tag_string.split('\u{1f}').map(str::to_string).collect()
             },
+            location_source: row.get(15)?,
         })
     })?;
     let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2568,6 +2603,30 @@ fn query_assets_in(
     })
 }
 
+fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>> {
+    let mut statement = connection.prepare(
+        "SELECT a.id,a.filename,a.decision,a.captured_at,a.date_fallback,a.camera,a.width,a.height,a.latitude,a.longitude,a.thumbnail_path,
+         (SELECT count(*) FROM representations r WHERE r.asset_id=a.id),
+         (SELECT path FROM representations r WHERE r.asset_id=a.id ORDER BY is_raw ASC,path ASC LIMIT 1),
+         (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
+         COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
+         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END)
+         FROM assets a WHERE a.id=?1",
+    )?;
+    statement.query_row([asset_id], |row| {
+        let thumbnail: String = row.get(10)?;
+        let tag_string: String = row.get(14)?;
+        Ok(Asset {
+            id: row.get(0)?, filename: row.get(1)?, decision: row.get(2)?, captured_at: row.get(3)?,
+            date_fallback: row.get::<_, i64>(4)? != 0, camera: row.get(5)?,
+            width: row.get::<_, Option<i64>>(6)?.map(|value| value as u32), height: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
+            latitude: row.get(8)?, longitude: row.get(9)?, preview_url: thumbnail.clone(), thumbnail_url: thumbnail,
+            representation_count: row.get(11)?, source_path: row.get(12)?, preferred_version_url: row.get(13)?,
+            tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?,
+        })
+    }).optional().map_err(KeepframeError::from)
+}
+
 #[tauri::command]
 fn query_assets(
     filter: AssetFilter,
@@ -2577,6 +2636,85 @@ fn query_assets(
 ) -> Result<AssetPage> {
     let connection = open_db(&root_from(&state)?)?;
     query_assets_in(&connection, &filter, offset, limit)
+}
+
+#[tauri::command]
+fn get_asset(asset_id: String, state: State<'_, AppState>) -> Result<Option<Asset>> {
+    let connection = open_db(&root_from(&state)?)?;
+    get_asset_in(&connection, &asset_id)
+}
+
+fn append_map_clause(where_sql: &mut String, clause: &str) {
+    if where_sql.is_empty() {
+        where_sql.push_str(" WHERE ");
+    } else {
+        where_sql.push_str(" AND ");
+    }
+    where_sql.push_str(clause);
+}
+
+fn validate_map_bounds(bounds: &MapBounds) -> Result<()> {
+    if !bounds.south.is_finite()
+        || !bounds.west.is_finite()
+        || !bounds.north.is_finite()
+        || !bounds.east.is_finite()
+        || !(-90.0..=90.0).contains(&bounds.south)
+        || !(-90.0..=90.0).contains(&bounds.north)
+        || !(-180.0..=180.0).contains(&bounds.west)
+        || !(-180.0..=180.0).contains(&bounds.east)
+        || bounds.south > bounds.north
+    {
+        return Err(KeepframeError::Message("Map bounds are invalid.".into()));
+    }
+    Ok(())
+}
+
+fn query_map_assets_in(connection: &Connection, query: &MapQuery) -> Result<Vec<MapAsset>> {
+    let (mut where_sql, mut values) = asset_where(&query.filter);
+    append_map_clause(
+        &mut where_sql,
+        "a.latitude BETWEEN -90 AND 90 AND a.longitude BETWEEN -180 AND 180",
+    );
+    if let Some(bounds) = query.bounds.as_ref() {
+        validate_map_bounds(bounds)?;
+        append_map_clause(&mut where_sql, "a.latitude >= ? AND a.latitude <= ?");
+        values.push(SqlValue::Real(bounds.south));
+        values.push(SqlValue::Real(bounds.north));
+        if bounds.west <= bounds.east {
+            append_map_clause(&mut where_sql, "a.longitude >= ? AND a.longitude <= ?");
+            values.push(SqlValue::Real(bounds.west));
+            values.push(SqlValue::Real(bounds.east));
+        } else {
+            append_map_clause(&mut where_sql, "(a.longitude >= ? OR a.longitude <= ?)");
+            values.push(SqlValue::Real(bounds.west));
+            values.push(SqlValue::Real(bounds.east));
+        }
+    }
+    let sql = format!(
+        "SELECT a.id,a.filename,a.latitude,a.longitude,a.captured_at,a.thumbnail_path,a.decision,\
+         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END)\
+         FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        Ok(MapAsset {
+            id: row.get(0)?,
+            filename: row.get(1)?,
+            latitude: row.get(2)?,
+            longitude: row.get(3)?,
+            captured_at: row.get(4)?,
+            thumbnail_url: row.get(5)?,
+            decision: row.get(6)?,
+            location_source: row.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+#[tauri::command]
+fn query_map_assets(query: MapQuery, state: State<'_, AppState>) -> Result<Vec<MapAsset>> {
+    let connection = open_db(&root_from(&state)?)?;
+    query_map_assets_in(&connection, &query)
 }
 
 #[tauri::command]
@@ -3018,11 +3156,14 @@ fn undo_last_action_in(connection: &mut Connection) -> Result<bool> {
             }
             "location" => {
                 tx.execute(
-                    "UPDATE assets SET latitude=?2,longitude=?3 WHERE id=?1",
+                    "UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?4,manual_longitude=?5,location_source=?6 WHERE id=?1",
                     params![
                         entity,
                         value["latitude"].as_f64(),
-                        value["longitude"].as_f64()
+                        value["longitude"].as_f64(),
+                        value["manualLatitude"].as_f64(),
+                        value["manualLongitude"].as_f64(),
+                        value["locationSource"].as_str().unwrap_or(if value["latitude"].is_null() { "none" } else { "embedded" })
                     ],
                 )?;
             }
@@ -3076,20 +3217,20 @@ fn update_location_in(
             "Coordinates are outside the valid range".into(),
         ));
     }
-    let old: (Option<f64>, Option<f64>) = connection.query_row(
-        "SELECT latitude,longitude FROM assets WHERE id=?1",
+    let old: (Option<f64>, Option<f64>, Option<f64>, Option<f64>, String) = connection.query_row(
+        "SELECT latitude,longitude,manual_latitude,manual_longitude,location_source FROM assets WHERE id=?1",
         [asset_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     )?;
-    if old == (Some(latitude), Some(longitude)) {
+    if old.0 == Some(latitude) && old.1 == Some(longitude) && old.2 == Some(latitude) && old.3 == Some(longitude) && old.4 == "manual" {
         return Ok(());
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
-        "UPDATE assets SET latitude=?2,longitude=?3 WHERE id=?1",
+        "UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?2,manual_longitude=?3,location_source='manual' WHERE id=?1",
         params![asset_id, latitude, longitude],
     )?;
-    tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'location',?2,?3,?4)",params![asset_id,json!({"latitude":old.0,"longitude":old.1}).to_string(),json!({"latitude":latitude,"longitude":longitude}).to_string(),Utc::now().to_rfc3339()])?;
+    tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'location',?2,?3,?4)",params![asset_id,json!({"latitude":old.0,"longitude":old.1,"manualLatitude":old.2,"manualLongitude":old.3,"locationSource":old.4}).to_string(),json!({"latitude":latitude,"longitude":longitude,"manualLatitude":latitude,"manualLongitude":longitude,"locationSource":"manual"}).to_string(),Utc::now().to_rfc3339()])?;
     tx.commit()?;
     Ok(())
 }
@@ -3103,6 +3244,63 @@ fn update_location(
 ) -> Result<()> {
     let mut connection = open_db(&root_from(&state)?)?;
     update_location_in(&mut connection, &asset_id, latitude, longitude)
+}
+
+fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitude: f64, longitude: f64) -> Result<usize> {
+    if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+        return Err(KeepframeError::Message("Coordinates are outside the valid range".into()));
+    }
+    let mut unique = HashSet::new();
+    let ids = asset_ids.iter().filter(|id| unique.insert(id.as_str())).collect::<Vec<_>>();
+    if ids.is_empty() { return Ok(0); }
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for asset_id in &ids {
+        let old: (Option<f64>, Option<f64>, Option<f64>, Option<f64>, String) = tx.query_row(
+            "SELECT latitude,longitude,manual_latitude,manual_longitude,location_source FROM assets WHERE id=?1", [asset_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        tx.execute("UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?2,manual_longitude=?3,location_source='manual' WHERE id=?1", params![asset_id, latitude, longitude])?;
+        tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'location',?2,?3,?4)",params![asset_id,json!({"latitude":old.0,"longitude":old.1,"manualLatitude":old.2,"manualLongitude":old.3,"locationSource":old.4}).to_string(),json!({"latitude":latitude,"longitude":longitude,"manualLatitude":latitude,"manualLongitude":longitude,"locationSource":"manual"}).to_string(),Utc::now().to_rfc3339()])?;
+    }
+    tx.commit()?;
+    Ok(ids.len())
+}
+
+#[tauri::command]
+fn update_locations(asset_ids: Vec<String>, latitude: f64, longitude: f64, state: State<'_, AppState>) -> Result<usize> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    update_locations_in(&mut connection, &asset_ids, latitude, longitude)
+}
+
+fn clear_manual_location_in(connection: &mut Connection, asset_id: &str) -> Result<bool> {
+    let old: (Option<f64>, Option<f64>, Option<f64>, Option<f64>, String) = connection.query_row(
+        "SELECT latitude,longitude,manual_latitude,manual_longitude,location_source FROM assets WHERE id=?1",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    )?;
+    if old.2.is_none() || old.3.is_none() {
+        return Ok(false);
+    }
+    let embedded: (Option<f64>, Option<f64>) = connection.query_row(
+        "SELECT embedded_latitude,embedded_longitude FROM assets WHERE id=?1",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let source = if embedded.0.is_some() && embedded.1.is_some() { "embedded" } else { "none" };
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=NULL,manual_longitude=NULL,location_source=?4 WHERE id=?1",
+        params![asset_id, embedded.0, embedded.1, source],
+    )?;
+    tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('asset',?1,'location',?2,?3,?4)",params![asset_id,json!({"latitude":old.0,"longitude":old.1,"manualLatitude":old.2,"manualLongitude":old.3,"locationSource":old.4}).to_string(),json!({"latitude":embedded.0,"longitude":embedded.1,"manualLatitude":Value::Null,"manualLongitude":Value::Null,"locationSource":source}).to_string(),Utc::now().to_rfc3339()])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn clear_manual_location(asset_id: String, state: State<'_, AppState>) -> Result<bool> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    clear_manual_location_in(&mut connection, &asset_id)
 }
 
 #[tauri::command]
@@ -4550,6 +4748,8 @@ pub fn run() {
             cancel_import,
             resume_import,
             query_assets,
+            get_asset,
+            query_map_assets,
             query_asset_ids,
             set_decision,
             move_to_trash,
@@ -4558,6 +4758,8 @@ pub fn run() {
             undo_last_action,
             update_tags,
             update_location,
+            update_locations,
+            clear_manual_location,
             create_edit_recipe,
             render_prompts,
             enqueue_batch,
@@ -4810,12 +5012,28 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         let recorded: i64 = connection
-            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=4", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=5", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(recorded, 1);
         drop(connection);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v5_location_migration_is_atomic_and_preserves_legacy_embedded_coordinates() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE assets(id TEXT PRIMARY KEY,captured_at TEXT NOT NULL,latitude REAL,longitude REAL);") .unwrap();
+        connection.execute("INSERT INTO assets(id,captured_at,latitude,longitude)VALUES('embedded','2026-09-12T12:00:00Z',56.2,-3.0),('none','2026-09-12T12:00:00Z',NULL,NULL)", []).unwrap();
+        migrations::apply_v5(&mut connection, true, 4).unwrap();
+        let embedded: (Option<f64>, Option<f64>, String) = connection.query_row("SELECT embedded_latitude,embedded_longitude,location_source FROM assets WHERE id='embedded'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        let none: String = connection.query_row("SELECT location_source FROM assets WHERE id='none'", [], |row| row.get(0)).unwrap();
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(embedded, (Some(56.2), Some(-3.0), "embedded".into()));
+        assert_eq!(none, "none");
+        assert_eq!(version, 5);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=5", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        migrations::apply_v5(&mut connection, true, 5).unwrap();
     }
 
     #[test]
@@ -4969,6 +5187,61 @@ mod tests {
         assert!(trash_where.contains("empty_failed"));
         assert!(!trash_where.contains("recycled"));
         assert!(normal_where.contains("a.trashed_at IS NULL"));
+    }
+
+    fn map_filter() -> AssetFilter {
+        AssetFilter { decision: "all".into(), search: String::new(), year: None, tag: None, date_from: None, date_to: None, camera: None, tagged: None, located: None, trashed: Some(false) }
+    }
+
+    #[test]
+    fn map_query_reads_the_full_filtered_catalogue_and_excludes_bad_coordinates() {
+        let root = std::env::temp_dir().join(format!("keepframe-map-query-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let connection = open_db(&root).unwrap();
+        for (id, decision, latitude, longitude) in [("keep", "keep", 56.12, -3.1), ("discard", "discard", 56.15, -3.2), ("bad", "keep", 95.0, -3.3), ("none", "keep", 0.0, 0.0)] {
+            connection.execute("INSERT INTO assets(id,filename,decision,captured_at,latitude,longitude,location_source,thumbnail_path,created_at)VALUES(?1,?1,?2,'2026-09-12T12:00:00Z',?3,?4,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", params![id, decision, latitude, longitude]).unwrap();
+        }
+        connection.execute("UPDATE assets SET latitude=NULL,longitude=NULL,location_source='none' WHERE id='none'", []).unwrap();
+        let all = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None }).unwrap();
+        assert_eq!(all.len(), 2);
+        let mut keep = map_filter(); keep.decision = "keep".into();
+        let bounded = query_map_assets_in(&connection, &MapQuery { filter: keep, bounds: Some(MapBounds { south: 56.0, west: -3.15, north: 56.13, east: -3.0 }) }).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].id, "keep");
+        assert!(query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: Some(MapBounds { south: 20.0, west: 0.0, north: -20.0, east: 1.0 }) }).is_err());
+        drop(connection); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_location_preserves_embedded_gps_and_can_be_cleared() {
+        let root = std::env::temp_dir().join(format!("keepframe-manual-location-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        connection.execute("INSERT INTO assets(id,filename,captured_at,latitude,longitude,embedded_latitude,embedded_longitude,location_source,thumbnail_path,created_at)VALUES('asset','photo.jpg','2026-09-12T12:00:00Z',56.1,-3.1,56.1,-3.1,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", []).unwrap();
+        update_location_in(&mut connection, "asset", 41.3851, 2.1734).unwrap();
+        let manual: (f64, f64, f64, f64, String) = connection.query_row("SELECT latitude,longitude,embedded_latitude,embedded_longitude,location_source FROM assets WHERE id='asset'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(manual, (41.3851, 2.1734, 56.1, -3.1, "manual".into()));
+        assert!(clear_manual_location_in(&mut connection, "asset").unwrap());
+        let restored: (Option<f64>, Option<f64>, Option<f64>, String) = connection.query_row("SELECT latitude,longitude,manual_latitude,location_source FROM assets WHERE id='asset'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(restored, (Some(56.1), Some(-3.1), None, "embedded".into()));
+        drop(connection); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn map_query_scales_to_ten_thousand_lightweight_markers() {
+        let root = std::env::temp_dir().join(format!("keepframe-map-scale-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        let tx = connection.transaction().unwrap();
+        for number in 0..10_000 {
+            tx.execute("INSERT INTO assets(id,filename,captured_at,latitude,longitude,location_source,thumbnail_path,created_at)VALUES(?1,?2,'2026-09-12T12:00:00Z',?3,?4,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", params![format!("asset-{number}"), format!("photo-{number}.jpg"), 55.0 + (number % 500) as f64 / 1000.0, -4.0 + (number % 500) as f64 / 1000.0]).unwrap();
+        }
+        tx.commit().unwrap();
+        let started = Instant::now();
+        let markers = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None }).unwrap();
+        assert_eq!(markers.len(), 10_000);
+        assert!(started.elapsed() < Duration::from_secs(5), "lightweight marker query should remain responsive");
+        drop(connection); fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn prompt_keeps_safety_constraints() {

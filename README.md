@@ -8,7 +8,7 @@ Keepframe is a local-first Windows photo catalogue for safely organising, triagi
 
 1. Choose or reconnect a portable master-library folder.
 2. Import with **Copy** (default) or explicitly choose **Move after verification**.
-3. Browse the timeline, tags and OpenStreetMap-backed map; click the map to place an unlocated photograph.
+3. Browse the timeline, tags and clustered full-library map; search configured places, select a marker, or place an unlocated photograph without changing its source metadata.
 4. Triage with `M` to Keep, `X` to Discard and the arrow keys to browse.
 5. Move discarded photographs to reversible Keepframe Trash. Empty Trash is separately confirmed.
 6. Make non-destructive basic exposure, white-balance, tonal-range, colour, texture/clarity/dehaze and point-curve adjustments, including a protected automatic range option.
@@ -65,6 +65,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-raw-fixtures.
 ```
 
 The fixture smoke test verifies EXIF dimensions/model and LibRaw inspection without modifying the originals. Then perform Copy import, thumbnail/review generation and malformed-file rejection against each fixture; record the camera model and LibRaw result in beta evidence. This is a residual beta gate, not a claim of universal RAW compatibility.
+
+## Location and map browsing
+
+Map markers use an independent lightweight catalogue query, so they represent all geotagged photographs matching the active catalogue filters rather than only the current library page. Nearby markers cluster at wider zoom levels. **Use visible area** creates an explicit temporary spatial filter; clear it to return to the wider catalogue.
+
+Keepframe preserves imported embedded GPS separately from a manual catalogue pin. Moving or clearing a manual pin never writes source EXIF and restores the embedded point where available. Tile providers and optional place search are build-time configurable; no geocoder is enabled by default. See `MILESTONE_4_LOCATION_GUIDE.md` for configuration, privacy and offline behaviour.
 
 ## Optional local AI
 
