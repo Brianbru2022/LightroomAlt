@@ -64,6 +64,16 @@ export type Asset = {
   representationCount: number;
   preferredVersionUrl?: string;
   hasEdits?: boolean;
+  sourceId?: string;
+  isPrimary?: boolean;
+  versionName?: string;
+  versionIndex?: number;
+  sourceVersionCount?: number;
+  versionGroupCollapsed?: boolean;
+  stackId?: string;
+  stackCount?: number;
+  stackCollapsed?: boolean;
+  isStackTop?: boolean;
 };
 
 export type MapBounds = { south: number; west: number; north: number; east: number };
@@ -128,7 +138,16 @@ export type AssetFilter = {
   fileType?: string;
   sort?: "captureTime" | "importTime" | "filename" | "rating" | "editedTime";
   descending?: boolean;
+  collectionId?: string;
+  versionMode?: "all" | "primary" | "virtual";
+  stackMode?: "all" | "stacked" | "unstacked";
 };
+
+export type CatalogueVersion={id:string;sourceId:string;name:string;isPrimary:boolean;versionIndex:number;hasEdits:boolean;rating:number;decision:Decision};
+export type SmartRule={field:"rating"|"flag"|"edited"|"fileType"|"keyword"|"captureDate"|"importDate"|"camera"|"lens"|"versionStatus"|"hasMultipleVersions"|"stackStatus";operator:string;value:unknown;secondValue?:unknown};
+export type CatalogueCollection={id:string;name:string;kind:"manual"|"smart";setId?:string;matchMode:"all"|"any";rules:SmartRule[];position:number;count:number};
+export type CollectionSet={id:string;name:string;position:number};
+export type StackSummary={id:string;name?:string;collapsed:boolean;topItemId:string;memberIds:string[]};
 
 export type LibraryMetadataPatch = {
   title?: string | null;

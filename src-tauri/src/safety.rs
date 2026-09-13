@@ -16,7 +16,10 @@ pub(crate) fn ensure_capacity(required_bytes: u64, available_bytes: u64) -> Resu
 
 pub(crate) fn copy_and_verify(source: &Path, staged: &Path, expected_hash: &str) -> Result<()> {
     fs::copy(source, staged)?;
-    fs::OpenOptions::new().write(true).open(staged)?.sync_all()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(staged)?
+        .sync_all()?;
     if hash_file(staged)? != expected_hash {
         let _ = fs::remove_file(staged);
         return Err(KeepframeError::Message(
@@ -55,7 +58,9 @@ pub(crate) fn delete_verified_external_source(
             "Source changed after verification and was retained.".into(),
         ));
     }
-    let source = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     let library_root = library_root
         .canonicalize()
         .unwrap_or_else(|_| library_root.to_path_buf());
@@ -79,7 +84,9 @@ mod tests {
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
-    fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+    fn digest(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
 
     #[test]
     fn insufficient_space_fails_before_any_copy() {

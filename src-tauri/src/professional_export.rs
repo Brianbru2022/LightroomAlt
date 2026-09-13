@@ -156,6 +156,7 @@ impl ExportConfig {
                     | "capturedate"
                     | "exportdate"
                     | "rating"
+                    | "version"
                     | "custom"
             ) {
                 return Err(KeepframeError::Message(format!(
@@ -229,6 +230,7 @@ struct SourceDetails {
     latitude: Option<f64>,
     longitude: Option<f64>,
     rating: Option<u8>,
+    version: String,
     tags: Vec<String>,
     input: AdjustmentInput,
     recipe: DevelopRecipe,
@@ -322,6 +324,7 @@ fn expanded_filename(details: &SourceDetails, config: &ExportConfig, index: usiz
         ("{stem}", stem),
         ("{capturedate}", capture),
         ("{rating}", rating.as_str()),
+        ("{version}", details.version.as_str()),
         ("{custom}", config.custom_text.as_str()),
     ];
     let mut output = config.filename_template.clone();
@@ -590,7 +593,7 @@ fn validate_output(
 
 fn load_source(root: &Path, asset_id: &str) -> Result<SourceDetails> {
     let connection = open_db(root)?;
-    let (filename, captured_at, latitude, longitude): (String, String, Option<f64>, Option<f64>) = connection.query_row("SELECT filename,captured_at,latitude,longitude FROM assets WHERE id=?1 AND trashed_at IS NULL", [asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+    let (filename,captured_at,latitude,longitude,rating,version):(String,String,Option<f64>,Option<f64>,i64,String)=connection.query_row("SELECT s.filename,s.captured_at,s.latitude,s.longitude,a.rating,COALESCE(a.version_name,CASE WHEN a.is_primary=1 THEN 'Primary' ELSE 'Version '||a.version_index END) FROM assets a JOIN sources s ON s.id=a.source_id WHERE a.id=?1 AND a.trashed_at IS NULL",[asset_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
     let tags = {
         let mut statement=connection.prepare("SELECT t.name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=?1 ORDER BY t.name COLLATE NOCASE")?;
         let values = statement
@@ -599,25 +602,13 @@ fn load_source(root: &Path, asset_id: &str) -> Result<SourceDetails> {
         values
     };
     let input = original_adjustment_input(&connection, asset_id)?;
-    let rating = hidden_command(exiftool_path())
-        .args(["-s3", "-n", "-Rating"])
-        .arg(&input.path)
-        .output()
-        .ok()
-        .filter(|value| value.status.success())
-        .and_then(|value| {
-            String::from_utf8_lossy(&value.stdout)
-                .trim()
-                .parse::<u8>()
-                .ok()
-        })
-        .filter(|value| *value <= 5);
     Ok(SourceDetails {
         filename,
         captured_at,
         latitude,
         longitude,
-        rating,
+        rating: Some(rating.clamp(0, 5) as u8),
+        version,
         tags,
         input,
         recipe: develop_recipe_in(&connection, asset_id)?,
@@ -1207,6 +1198,35 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+    #[test]
+    fn version_token_uses_catalogue_name_and_safe_fallback() {
+        let details = SourceDetails {
+            filename: "portrait.nef".into(),
+            captured_at: "2026-09-13T10:00:00Z".into(),
+            latitude: None,
+            longitude: None,
+            rating: Some(5),
+            version: "Client Edit".into(),
+            tags: vec![],
+            input: AdjustmentInput {
+                path: PathBuf::from("portrait.nef"),
+                source_hash: "hash".into(),
+                captured_at: "2026-09-13T10:00:00Z".into(),
+                expected_dimensions: None,
+            },
+            recipe: DevelopRecipe::neutral(),
+        };
+        let config = ExportConfig {
+            filename_template: "{stem}-{version}-{sequence}".into(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            expanded_filename(&details, &config, 0),
+            "portrait-Client Edit-001"
+        );
     }
     #[test]
     fn collision_policies_are_deterministic() {

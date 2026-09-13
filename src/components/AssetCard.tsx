@@ -18,9 +18,11 @@ export function AssetCard({ asset, selected, active = selected, onSelect, onOpen
         {asset.missingState && asset.missingState !== "available" ? <span className="pair-badge missing-badge" title={asset.missingState.replaceAll("_", " ")}><TriangleAlert size={13} /> Missing</span> : null}
         {asset.hasEdits ? <span className="pair-badge edited-badge" title="Non-destructive Develop settings applied"><SlidersHorizontal size={13} /> Edited</span> : null}
         {asset.representationCount > 1 ? <span className="pair-badge" title={`${asset.representationCount} paired files`}><Layers3 size={13} /> {asset.representationCount}</span> : null}
+        {asset.isPrimary===false?<span className="version-badge" title={`Virtual version ${asset.versionIndex??""}`}>{asset.versionName??`Version ${asset.versionIndex??""}`}</span>:asset.sourceVersionCount&&asset.sourceVersionCount>1?<span className="version-badge primary" title="Primary catalogue version">Primary · {asset.sourceVersionCount}</span>:null}
+        {asset.stackId?<span className="stack-badge" title={asset.stackCollapsed?"Collapsed manual stack":"Expanded manual stack"}><Layers3 size={13}/> {asset.stackCount??1}</span>:null}
       </div>
       <div className="asset-card-copy">
-        <strong title={asset.filename}>{asset.filename}</strong>
+        <strong title={asset.filename}>{asset.filename}{asset.isPrimary===false&&asset.versionName?` · ${asset.versionName}`:""}</strong>
         <span>{"★".repeat(asset.rating)}{"☆".repeat(5-asset.rating)} · {formatDate(asset.capturedAt)} {asset.latitude !== undefined ? <MapPin size={12} /> : null}</span>
       </div>
     </article>

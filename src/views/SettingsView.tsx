@@ -1,6 +1,7 @@
 import { Activity, Archive, Eye, FileHeart, FileOutput, HardDrive, Link2, RefreshCw, ScanSearch, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { LibraryStatus, ServiceHealth } from "../types";
+import { api } from "../lib/bridge";
 
 type Props = {
   status: LibraryStatus;
@@ -17,6 +18,7 @@ type Props = {
   onExportSidecars: (scope: "selected" | "filtered" | "library", replace: boolean) => void;
   onImportSidecar: () => void;
   onExportPortableCatalogue: () => void;
+  onImportPortableCatalogue?: () => void;
   onRescanLibrary: () => void;
   onRelinkSelected: () => void;
   onAddFolderWatch: () => void;
@@ -24,7 +26,7 @@ type Props = {
   onShowFolderWatchEvents: () => void;
 };
 
-export function SettingsView({ status, health, busy, onIntegrity, onBackup, onRestore, onRebuild, onDiagnostics, onRefreshAi, onConfigureAi, selectedAssetName, onExportSidecars, onImportSidecar, onExportPortableCatalogue, onRescanLibrary, onRelinkSelected, onAddFolderWatch, onDisableFolderWatches, onShowFolderWatchEvents }: Props) {
+export function SettingsView({ status, health, busy, onIntegrity, onBackup, onRestore, onRebuild, onDiagnostics, onRefreshAi, onConfigureAi, selectedAssetName, onExportSidecars, onImportSidecar, onExportPortableCatalogue, onImportPortableCatalogue=()=>{if(window.confirm("Import catalogue organisation? Keepframe creates a verified backup first and does not alter source files."))void api.importPortableCatalogue().then(count=>{if(count!==null)window.dispatchEvent(new CustomEvent("keepframe-catalogue-restored",{detail:{count}}));});}, onRescanLibrary, onRelinkSelected, onAddFolderWatch, onDisableFolderWatches, onShowFolderWatchEvents }: Props) {
   const [url, setUrl] = useState(health.localAiUrl);
   useEffect(() => setUrl(health.localAiUrl), [health.localAiUrl]);
   return <main className="view settings-view">
@@ -36,7 +38,7 @@ export function SettingsView({ status, health, busy, onIntegrity, onBackup, onRe
       <section className="settings-card"><RefreshCw size={22} /><div><h2>Disposable previews</h2><p>Rebuild thumbnails from catalogued originals. Decisions, tags and locations are untouched.</p><button className="quiet-button" disabled={busy} onClick={onRebuild}>Rebuild thumbnails</button></div></section>
       <section className="settings-card"><FileHeart size={22} /><div><h2>Support diagnostics</h2><p>Exports version, schema, integrity and counts. No pixels, prompts or recipes are included.</p><button className="quiet-button" disabled={busy} onClick={onDiagnostics}>Export diagnostics…</button></div></section>
       <section className="settings-card"><FileOutput size={22} /><div><h2>Portable metadata</h2><p>XMP sidecars are explicit, local and never alter the photograph. Existing sidecars are preserved unless you deliberately replace them.</p><div className="settings-actions"><button className="quiet-button" disabled={busy || !selectedAssetName} onClick={() => onExportSidecars("selected", false)}>Export selected XMP</button><button className="quiet-button" disabled={busy} onClick={() => onExportSidecars("filtered", false)}>Export filtered XMP</button><button className="quiet-button" disabled={busy} onClick={() => onExportSidecars("library", false)}>Export all XMP…</button><button className="quiet-button" disabled={busy || !selectedAssetName} onClick={onImportSidecar}>Read selected XMP</button></div><small>{selectedAssetName ? `Selected: ${selectedAssetName}` : "Select a photograph to export or read one sidecar."}</small></div></section>
-      <section className="settings-card"><Archive size={22} /><div><h2>Portable catalogue</h2><p>Exports a versioned JSON record of organisation, paths, hashes and version provenance. No image pixels or AI prompts are included.</p><button className="quiet-button" disabled={busy} onClick={onExportPortableCatalogue}>Export catalogue JSON…</button></div></section>
+      <section className="settings-card"><Archive size={22} /><div><h2>Portable catalogue</h2><p>Schema v3 preserves source/version relationships, recipes, Collections, Smart rules and Stacks. Import first creates a verified database backup and never writes image pixels.</p><div className="settings-actions"><button className="quiet-button" disabled={busy} onClick={onExportPortableCatalogue}>Export catalogue JSON…</button><button className="quiet-button" disabled={busy||!onImportPortableCatalogue} onClick={onImportPortableCatalogue}>Import catalogue JSON…</button></div></div></section>
       <section className="settings-card"><ScanSearch size={22} /><div><h2>Library rescan</h2><p>Checks missing or changed originals, derived versions, untracked managed files and previously exported sidecars. It never removes or relinks anything automatically.</p><div className="settings-actions"><button className="quiet-button" disabled={busy} onClick={onRescanLibrary}>Scan library</button><button className="quiet-button" disabled={busy || !selectedAssetName} onClick={onRelinkSelected}><Link2 size={14} /> Relink selected…</button></div></div></section>
       <section className="settings-card"><Eye size={22} /><div><h2>Changes-detected Inbox</h2><p>Watch only folders you choose. New, changed and removed files are debounced into a local Inbox; nothing is imported, removed or relinked automatically.</p><div className="settings-actions"><button className="quiet-button" disabled={busy} onClick={onAddFolderWatch}>Watch a folder…</button><button className="quiet-button" disabled={busy} onClick={onShowFolderWatchEvents}>Show findings</button><button className="quiet-button" disabled={busy} onClick={onDisableFolderWatches}>Disable watches</button></div></div></section>
       <section className="settings-card"><ShieldCheck size={22} /><div><h2>Local image editor</h2><p>{health.localAiDetail}</p><small>State: {health.localAiState.replaceAll("_", " ")}. {health.localAiModel ?? "Qwen-Image-Edit is optional."}</small><label className="ai-url-field"><span>Loopback service address</span><input value={url} onChange={(event) => setUrl(event.target.value)} aria-label="Local AI service address" /><button className="quiet-button" disabled={busy} onClick={() => void onConfigureAi(url)}>Save address</button><button className="quiet-button" disabled={busy} onClick={() => void onRefreshAi()}>Refresh status</button></label></div></section>

@@ -175,6 +175,23 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [jobs]);
   useEffect(() => {
+    const selectCatalogueItem = (event: Event) => {
+      const id = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (id) setSingleSelection(id);
+    };
+    const catalogueRestored = (event: Event) => {
+      const count = (event as CustomEvent<{ count?: number }>).detail?.count ?? 0;
+      void refreshCatalogue();
+      setNotice(`${count} catalogue item(s) restored from the portable catalogue.`);
+    };
+    window.addEventListener("keepframe-select-catalogue-item", selectCatalogueItem);
+    window.addEventListener("keepframe-catalogue-restored", catalogueRestored);
+    return () => {
+      window.removeEventListener("keepframe-select-catalogue-item", selectCatalogueItem);
+      window.removeEventListener("keepframe-catalogue-restored", catalogueRestored);
+    };
+  }, [refreshCatalogue]);
+  useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
       const target = event.target;
@@ -280,7 +297,7 @@ export function App() {
   const moveAllDiscarded = async () => {
     if (!visibleTotal) return;
     const scope = filter.search ? " matching the current search" : "";
-    if (!window.confirm(`Move all ${visibleTotal} discarded ${visibleTotal === 1 ? "photograph" : "photographs"}${scope} to Keepframe Trash?\n\nThey remain catalogued and can be restored until you separately empty Trash.`)) return;
+    if (!window.confirm(`Move all ${visibleTotal} discarded catalogue ${visibleTotal === 1 ? "item" : "items"}${scope} to Keepframe Trash?\n\nThis is source-level: every sibling version of each matched physical photograph moves with it. They remain catalogued and can be restored until you separately empty Trash.`)) return;
     setBusy(true);
     try {
       const ids = await api.assetIds({ ...effectiveFilter, decision: "discard" });
@@ -446,7 +463,7 @@ export function App() {
       <Sidebar view={view} status={{ ...status, ...health }} onView={(nextView) => { setView(nextView); if (nextView === "trash") setFilter((value) => ({ ...value, decision: "all" })); }} />
       <div className="workspace">
         <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => setFilter((value) => ({ ...value, search }))} onDecision={(decision) => setFilter((value) => ({ ...value, decision }))} tags={knownTags} selectedTag={filter.tag} onTag={(tag) => setFilter((value) => ({ ...value, tag }))} dateFrom={filter.dateFrom} dateTo={filter.dateTo} onDateRange={(dateFrom, dateTo) => setFilter((value) => ({ ...value, dateFrom, dateTo }))} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={moveAllDiscarded} />
-        {view === "library" ? <LibraryProductivityView assets={assets} total={visibleTotal} visibleSelectedCount={visibleSelectedCount} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} filter={filter} onFilter={patch=>setFilter(value=>({...value,...patch}))} active={selected} activeId={selection.activeId} selectedIds={selection.selectedIds} layout={libraryLayout} onLayout={setLibraryLayout} onSelect={selectLibraryAsset} onSetActive={id=>setSelection(current=>current.selectedIds.has(id)?{...current,activeId:id}:selectId(current,id,resultIds))} onRemove={removeSelectedId} onClear={()=>setSelection(clearSelection())} onOpenDevelop={openAsset} onMetadata={applySelectionMetadata} onReviewAsset={reviewOne} onSync={syncSelection} onPreset={applyPresetSelection} onBatchAuto={runBatchAuto} onExport={exportSelected} autoAdvance={autoAdvance} onAutoAdvance={setAutoAdvance} /> : null}
+        {view === "library" ? <LibraryProductivityView assets={assets} total={visibleTotal} visibleSelectedCount={visibleSelectedCount} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} filter={filter} onFilter={patch=>setFilter(value=>({...value,...patch}))} active={selected} activeId={selection.activeId} selectedIds={selection.selectedIds} layout={libraryLayout} onLayout={setLibraryLayout} onSelect={selectLibraryAsset} onSetActive={id=>setSelection(current=>current.selectedIds.has(id)?{...current,activeId:id}:selectId(current,id,resultIds))} onRemove={removeSelectedId} onClear={()=>setSelection(clearSelection())} onOpenDevelop={openAsset} onMetadata={applySelectionMetadata} onReviewAsset={reviewOne} onSync={syncSelection} onPreset={applyPresetSelection} onBatchAuto={runBatchAuto} onExport={exportSelected} autoAdvance={autoAdvance} onAutoAdvance={setAutoAdvance} onCatalogueChanged={refreshCatalogue} onNotice={setNotice} /> : null}
         {view === "develop" ? <DevelopView assets={assets} selected={selected} selectedIds={selection.selectedIds} onSelect={selectLibraryAsset} onOpenSync={()=>{setLibraryLayout("grid");setView("library");setNotice("Selection retained. Choose Sync settings to select categories and apply from the active photograph.");}} onExport={async (asset) => {setExportSelection([...selection.selectedIds]);setExportAsset(asset);}} onRecipeSaved={() => { void refreshCatalogue(); }} /> : null}
         {view === "triage" ? <TriageView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSingleSelection(asset.id)} onDecision={decide} onWorkshop={() => setView("workshop")} onMap={() => setView("map")} onTags={setTagAsset} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={api.applyBasicAdjustments} onAdjustmentSaved={() => setNotice("Adjustment saved as a candidate version; the protected original is unchanged.")} /> : null}
         {view === "map" ? <MapView assets={assets} mapAssets={mapAssets} mapLoading={mapLoading} total={visibleTotal} selected={selected} onSelect={selectMapAsset} onLocations={saveLocations} onClearManualLocation={clearManualLocation} onOpenSelected={() => setView("triage")} onLocatedFilter={(located) => { setSpatialBounds(undefined); setFilter((value) => ({ ...value, located })); }} spatialBounds={spatialBounds} onUseVisibleBounds={setSpatialBounds} onClearSpatialBounds={() => setSpatialBounds(undefined)} /> : null}

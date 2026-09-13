@@ -1,4 +1,6 @@
-mod interoperability;mod migrations;
+mod interoperability;
+mod migrations;
+mod organisation;
 mod professional_export;
 mod safety;
 
@@ -23,7 +25,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},mpsc, Arc, Mutex,},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -31,7 +35,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
 const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
@@ -87,7 +91,11 @@ const MASK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SEMANTIC_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
-struct CacheEntry<T> { key: String, value: Arc<T>, bytes: usize }
+struct CacheEntry<T> {
+    key: String,
+    value: Arc<T>,
+    bytes: usize,
+}
 
 #[derive(Debug)]
 struct BoundedCache<T> {
@@ -101,11 +109,21 @@ struct BoundedCache<T> {
 
 impl<T> BoundedCache<T> {
     fn new(limit_bytes: usize) -> Self {
-        Self { entries: VecDeque::new(), used_bytes: 0, limit_bytes, hits: 0, misses: 0, evictions: 0 }
+        Self {
+            entries: VecDeque::new(),
+            used_bytes: 0,
+            limit_bytes,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
     }
     fn get(&mut self, key: &str) -> Option<Arc<T>> {
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
-            let entry = self.entries.remove(index).expect("cache index remains valid");
+            let entry = self
+                .entries
+                .remove(index)
+                .expect("cache index remains valid");
             let value = Arc::clone(&entry.value);
             self.entries.push_back(entry);
             self.hits += 1;
@@ -116,13 +134,20 @@ impl<T> BoundedCache<T> {
         }
     }
     fn insert(&mut self, key: String, value: Arc<T>, bytes: usize) {
-        if bytes > self.limit_bytes { return; }
+        if bytes > self.limit_bytes {
+            return;
+        }
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
-            let old = self.entries.remove(index).expect("cache index remains valid");
+            let old = self
+                .entries
+                .remove(index)
+                .expect("cache index remains valid");
             self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
         }
         while self.used_bytes.saturating_add(bytes) > self.limit_bytes {
-            let Some(old) = self.entries.pop_front() else { break; };
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
             self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
             self.evictions += 1;
         }
@@ -268,7 +293,11 @@ struct BasicAdjustments {
 
 impl BasicAdjustments {
     fn neutral() -> Self {
-        Self { crop_width: 1.0, crop_height: 1.0, ..Self::default() }
+        Self {
+            crop_width: 1.0,
+            crop_height: 1.0,
+            ..Self::default()
+        }
     }
 
     fn validate(self) -> Result<Self> {
@@ -291,8 +320,16 @@ impl BasicAdjustments {
             self.curve_darks,
             self.curve_shadows,
         ];
-        let crop_width = if self.crop_width == 0.0 { 1.0 } else { self.crop_width };
-        let crop_height = if self.crop_height == 0.0 { 1.0 } else { self.crop_height };
+        let crop_width = if self.crop_width == 0.0 {
+            1.0
+        } else {
+            self.crop_width
+        };
+        let crop_height = if self.crop_height == 0.0 {
+            1.0
+        } else {
+            self.crop_height
+        };
         let valid = self.exposure.is_finite()
             && (-3.0..=3.0).contains(&self.exposure)
             && unit_values
@@ -318,19 +355,52 @@ impl BasicAdjustments {
     }
 
     fn normalised_crop(self) -> (f32, f32, f32, f32) {
-        (self.crop_left, self.crop_top, if self.crop_width == 0.0 { 1.0 } else { self.crop_width }, if self.crop_height == 0.0 { 1.0 } else { self.crop_height },)
+        (
+            self.crop_left,
+            self.crop_top,
+            if self.crop_width == 0.0 {
+                1.0
+            } else {
+                self.crop_width
+            },
+            if self.crop_height == 0.0 {
+                1.0
+            } else {
+                self.crop_height
+            },
+        )
     }
 }
 
 impl Default for BasicAdjustments {
     fn default() -> Self {
         Self {
-            exposure: 0.0, light_balance: 0.0, tint: 0.0, contrast: 0.0, highlights: 0.0,
-            shadows: 0.0, whites: 0.0, blacks: 0.0, dynamic_range: 0.0, texture: 0.0,
-            clarity: 0.0, dehaze: 0.0, colour_boost: 0.0, saturation: 0.0,
-            curve_highlights: 0.0, curve_lights: 0.0, curve_darks: 0.0, curve_shadows: 0.0,
-            crop_left: 0.0, crop_top: 0.0, crop_width: 1.0, crop_height: 1.0,
-            rotate_quadrants: 0, straighten: 0.0, horizontal_flip: false, vertical_flip: false,
+            exposure: 0.0,
+            light_balance: 0.0,
+            tint: 0.0,
+            contrast: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            dynamic_range: 0.0,
+            texture: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            colour_boost: 0.0,
+            saturation: 0.0,
+            curve_highlights: 0.0,
+            curve_lights: 0.0,
+            curve_darks: 0.0,
+            curve_shadows: 0.0,
+            crop_left: 0.0,
+            crop_top: 0.0,
+            crop_width: 1.0,
+            crop_height: 1.0,
+            rotate_quadrants: 0,
+            straighten: 0.0,
+            horizontal_flip: false,
+            vertical_flip: false,
         }
     }
 }
@@ -395,32 +465,100 @@ struct IntelligentMaskProposal {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct LocalAdjustments {
-    exposure: f32, contrast: f32, highlights: f32, shadows: f32, whites: f32, blacks: f32,
-    light_balance: f32, tint: f32, saturation: f32, clarity: f32, dehaze: f32, texture: f32,
+    exposure: f32,
+    contrast: f32,
+    highlights: f32,
+    shadows: f32,
+    whites: f32,
+    blacks: f32,
+    light_balance: f32,
+    tint: f32,
+    saturation: f32,
+    clarity: f32,
+    dehaze: f32,
+    texture: f32,
 }
 
 impl LocalAdjustments {
     fn validate(self) -> Result<Self> {
-        let values = [self.contrast,self.highlights,self.shadows,self.whites,self.blacks,self.light_balance,self.tint,self.saturation,self.clarity,self.dehaze,self.texture,];
-        if !self.exposure.is_finite() || !(-3.0..=3.0).contains(&self.exposure) || values.iter().any(|value| !value.is_finite() || !(-100.0..=100.0).contains(value)) {
-            return Err(KeepframeError::Message("A local adjustment is outside the supported range.".into(),));
+        let values = [
+            self.contrast,
+            self.highlights,
+            self.shadows,
+            self.whites,
+            self.blacks,
+            self.light_balance,
+            self.tint,
+            self.saturation,
+            self.clarity,
+            self.dehaze,
+            self.texture,
+        ];
+        if !self.exposure.is_finite()
+            || !(-3.0..=3.0).contains(&self.exposure)
+            || values
+                .iter()
+                .any(|value| !value.is_finite() || !(-100.0..=100.0).contains(value))
+        {
+            return Err(KeepframeError::Message(
+                "A local adjustment is outside the supported range.".into(),
+            ));
         }
         Ok(self)
     }
-    fn as_basic(self) -> BasicAdjustments { BasicAdjustments { exposure:self.exposure,contrast:self.contrast,highlights:self.highlights,shadows:self.shadows,whites:self.whites,blacks:self.blacks,light_balance:self.light_balance,tint:self.tint,saturation:self.saturation,clarity:self.clarity,dehaze:self.dehaze,texture:self.texture,..BasicAdjustments::neutral() } }
+    fn as_basic(self) -> BasicAdjustments {
+        BasicAdjustments {
+            exposure: self.exposure,
+            contrast: self.contrast,
+            highlights: self.highlights,
+            shadows: self.shadows,
+            whites: self.whites,
+            blacks: self.blacks,
+            light_balance: self.light_balance,
+            tint: self.tint,
+            saturation: self.saturation,
+            clarity: self.clarity,
+            dehaze: self.dehaze,
+            texture: self.texture,
+            ..BasicAdjustments::neutral()
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
-struct MaskPoint { x: f32, y: f32, }
+struct MaskPoint {
+    x: f32,
+    y: f32,
+}
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct BrushStroke { points: Vec<MaskPoint>, radius: f32, feather: f32, flow: f32, erase: bool, }
+struct BrushStroke {
+    points: Vec<MaskPoint>,
+    radius: f32,
+    feather: f32,
+    flow: f32,
+    erase: bool,
+}
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum MaskGeometry {
-    Linear { start: MaskPoint, end: MaskPoint, },
-    Radial { centre: MaskPoint, radius_x: f32, radius_y: f32, rotation: f32, },
-    Brush { strokes: Vec<BrushStroke>, },
+    Linear {
+        start: MaskPoint,
+        end: MaskPoint,
+    },
+    Radial {
+        centre: MaskPoint,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+    },
+    Brush {
+        strokes: Vec<BrushStroke>,
+    },
     Semantic {
         width: u32,
         height: u32,
@@ -443,7 +581,15 @@ struct MaskProvenance {
 }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct DevelopMask { id: String, name: String, enabled: bool, inverted: bool, opacity: f32, feather: f32, geometry: MaskGeometry, adjustments: LocalAdjustments,
+struct DevelopMask {
+    id: String,
+    name: String,
+    enabled: bool,
+    inverted: bool,
+    opacity: f32,
+    feather: f32,
+    geometry: MaskGeometry,
+    adjustments: LocalAdjustments,
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -479,7 +625,8 @@ fn decode_semantic_payload(coverage_png: &str, checksum: &str) -> Result<image::
         ));
     }
     let image = image::load_from_memory_with_format(&bytes, ImageFormat::Png)?.to_luma8();
-    Ok(image) }
+    Ok(image)
+}
 
 const PRESET_CATEGORIES: &[&str] = &["whiteBalance", "tone", "presence", "colour"];
 
@@ -533,25 +680,69 @@ struct AutoProposal {
 }
 
 impl DevelopRecipe {
-    fn neutral() -> Self { Self { schema_version: 2, settings: BasicAdjustments::neutral(), masks: Vec::new(), } }
+    fn neutral() -> Self {
+        Self {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: Vec::new(),
+        }
+    }
     fn validate(mut self) -> Result<Self> {
-        if self.schema_version == 1 && self.masks.is_empty() { self.schema_version = 2; }
+        if self.schema_version == 1 && self.masks.is_empty() {
+            self.schema_version = 2;
+        }
         if self.schema_version != 2 {
-            return Err(KeepframeError::Message("This Develop recipe version is not supported by this build.".into(),));
+            return Err(KeepframeError::Message(
+                "This Develop recipe version is not supported by this build.".into(),
+            ));
         }
         self.settings = self.settings.validate()?;
-        if self.masks.len() > 64 { return Err(KeepframeError::Message("A Develop recipe cannot contain more than 64 masks.".into(),)); }
+        if self.masks.len() > 64 {
+            return Err(KeepframeError::Message(
+                "A Develop recipe cannot contain more than 64 masks.".into(),
+            ));
+        }
         let mut ids = std::collections::HashSet::new();
         for mask in &mut self.masks {
             mask.name = mask.name.trim().to_string();
-            if mask.id.trim().is_empty() || !ids.insert(mask.id.clone()) || mask.name.chars().count() > 80 || !mask.opacity.is_finite() || !(0.0..=1.0).contains(&mask.opacity) || !mask.feather.is_finite() || !(0.0..=1.0).contains(&mask.feather) { return Err(KeepframeError::Message("A mask definition is invalid.".into(),)); }
+            if mask.id.trim().is_empty()
+                || !ids.insert(mask.id.clone())
+                || mask.name.chars().count() > 80
+                || !mask.opacity.is_finite()
+                || !(0.0..=1.0).contains(&mask.opacity)
+                || !mask.feather.is_finite()
+                || !(0.0..=1.0).contains(&mask.feather)
+            {
+                return Err(KeepframeError::Message(
+                    "A mask definition is invalid.".into(),
+                ));
+            }
             mask.adjustments = mask.adjustments.validate()?;
-            let valid_point = |point: &MaskPoint| { point.x.is_finite() && point.y.is_finite() && (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y)
+            let valid_point = |point: &MaskPoint| {
+                point.x.is_finite()
+                    && point.y.is_finite()
+                    && (0.0..=1.0).contains(&point.x)
+                    && (0.0..=1.0).contains(&point.y)
             };
             match &mask.geometry {
-                MaskGeometry::Linear { start, end } if valid_point(start) && valid_point(end) && ((start.x-end.x).powi(2)+(start.y-end.y).powi(2)).sqrt() >= 0.001 => {}
-                MaskGeometry::Radial { centre, radius_x, radius_y, rotation, } if valid_point(centre) && radius_x.is_finite() && radius_y.is_finite() && (0.005..=2.0).contains(radius_x) && (0.005..=2.0).contains(radius_y) && rotation.is_finite() && (-360.0..=360.0).contains(rotation) => {}
-                MaskGeometry::Brush { strokes } if valid_strokes( strokes, &valid_point) => {}
+                MaskGeometry::Linear { start, end }
+                    if valid_point(start)
+                        && valid_point(end)
+                        && ((start.x - end.x).powi(2) + (start.y - end.y).powi(2)).sqrt()
+                            >= 0.001 => {}
+                MaskGeometry::Radial {
+                    centre,
+                    radius_x,
+                    radius_y,
+                    rotation,
+                } if valid_point(centre)
+                    && radius_x.is_finite()
+                    && radius_y.is_finite()
+                    && (0.005..=2.0).contains(radius_x)
+                    && (0.005..=2.0).contains(radius_y)
+                    && rotation.is_finite()
+                    && (-360.0..=360.0).contains(rotation) => {}
+                MaskGeometry::Brush { strokes } if valid_strokes(strokes, &valid_point) => {}
                 MaskGeometry::Semantic {
                     width,
                     height,
@@ -561,38 +752,65 @@ impl DevelopRecipe {
                     refinements,
                 } if (16..=2048).contains(width)
                     && (16..=2048).contains(height)
-                    && coverage_png.len() <= 4_000_000 && is_sha256(checksum)
+                    && coverage_png.len() <= 4_000_000
+                    && is_sha256(checksum)
                     && is_sha256(&provenance.model_sha256)
                     && matches!(provenance.category.as_str(), "subject" | "people" | "sky")
-                    && !provenance.provider.trim().is_empty() && !provenance.provider_version.trim().is_empty() && !provenance.model.trim ().is_empty() && !provenance.model_revision.trim ().is_empty() && !provenance.execution_provider.trim ().is_empty()&& valid_strokes(refinements, &valid_point) => {
+                    && !provenance.provider.trim().is_empty()
+                    && !provenance.provider_version.trim().is_empty()
+                    && !provenance.model.trim().is_empty()
+                    && !provenance.model_revision.trim().is_empty()
+                    && !provenance.execution_provider.trim().is_empty()
+                    && valid_strokes(refinements, &valid_point) =>
+                {
                     let coverage = decode_semantic_payload(coverage_png, checksum)?;
                     if coverage.dimensions() != (*width, *height) {
                         return Err(KeepframeError::Message(
                             "An intelligent mask has inconsistent canonical dimensions.".into(),
-                        ));}
+                        ));
+                    }
                 }
-                _ => { return Err(KeepframeError::Message("A mask has invalid geometry or stroke data.".into(),))
+                _ => {
+                    return Err(KeepframeError::Message(
+                        "A mask has invalid geometry or stroke data.".into(),
+                    ))
                 }
             }
         }
         Ok(self)
     }
-    fn is_edited(&self) -> bool { self.settings != BasicAdjustments::neutral() || !self.masks.is_empty() }
+    fn is_edited(&self) -> bool {
+        self.settings != BasicAdjustments::neutral() || !self.masks.is_empty()
+    }
 }
 
 impl DevelopPreset {
     fn validate(mut self, user_authored: bool) -> Result<Self> {
         if self.schema_version != 1 {
-            return Err(KeepframeError::Message("This Develop preset version is not supported by this build.".into(),));
+            return Err(KeepframeError::Message(
+                "This Develop preset version is not supported by this build.".into(),
+            ));
         }
         self.name = self.name.trim().to_string();
-        if self.name.is_empty() || self.name.chars().count() > 80 || self.name.chars().any(char::is_control) {
-            return Err(KeepframeError::Message("Preset names must be 1 to 80 printable characters.".into(),));
+        if self.name.is_empty()
+            || self.name.chars().count() > 80
+            || self.name.chars().any(char::is_control)
+        {
+            return Err(KeepframeError::Message(
+                "Preset names must be 1 to 80 printable characters.".into(),
+            ));
         }
         self.categories.sort();
         self.categories.dedup();
-        if self.categories.is_empty() || self.categories.iter().any(|category| !PRESET_CATEGORIES.contains(&category.as_str())) {
-            return Err(KeepframeError::Message("A preset contains an unsupported settings category.".into(),));
+        if self.categories.is_empty()
+            || self
+                .categories
+                .iter()
+                .any(|category| !PRESET_CATEGORIES.contains(&category.as_str()))
+        {
+            return Err(KeepframeError::Message(
+                "A preset contains an unsupported settings category.".into(),
+            ));
         }
         if user_authored && (self.built_in || self.id.trim().is_empty()) {
             return Err(KeepframeError::Message("User presets must have an application-generated id and cannot claim to be built in.".into()));
@@ -603,23 +821,173 @@ impl DevelopPreset {
 }
 
 fn built_in_presets() -> Vec<DevelopPreset> {
-    let preset = |id: &str, name: &str, categories: &[&str], settings: BasicAdjustments| DevelopPreset {
-        schema_version: 1, id: id.into(), name: name.into(), categories: categories.iter().map(|value| (*value).into()).collect(), settings, built_in: true,
-    };
+    let preset =
+        |id: &str, name: &str, categories: &[&str], settings: BasicAdjustments| DevelopPreset {
+            schema_version: 1,
+            id: id.into(),
+            name: name.into(),
+            categories: categories.iter().map(|value| (*value).into()).collect(),
+            settings,
+            built_in: true,
+        };
     vec![
-        preset("natural", "Natural", &["tone", "colour"], BasicAdjustments::neutral(),),
-        preset("clean", "Clean", &["tone", "presence", "colour"], BasicAdjustments { contrast: 4.0, highlights: -8.0, shadows: 6.0, clarity: 3.0, colour_boost: 3.0, ..BasicAdjustments::neutral() },),
-        preset("warm", "Warm", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: 14.0, tint: 2.0, contrast: 4.0, colour_boost: 6.0, ..BasicAdjustments::neutral() },),
-        preset("cool", "Cool", &["whiteBalance", "tone", "colour"], BasicAdjustments { light_balance: -12.0, tint: -2.0, highlights: -8.0, colour_boost: 3.0, ..BasicAdjustments::neutral() },),
-        preset("high-contrast", "High Contrast", &["tone", "presence"], BasicAdjustments { contrast: 20.0, highlights: -8.0, shadows: -5.0, whites: 8.0, blacks: -10.0, clarity: 5.0, ..BasicAdjustments::neutral() },),
-        preset("soft-contrast", "Soft Contrast", &["tone", "presence"], BasicAdjustments { contrast: -14.0, highlights: -12.0, shadows: 12.0, texture: -5.0, ..BasicAdjustments::neutral() },),
-        preset("vivid", "Vivid", &["tone", "colour"], BasicAdjustments { contrast: 8.0, colour_boost: 20.0, saturation: 5.0, ..BasicAdjustments::neutral() },),
-        preset("muted", "Muted", &["tone", "colour"], BasicAdjustments { contrast: -4.0, colour_boost: -8.0, saturation: -22.0, ..BasicAdjustments::neutral() },),
-        preset("portrait", "Portrait", &["tone", "presence", "colour"], BasicAdjustments { contrast: -3.0, highlights: -10.0, shadows: 8.0, texture: -12.0, clarity: -5.0, colour_boost: 5.0, ..BasicAdjustments::neutral() },),
-        preset("landscape", "Landscape", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, highlights: -10.0, dehaze: 7.0, clarity: 8.0, colour_boost: 15.0, ..BasicAdjustments::neutral() },),
-        preset("black-and-white", "Black & White", &["tone", "presence", "colour"], BasicAdjustments { contrast: 10.0, clarity: 4.0, saturation: -100.0, ..BasicAdjustments::neutral() },),
-        preset("high-key-bw", "High-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: 0.45, contrast: -8.0, shadows: 18.0, blacks: 10.0, clarity: -3.0, saturation: -100.0, ..BasicAdjustments::neutral() },),
-        preset("low-key-bw", "Low-Key B&W", &["tone", "presence", "colour"], BasicAdjustments { exposure: -0.45, contrast: 18.0, highlights: -15.0, blacks: -18.0, clarity: 6.0, saturation: -100.0, ..BasicAdjustments::neutral() },),
+        preset(
+            "natural",
+            "Natural",
+            &["tone", "colour"],
+            BasicAdjustments::neutral(),
+        ),
+        preset(
+            "clean",
+            "Clean",
+            &["tone", "presence", "colour"],
+            BasicAdjustments {
+                contrast: 4.0,
+                highlights: -8.0,
+                shadows: 6.0,
+                clarity: 3.0,
+                colour_boost: 3.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "warm",
+            "Warm",
+            &["whiteBalance", "tone", "colour"],
+            BasicAdjustments {
+                light_balance: 14.0,
+                tint: 2.0,
+                contrast: 4.0,
+                colour_boost: 6.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "cool",
+            "Cool",
+            &["whiteBalance", "tone", "colour"],
+            BasicAdjustments {
+                light_balance: -12.0,
+                tint: -2.0,
+                highlights: -8.0,
+                colour_boost: 3.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "high-contrast",
+            "High Contrast",
+            &["tone", "presence"],
+            BasicAdjustments {
+                contrast: 20.0,
+                highlights: -8.0,
+                shadows: -5.0,
+                whites: 8.0,
+                blacks: -10.0,
+                clarity: 5.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "soft-contrast",
+            "Soft Contrast",
+            &["tone", "presence"],
+            BasicAdjustments {
+                contrast: -14.0,
+                highlights: -12.0,
+                shadows: 12.0,
+                texture: -5.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "vivid",
+            "Vivid",
+            &["tone", "colour"],
+            BasicAdjustments {
+                contrast: 8.0,
+                colour_boost: 20.0,
+                saturation: 5.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "muted",
+            "Muted",
+            &["tone", "colour"],
+            BasicAdjustments {
+                contrast: -4.0,
+                colour_boost: -8.0,
+                saturation: -22.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "portrait",
+            "Portrait",
+            &["tone", "presence", "colour"],
+            BasicAdjustments {
+                contrast: -3.0,
+                highlights: -10.0,
+                shadows: 8.0,
+                texture: -12.0,
+                clarity: -5.0,
+                colour_boost: 5.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "landscape",
+            "Landscape",
+            &["tone", "presence", "colour"],
+            BasicAdjustments {
+                contrast: 10.0,
+                highlights: -10.0,
+                dehaze: 7.0,
+                clarity: 8.0,
+                colour_boost: 15.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "black-and-white",
+            "Black & White",
+            &["tone", "presence", "colour"],
+            BasicAdjustments {
+                contrast: 10.0,
+                clarity: 4.0,
+                saturation: -100.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "high-key-bw",
+            "High-Key B&W",
+            &["tone", "presence", "colour"],
+            BasicAdjustments {
+                exposure: 0.45,
+                contrast: -8.0,
+                shadows: 18.0,
+                blacks: 10.0,
+                clarity: -3.0,
+                saturation: -100.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
+        preset(
+            "low-key-bw",
+            "Low-Key B&W",
+            &["tone", "presence", "colour"],
+            BasicAdjustments {
+                exposure: -0.45,
+                contrast: 18.0,
+                highlights: -15.0,
+                blacks: -18.0,
+                clarity: 6.0,
+                saturation: -100.0,
+                ..BasicAdjustments::neutral()
+            },
+        ),
     ]
 }
 
@@ -647,6 +1015,9 @@ struct AssetFilter {
     file_type: Option<String>,
     sort: Option<String>,
     descending: Option<bool>,
+    collection_id: Option<String>,
+    version_mode: Option<String>,
+    stack_mode: Option<String>,
 }
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -675,6 +1046,16 @@ struct Asset {
     representation_count: i64,
     preferred_version_url: Option<String>,
     has_edits: bool,
+    source_id: String,
+    is_primary: bool,
+    version_name: String,
+    version_index: i64,
+    source_version_count: i64,
+    version_group_collapsed: bool,
+    stack_id: Option<String>,
+    stack_count: i64,
+    stack_collapsed: bool,
+    is_stack_top: bool,
 }
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1091,6 +1472,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v9(&mut connection, existed, version)?;
     migrations::apply_v10(&mut connection, existed, version)?;
     migrations::apply_v11(&mut connection, existed, version)?;
+    migrations::apply_v12(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -1151,9 +1533,11 @@ fn recover_interrupted_operations(root: &Path) -> Result<Option<String>> {
     )?;
 
     let mut missing_trash = 0usize;
-    let mut statement = connection.prepare("SELECT id,trash_path FROM trash_items WHERE state='moved'")?;
+    let mut statement =
+        connection.prepare("SELECT id,trash_path FROM trash_items WHERE state='moved'")?;
     let items = statement
-        .query_map([], |row| { Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
@@ -1221,7 +1605,12 @@ fn parse_local_ai_health(value: &Value) -> ServiceHealth {
         local_ai_busy: busy,
         local_ai_model: model,
         local_ai_detail: detail,
-        local_ai_state: if available { "available" } else { "model_missing" }.into(),
+        local_ai_state: if available {
+            "available"
+        } else {
+            "model_missing"
+        }
+        .into(),
         local_ai_url: String::new(),
         analysis_model_installed: analysis_installed(),
         analysis_available: false,
@@ -1410,7 +1799,8 @@ fn start_analysis_worker(state: &AppState) {
         if let Ok(mut worker) = state.analysis_worker.lock() {
             worker.last_error = Some(if segmentation_model_installed() {
                 "The intelligent-masking model is installed, but the Keepframe Python runtime is missing. Run scripts\\setup-ai-worker.ps1.".into()
-            } else {analysis_installation_detail()
+            } else {
+                analysis_installation_detail()
             });
         }
         return;
@@ -1530,7 +1920,10 @@ fn get_library_status(state: State<'_, AppState>) -> Result<LibraryStatus> {
     }
 }
 #[tauri::command]
-async fn get_service_health(force: Option<bool>, state: State<'_, AppState>,) -> Result<ServiceHealth> {
+async fn get_service_health(
+    force: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<ServiceHealth> {
     if !force.unwrap_or(false) {
         if let Ok(cache) = state.health_cache.lock() {
             if let Some((checked_at, health)) = cache.as_ref() {
@@ -1772,11 +2165,7 @@ async fn propose_intelligent_mask(
     let request_id = state.mask_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let root = root_from(&state)?;
     let connection = open_db(&root)?;
-    let preview: String = connection.query_row(
-        "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",
-        [&asset_id],
-        |row| row.get(0),
-    )?;
+    let preview = source_thumbnail_in(&connection, &asset_id)?;
     drop(connection);
     let source = image::open(preview)?.thumbnail(640, 640);
     let analysis_width = source.width();
@@ -1896,7 +2285,10 @@ fn configure_local_ai(url: String, state: State<'_, AppState>) -> Result<()> {
     let url = validated_loopback_url(&url)?;
     let root = root_from(&state)?;
     save_settings(&root, &url)?;
-    *state.local_ai_url.lock().map_err(|_| KeepframeError::Message("AI service setting lock failed".into()))? = url;
+    *state
+        .local_ai_url
+        .lock()
+        .map_err(|_| KeepframeError::Message("AI service setting lock failed".into()))? = url;
     if let Ok(mut cache) = state.health_cache.lock() {
         *cache = None;
     }
@@ -1915,7 +2307,13 @@ async fn initialise_library(
         return Err(error);
     }
     let relocated = interoperability::recover_moved_managed_paths(&mut open_db(&root)?, &root)?;
-    if relocated > 0 { append_runtime_log(&root, "managed_paths_rebased", &format!("{relocated} verified managed paths were rebased after opening this library."),); }
+    if relocated > 0 {
+        append_runtime_log(
+            &root,
+            "managed_paths_rebased",
+            &format!("{relocated} verified managed paths were rebased after opening this library."),
+        );
+    }
     let recovery_notice = recover_interrupted_operations(&root)?;
     *state
         .root
@@ -1934,7 +2332,20 @@ async fn initialise_library(
 
 #[tauri::command]
 fn check_catalogue_integrity(state: State<'_, AppState>) -> Result<String> {
-    database_integrity(&open_db(&root_from(&state)?)?)
+    let connection = open_db(&root_from(&state)?)?;
+    let sqlite = database_integrity(&connection)?;
+    if sqlite != "ok" {
+        return Ok(sqlite);
+    }
+    let issues = organisation::health_issues(&connection)?;
+    if issues.is_empty() {
+        Ok("ok".into())
+    } else {
+        Err(KeepframeError::Message(format!(
+            "Catalogue health found {}",
+            issues.join("; ")
+        )))
+    }
 }
 
 #[tauri::command]
@@ -2085,27 +2496,42 @@ fn validate_local_output_path(output: &Path, intended_dir: &Path) -> Result<Path
 
 /// Accept only a complete, decodable, plausibly-sized image that is distinct
 /// from the protected source. The caller owns any failed output and removes it.
-fn validate_ai_output(output: &Path, source_hash: &str, expected: Option<(u32, u32)>,) -> Result<String> {
-    let metadata = fs::metadata(output).map_err(|_| KeepframeError::Message("The AI result file was not found.".into()))?;
+fn validate_ai_output(
+    output: &Path,
+    source_hash: &str,
+    expected: Option<(u32, u32)>,
+) -> Result<String> {
+    let metadata = fs::metadata(output)
+        .map_err(|_| KeepframeError::Message("The AI result file was not found.".into()))?;
     if !metadata.is_file() || metadata.len() == 0 {
-        return Err(KeepframeError::Message("The AI result is empty or incomplete.".into(),));
+        return Err(KeepframeError::Message(
+            "The AI result is empty or incomplete.".into(),
+        ));
     }
-    let image = image::open(output).map_err(|_| { KeepframeError::Message("The AI result is not a valid decodable image.".into())
+    let image = image::open(output).map_err(|_| {
+        KeepframeError::Message("The AI result is not a valid decodable image.".into())
     })?;
     let (width, height) = image.dimensions();
     if width < 64 || height < 64 {
-        return Err(KeepframeError::Message("The AI result dimensions are implausibly small.".into(),));
+        return Err(KeepframeError::Message(
+            "The AI result dimensions are implausibly small.".into(),
+        ));
     }
     if let Some((source_width, source_height)) = expected {
         let source_pixels = u64::from(source_width) * u64::from(source_height);
         let output_pixels = u64::from(width) * u64::from(height);
-        if output_pixels < source_pixels / 100 || output_pixels > source_pixels.saturating_mul(100) {
-            return Err(KeepframeError::Message("The AI result dimensions are implausible for this photograph.".into(),));
+        if output_pixels < source_pixels / 100 || output_pixels > source_pixels.saturating_mul(100)
+        {
+            return Err(KeepframeError::Message(
+                "The AI result dimensions are implausible for this photograph.".into(),
+            ));
         }
     }
     let output_hash = hash_file(output)?;
     if output_hash == source_hash {
-        return Err(KeepframeError::Message("The returned image is identical to the protected source; no edit was imported.".into(),));
+        return Err(KeepframeError::Message(
+            "The returned image is identical to the protected source; no edit was imported.".into(),
+        ));
     }
     Ok(output_hash)
 }
@@ -2449,9 +2875,54 @@ fn encode_srgb_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn source_thumbnail_in(connection: &Connection, item_id: &str) -> Result<String> {
+    connection.query_row(
+        "SELECT s.thumbnail_path FROM assets item JOIN sources s ON s.id=item.source_id WHERE item.id=?1 AND item.trashed_at IS NULL",
+        [item_id],|row|row.get(0),
+    ).map_err(KeepframeError::from)
+}
+
+fn refresh_catalogue_thumbnail(
+    root: &Path,
+    connection: &Connection,
+    item_id: &str,
+) -> Result<String> {
+    let source = source_thumbnail_in(connection, item_id)?;
+    let recipe = develop_recipe_in(connection, item_id)?;
+    if !recipe.is_edited() {
+        connection.execute(
+            "UPDATE assets SET thumbnail_path=?2 WHERE id=?1",
+            params![item_id, source],
+        )?;
+        return Ok(source);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"keepframe-catalogue-item-v1");
+    digest.update(item_id.as_bytes());
+    digest.update(serde_json::to_vec(&recipe)?);
+    let key = format!("{:x}", digest.finalize());
+    let directory = root.join(".keepframe/previews");
+    fs::create_dir_all(&directory)?;
+    let output = directory.join(format!("catalogue-item-{}.png", &key[..24]));
+    if !output.exists() {
+        let rendered = image::DynamicImage::ImageRgb8(render_develop_recipe(
+            &image::open(&source)?.thumbnail(720, 540),
+            &recipe,
+        ));
+        let temporary = output.with_extension("png.tmp");
+        fs::write(&temporary, encode_srgb_png(&rendered)?)?;
+        fs::rename(&temporary, &output)?;
+    }
+    connection.execute(
+        "UPDATE assets SET thumbnail_path=?2 WHERE id=?1",
+        params![item_id, output.to_string_lossy()],
+    )?;
+    Ok(output.to_string_lossy().into())
+}
+
 fn adjustment_input(connection: &Connection, asset_id: &str) -> Result<AdjustmentInput> {
     let (captured, width, height, preferred): (String, Option<u32>, Option<u32>, Option<String>) = connection.query_row(
-        "SELECT captured_at,width,height,preferred_version_id FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        "SELECT s.captured_at,s.width,s.height,a.preferred_version_id FROM assets a JOIN sources s ON s.id=a.source_id WHERE a.id=?1 AND a.trashed_at IS NULL",
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
@@ -2471,7 +2942,7 @@ fn adjustment_input(connection: &Connection, asset_id: &str) -> Result<Adjustmen
         });
     }
     let (path, source_hash): (String, String) = connection.query_row(
-        "SELECT path,sha256 FROM representations WHERE asset_id=?1 ORDER BY CASE WHEN lower(extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN is_raw=1 THEN 1 ELSE 2 END,path LIMIT 1",
+        "SELECT path,sha256 FROM representations WHERE source_id=(SELECT source_id FROM assets WHERE id=?1) ORDER BY CASE WHEN lower(extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN is_raw=1 THEN 1 ELSE 2 END,path LIMIT 1",
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -2584,32 +3055,42 @@ fn apply_protected_local_contrast(image: &mut RgbImage, amount: f32, radius_divi
         let scale = 640.0 / largest as f32;
         let width = (image.width() as f32 * scale).round().max(1.0) as u32;
         let height = (image.height() as f32 * scale).round().max(1.0) as u32;
-        let working = image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle);
+        let working =
+            image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle);
         let small_blur = image::imageops::blur(&working, (sigma * scale).max(1.2));
-        image::imageops::resize(&small_blur, image.width(), image.height(), image::imageops::FilterType::Triangle,)
+        image::imageops::resize(
+            &small_blur,
+            image.width(),
+            image.height(),
+            image::imageops::FilterType::Triangle,
+        )
     } else {
         image::imageops::blur(image, sigma)
     };
-    image.as_mut().par_chunks_mut(3).zip(blurred.as_raw().par_chunks(3)).for_each(|(pixel, blurred_pixel)| {
-        let mut values = [
-            pixel[0] as f32 / 255.0,
-            pixel[1] as f32 / 255.0,
-            pixel[2] as f32 / 255.0,
-        ];
-        let current = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
-        let local_average = blurred_pixel[0] as f32 / 255.0 * 0.2126
-            + blurred_pixel[1] as f32 / 255.0 * 0.7152
-            + blurred_pixel[2] as f32 / 255.0 * 0.0722;
-        // Fade the local-contrast correction near pure black and white so it
-        // cannot turn the protected endpoint placement into broad clipping.
-        let endpoint_protection = (4.0 * current * (1.0 - current)).clamp(0.0, 1.0);
-        let target = (current + (current - local_average) * amount * endpoint_protection)
-            .clamp(0.0, 1.0);
-        remap_luminance(&mut values, current, target);
-        for (index, value) in values.iter().enumerate() {
-            pixel[index] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-        }
-    });
+    image
+        .as_mut()
+        .par_chunks_mut(3)
+        .zip(blurred.as_raw().par_chunks(3))
+        .for_each(|(pixel, blurred_pixel)| {
+            let mut values = [
+                pixel[0] as f32 / 255.0,
+                pixel[1] as f32 / 255.0,
+                pixel[2] as f32 / 255.0,
+            ];
+            let current = values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
+            let local_average = blurred_pixel[0] as f32 / 255.0 * 0.2126
+                + blurred_pixel[1] as f32 / 255.0 * 0.7152
+                + blurred_pixel[2] as f32 / 255.0 * 0.0722;
+            // Fade the local-contrast correction near pure black and white so it
+            // cannot turn the protected endpoint placement into broad clipping.
+            let endpoint_protection = (4.0 * current * (1.0 - current)).clamp(0.0, 1.0);
+            let target = (current + (current - local_average) * amount * endpoint_protection)
+                .clamp(0.0, 1.0);
+            remap_luminance(&mut values, current, target);
+            for (index, value) in values.iter().enumerate() {
+                pixel[index] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        });
 }
 
 fn apply_colour_adjustments_to_image(
@@ -2682,15 +3163,25 @@ fn apply_colour_adjustments_to_image(
     output
 }
 
-fn apply_adjustments_to_image(image: &image::DynamicImage, adjustments: BasicAdjustments,) -> RgbImage {
+fn apply_adjustments_to_image(
+    image: &image::DynamicImage,
+    adjustments: BasicAdjustments,
+) -> RgbImage {
     let colour = apply_colour_adjustments_to_image(image, adjustments);
     apply_geometry(&colour, adjustments)
 }
 
 fn segment_distance(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
-    let dx = end.0 - start.0; let dy = end.1 - start.1; let length_squared = dx * dx + dy * dy;
-    let t = (if length_squared <= f32::EPSILON { 0.0 } else { ((point.0-start.0)*dx+(point.1-start.1)*dy)/length_squared }).clamp(0.0,1.0);
-    ((point.0-(start.0+dx*t)).powi(2)+(point.1-(start.1+dy*t)).powi(2)).sqrt()
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let length_squared = dx * dx + dy * dy;
+    let t = (if length_squared <= f32::EPSILON {
+        0.0
+    } else {
+        ((point.0 - start.0) * dx + (point.1 - start.1) * dy) / length_squared
+    })
+    .clamp(0.0, 1.0);
+    ((point.0 - (start.0 + dx * t)).powi(2) + (point.1 - (start.1 + dy * t)).powi(2)).sqrt()
 }
 
 fn brush_stroke_alpha(stroke: &BrushStroke, x: u32, y: u32, width: u32, height: u32) -> f32 {
@@ -2753,12 +3244,20 @@ fn prepared_semantic_coverage(
 }
 
 fn digest_json(value: &impl Serialize) -> String {
-    format!("{:x}", Sha256::digest(serde_json::to_vec(value).expect("validated renderer values serialise")))
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).expect("validated renderer values serialise"))
+    )
 }
 
 fn semantic_cache_key(mask: &DevelopMask, width: u32, height: u32) -> Option<String> {
-    let MaskGeometry::Semantic { checksum, .. } = &mask.geometry else { return None; };
-    Some(format!("{checksum}:{width}x{height}:{:08x}", mask.feather.to_bits()))
+    let MaskGeometry::Semantic { checksum, .. } = &mask.geometry else {
+        return None;
+    };
+    Some(format!(
+        "{checksum}:{width}x{height}:{:08x}",
+        mask.feather.to_bits()
+    ))
 }
 
 fn prepared_semantic_coverage_cached(
@@ -2767,10 +3266,19 @@ fn prepared_semantic_coverage_cached(
     height: u32,
     caches: &mut RendererCaches,
 ) -> Result<Option<Arc<image::GrayImage>>> {
-    let Some(key) = semantic_cache_key(mask, width, height) else { return Ok(None); };
-    if let Some(coverage) = caches.semantics.get(&key) { return Ok(Some(coverage)); }
-    let coverage = Arc::new(prepared_semantic_coverage(mask, width, height)?.expect("semantic key requires semantic geometry"));
-    caches.semantics.insert(key, Arc::clone(&coverage), width as usize * height as usize);
+    let Some(key) = semantic_cache_key(mask, width, height) else {
+        return Ok(None);
+    };
+    if let Some(coverage) = caches.semantics.get(&key) {
+        return Ok(Some(coverage));
+    }
+    let coverage = Arc::new(
+        prepared_semantic_coverage(mask, width, height)?
+            .expect("semantic key requires semantic geometry"),
+    );
+    caches
+        .semantics
+        .insert(key, Arc::clone(&coverage), width as usize * height as usize);
     Ok(Some(coverage))
 }
 
@@ -2784,7 +3292,14 @@ fn mask_cache_key(mask: &DevelopMask, width: u32, height: u32) -> String {
         width: u32,
         height: u32,
     }
-    digest_json(&CoverageIdentity { geometry: &mask.geometry, inverted: mask.inverted, opacity: mask.opacity, feather: mask.feather, width, height })
+    digest_json(&CoverageIdentity {
+        geometry: &mask.geometry,
+        inverted: mask.inverted,
+        opacity: mask.opacity,
+        feather: mask.feather,
+        width,
+        height,
+    })
 }
 
 fn mask_coverage_prepared(
@@ -2793,12 +3308,56 @@ fn mask_coverage_prepared(
     x: u32,
     y: u32,
     width: u32,
-    height: u32,) -> f32 {
-    let nx=if width>1{x as f32/(width-1) as f32}else{0.0}; let ny=if height>1{y as f32/(height-1) as f32}else{0.0};
-    let mut coverage=match &mask.geometry {
-        MaskGeometry::Linear{start,end}=>{let dx=end.x-start.x;let dy=end.y-start.y;let t=((nx-start.x)*dx+(ny-start.y)*dy)/(dx*dx+dy*dy).max(0.000_001);let half=mask.feather.max(0.001)*0.5;smoothstep(0.5-half,0.5+half,t)}
-        MaskGeometry::Radial{centre,radius_x,radius_y,rotation,}=>{let(sin,cos)=rotation.to_radians().sin_cos();let dx=nx-centre.x;let dy=ny-centre.y;let rx=(cos*dx+sin*dy)/radius_x.max(0.000_001);let ry=(-sin*dx+cos*dy)/radius_y.max(0.000_001);1.0-smoothstep((1.0-mask.feather).clamp(0.0,0.999),1.0,(rx*rx+ry*ry).sqrt(),)}
-        MaskGeometry::Brush{strokes}=>{let mut painted=0.0_f32;for stroke in strokes{let alpha= brush_stroke_alpha(stroke, x, y, width, height);painted=if stroke.erase{painted*(1.0-alpha)}else{painted+(1.0-painted)*alpha};}painted}
+    height: u32,
+) -> f32 {
+    let nx = if width > 1 {
+        x as f32 / (width - 1) as f32
+    } else {
+        0.0
+    };
+    let ny = if height > 1 {
+        y as f32 / (height - 1) as f32
+    } else {
+        0.0
+    };
+    let mut coverage = match &mask.geometry {
+        MaskGeometry::Linear { start, end } => {
+            let dx = end.x - start.x;
+            let dy = end.y - start.y;
+            let t =
+                ((nx - start.x) * dx + (ny - start.y) * dy) / (dx * dx + dy * dy).max(0.000_001);
+            let half = mask.feather.max(0.001) * 0.5;
+            smoothstep(0.5 - half, 0.5 + half, t)
+        }
+        MaskGeometry::Radial {
+            centre,
+            radius_x,
+            radius_y,
+            rotation,
+        } => {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let dx = nx - centre.x;
+            let dy = ny - centre.y;
+            let rx = (cos * dx + sin * dy) / radius_x.max(0.000_001);
+            let ry = (-sin * dx + cos * dy) / radius_y.max(0.000_001);
+            1.0 - smoothstep(
+                (1.0 - mask.feather).clamp(0.0, 0.999),
+                1.0,
+                (rx * rx + ry * ry).sqrt(),
+            )
+        }
+        MaskGeometry::Brush { strokes } => {
+            let mut painted = 0.0_f32;
+            for stroke in strokes {
+                let alpha = brush_stroke_alpha(stroke, x, y, width, height);
+                painted = if stroke.erase {
+                    painted * (1.0 - alpha)
+                } else {
+                    painted + (1.0 - painted) * alpha
+                };
+            }
+            painted
+        }
         MaskGeometry::Semantic { refinements, .. } => {
             let mut value = semantic
                 .map(|coverage| coverage.get_pixel(x, y)[0] as f32 / 255.0)
@@ -2814,8 +3373,10 @@ fn mask_coverage_prepared(
             value
         }
     };
-    if mask.inverted { coverage=1.0-coverage; }
-    (coverage*mask.opacity).clamp(0.0,1.0)
+    if mask.inverted {
+        coverage = 1.0 - coverage;
+    }
+    (coverage * mask.opacity).clamp(0.0, 1.0)
 }
 
 fn prepared_mask_coverage(
@@ -2825,11 +3386,14 @@ fn prepared_mask_coverage(
     semantic: Option<&image::GrayImage>,
 ) -> Vec<f32> {
     let count = width as usize * height as usize;
-    (0..count).into_par_iter().map(|index| {
-        let x = index as u32 % width;
-        let y = index as u32 / width;
-        mask_coverage_prepared(mask, semantic, x, y, width, height)
-    }).collect()
+    (0..count)
+        .into_par_iter()
+        .map(|index| {
+            let x = index as u32 % width;
+            let y = index as u32 / width;
+            mask_coverage_prepared(mask, semantic, x, y, width, height)
+        })
+        .collect()
 }
 
 fn prepared_mask_coverage_cached(
@@ -2839,10 +3403,21 @@ fn prepared_mask_coverage_cached(
     caches: &mut RendererCaches,
 ) -> Result<Arc<Vec<f32>>> {
     let key = mask_cache_key(mask, width, height);
-    if let Some(coverage) = caches.masks.get(&key) { return Ok(coverage); }
+    if let Some(coverage) = caches.masks.get(&key) {
+        return Ok(coverage);
+    }
     let semantic = prepared_semantic_coverage_cached(mask, width, height, caches)?;
-    let coverage = Arc::new(prepared_mask_coverage(mask, width, height, semantic.as_deref()));
-    caches.masks.insert(key, Arc::clone(&coverage), coverage.len() * std::mem::size_of::<f32>());
+    let coverage = Arc::new(prepared_mask_coverage(
+        mask,
+        width,
+        height,
+        semantic.as_deref(),
+    ));
+    caches.masks.insert(
+        key,
+        Arc::clone(&coverage),
+        coverage.len() * std::mem::size_of::<f32>(),
+    );
     Ok(coverage)
 }
 
@@ -2856,19 +3431,49 @@ fn mask_coverage(mask: &DevelopMask, x: u32, y: u32, width: u32, height: u32) ->
 
 fn render_develop_recipe(image: &image::DynamicImage, recipe: &DevelopRecipe) -> RgbImage {
     // Deliberate order: EXIF-oriented source -> global colour/tone -> ordered local masks -> transform/crop.
-    let mut output=apply_colour_adjustments_to_image(image,recipe.settings);let(width,height)=output.dimensions();
-    for mask in recipe.masks.iter().filter(|mask|mask.enabled&&mask.opacity>0.0){
-        let semantic = prepared_semantic_coverage(mask, width, height).ok().flatten();
-        let coverage = prepared_mask_coverage(mask,width,height,semantic.as_ref());
-        let adjusted=apply_colour_adjustments_to_image(&image::DynamicImage::ImageRgb8(output.clone()),mask.adjustments.as_basic(),);
-        output.as_mut().par_chunks_mut(3).zip(adjusted.as_raw().par_chunks(3)).zip(coverage.par_iter()).for_each(|((pixel,target),alpha)| { if *alpha>0.0 { for channel in 0..3 { pixel[channel]=(pixel[channel] as f32+(target[channel] as f32-pixel[channel] as f32)*alpha).round().clamp(0.0,255.0) as u8; } } });
+    let mut output = apply_colour_adjustments_to_image(image, recipe.settings);
+    let (width, height) = output.dimensions();
+    for mask in recipe
+        .masks
+        .iter()
+        .filter(|mask| mask.enabled && mask.opacity > 0.0)
+    {
+        let semantic = prepared_semantic_coverage(mask, width, height)
+            .ok()
+            .flatten();
+        let coverage = prepared_mask_coverage(mask, width, height, semantic.as_ref());
+        let adjusted = apply_colour_adjustments_to_image(
+            &image::DynamicImage::ImageRgb8(output.clone()),
+            mask.adjustments.as_basic(),
+        );
+        output
+            .as_mut()
+            .par_chunks_mut(3)
+            .zip(adjusted.as_raw().par_chunks(3))
+            .zip(coverage.par_iter())
+            .for_each(|((pixel, target), alpha)| {
+                if *alpha > 0.0 {
+                    for channel in 0..3 {
+                        pixel[channel] = (pixel[channel] as f32
+                            + (target[channel] as f32 - pixel[channel] as f32) * alpha)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                }
+            });
     }
-    apply_geometry(&output,recipe.settings)
+    apply_geometry(&output, recipe.settings)
 }
 
 fn colour_identity(mut settings: BasicAdjustments) -> BasicAdjustments {
-    settings.crop_left=0.0; settings.crop_top=0.0; settings.crop_width=1.0; settings.crop_height=1.0;
-    settings.rotate_quadrants=0; settings.straighten=0.0; settings.horizontal_flip=false; settings.vertical_flip=false;
+    settings.crop_left = 0.0;
+    settings.crop_top = 0.0;
+    settings.crop_width = 1.0;
+    settings.crop_height = 1.0;
+    settings.rotate_quadrants = 0;
+    settings.straighten = 0.0;
+    settings.horizontal_flip = false;
+    settings.vertical_flip = false;
     settings
 }
 
@@ -2877,41 +3482,124 @@ fn render_develop_recipe_cached(
     source_key: &str,
     recipe: &DevelopRecipe,
     caches: &Mutex<RendererCaches>,
-    generation: Option<(&AtomicU64,u64)>,
+    generation: Option<(&AtomicU64, u64)>,
 ) -> Result<RgbImage> {
-    let cancelled=||generation.is_some_and(|(current,requested)|current.load(Ordering::Acquire)!=requested);
-    if cancelled(){return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
-    let global_key=format!("{source_key}:{}",digest_json(&colour_identity(recipe.settings)));
-    let cached_global=caches.lock().expect("renderer cache lock").intermediates.get(&global_key);
-    let mut output=if let Some(global)=cached_global{(*global).clone()}else{
-        let rendered=apply_colour_adjustments_to_image(image,recipe.settings);
-        caches.lock().expect("renderer cache lock").intermediates.insert(global_key,Arc::new(rendered.clone()),rendered.as_raw().len());
+    let cancelled = || {
+        generation.is_some_and(|(current, requested)| current.load(Ordering::Acquire) != requested)
+    };
+    if cancelled() {
+        return Err(KeepframeError::Message(
+            "Superseded Develop preview.".into(),
+        ));
+    }
+    let global_key = format!(
+        "{source_key}:{}",
+        digest_json(&colour_identity(recipe.settings))
+    );
+    let cached_global = caches
+        .lock()
+        .expect("renderer cache lock")
+        .intermediates
+        .get(&global_key);
+    let mut output = if let Some(global) = cached_global {
+        (*global).clone()
+    } else {
+        let rendered = apply_colour_adjustments_to_image(image, recipe.settings);
+        caches
+            .lock()
+            .expect("renderer cache lock")
+            .intermediates
+            .insert(
+                global_key,
+                Arc::new(rendered.clone()),
+                rendered.as_raw().len(),
+            );
         rendered
     };
-    if cancelled(){return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
-    let(width,height)=output.dimensions();
-    for mask in recipe.masks.iter().filter(|mask|mask.enabled&&mask.opacity>0.0){
-        let coverage=prepared_mask_coverage_cached(mask,width,height,&mut caches.lock().expect("renderer cache lock"))?;
-        let adjusted=apply_colour_adjustments_to_image(&image::DynamicImage::ImageRgb8(output.clone()),mask.adjustments.as_basic());
-        output.as_mut().par_chunks_mut(3).zip(adjusted.as_raw().par_chunks(3)).zip(coverage.par_iter()).for_each(|((pixel,target),alpha)|{if *alpha>0.0{for channel in 0..3{pixel[channel]=(pixel[channel]as f32+(target[channel]as f32-pixel[channel]as f32)*alpha).round().clamp(0.0,255.0)as u8;}}});
-        if cancelled(){return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
+    if cancelled() {
+        return Err(KeepframeError::Message(
+            "Superseded Develop preview.".into(),
+        ));
     }
-    Ok(apply_geometry(&output,recipe.settings))
+    let (width, height) = output.dimensions();
+    for mask in recipe
+        .masks
+        .iter()
+        .filter(|mask| mask.enabled && mask.opacity > 0.0)
+    {
+        let coverage = prepared_mask_coverage_cached(
+            mask,
+            width,
+            height,
+            &mut caches.lock().expect("renderer cache lock"),
+        )?;
+        let adjusted = apply_colour_adjustments_to_image(
+            &image::DynamicImage::ImageRgb8(output.clone()),
+            mask.adjustments.as_basic(),
+        );
+        output
+            .as_mut()
+            .par_chunks_mut(3)
+            .zip(adjusted.as_raw().par_chunks(3))
+            .zip(coverage.par_iter())
+            .for_each(|((pixel, target), alpha)| {
+                if *alpha > 0.0 {
+                    for channel in 0..3 {
+                        pixel[channel] = (pixel[channel] as f32
+                            + (target[channel] as f32 - pixel[channel] as f32) * alpha)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                }
+            });
+        if cancelled() {
+            return Err(KeepframeError::Message(
+                "Superseded Develop preview.".into(),
+            ));
+        }
+    }
+    Ok(apply_geometry(&output, recipe.settings))
 }
 
-fn decoded_source_key(path:&Path,width:u32,height:u32)->Result<String>{
-    let metadata=fs::metadata(path)?;
-    let modified=metadata.modified().ok().and_then(|value|value.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
-    Ok(format!("{}:{}:{}:{}:{}x{}",path.to_string_lossy(),metadata.len(),modified.as_secs(),modified.subsec_nanos(),width,height))
+fn decoded_source_key(path: &Path, width: u32, height: u32) -> Result<String> {
+    let metadata = fs::metadata(path)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    Ok(format!(
+        "{}:{}:{}:{}:{}x{}",
+        path.to_string_lossy(),
+        metadata.len(),
+        modified.as_secs(),
+        modified.subsec_nanos(),
+        width,
+        height
+    ))
 }
 
-fn decode_preview_cached(path:&Path,caches:&Mutex<RendererCaches>)->Result<(String,Arc<image::DynamicImage>)>{
-    let key=decoded_source_key(path,720,540)?;
-    if let Some(image)=caches.lock().expect("renderer cache lock").decoded.get(&key){return Ok((key,image));}
-    let image=Arc::new(image::open(path)?.thumbnail(720,540));
-    let bytes=image.width()as usize*image.height()as usize*4;
-    caches.lock().expect("renderer cache lock").decoded.insert(key.clone(),Arc::clone(&image),bytes);
-    Ok((key,image))
+fn decode_preview_cached(
+    path: &Path,
+    caches: &Mutex<RendererCaches>,
+) -> Result<(String, Arc<image::DynamicImage>)> {
+    let key = decoded_source_key(path, 720, 540)?;
+    if let Some(image) = caches
+        .lock()
+        .expect("renderer cache lock")
+        .decoded
+        .get(&key)
+    {
+        return Ok((key, image));
+    }
+    let image = Arc::new(image::open(path)?.thumbnail(720, 540));
+    let bytes = image.width() as usize * image.height() as usize * 4;
+    caches.lock().expect("renderer cache lock").decoded.insert(
+        key.clone(),
+        Arc::clone(&image),
+        bytes,
+    );
+    Ok((key, image))
 }
 
 fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage {
@@ -2938,8 +3626,13 @@ fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage 
                 let dy = y as f32 - centre_y;
                 let source_x = (cos * dx + sin * dy + centre_x).round() as i32;
                 let source_y = (-sin * dx + cos * dy + centre_y).round() as i32;
-                if source_x >= 0 && source_y >= 0 && source_x < width as i32 && source_y < height as i32 {
-                    *rotated.get_pixel_mut(x, y) = *image.get_pixel(source_x as u32, source_y as u32);
+                if source_x >= 0
+                    && source_y >= 0
+                    && source_x < width as i32
+                    && source_y < height as i32
+                {
+                    *rotated.get_pixel_mut(x, y) =
+                        *image.get_pixel(source_x as u32, source_y as u32);
                 }
             }
         }
@@ -2950,70 +3643,180 @@ fn apply_geometry(source: &RgbImage, adjustments: BasicAdjustments) -> RgbImage 
     let height = image.height();
     let x = (left * width as f32).round() as u32;
     let y = (top * height as f32).round() as u32;
-    let crop_w = ((crop_width * width as f32).round() as u32).clamp(1, width.saturating_sub(x).max(1));
-    let crop_h = ((crop_height * height as f32).round() as u32).clamp(1, height.saturating_sub(y).max(1));
-    image::imageops::crop_imm(&image, x.min(width - 1), y.min(height - 1), crop_w, crop_h).to_image()
+    let crop_w =
+        ((crop_width * width as f32).round() as u32).clamp(1, width.saturating_sub(x).max(1));
+    let crop_h =
+        ((crop_height * height as f32).round() as u32).clamp(1, height.saturating_sub(y).max(1));
+    image::imageops::crop_imm(&image, x.min(width - 1), y.min(height - 1), crop_w, crop_h)
+        .to_image()
 }
 
 fn original_adjustment_input(connection: &Connection, asset_id: &str) -> Result<AdjustmentInput> {
     let (captured, width, height): (String, Option<u32>, Option<u32>) = connection.query_row(
-        "SELECT captured_at,width,height FROM assets WHERE id=?1 AND trashed_at IS NULL",
+        "SELECT s.captured_at,s.width,s.height FROM assets a JOIN sources s ON s.id=a.source_id WHERE a.id=?1 AND a.trashed_at IS NULL",
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let (path, source_hash): (String, String) = connection.query_row(
-        "SELECT path,sha256 FROM representations WHERE asset_id=?1 ORDER BY CASE WHEN lower(extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN is_raw=1 THEN 1 ELSE 2 END,path LIMIT 1",
+        "SELECT path,sha256 FROM representations WHERE source_id=(SELECT source_id FROM assets WHERE id=?1) ORDER BY CASE WHEN lower(extension) IN ('jpg','jpeg','png','tif','tiff') THEN 0 WHEN is_raw=1 THEN 1 ELSE 2 END,path LIMIT 1",
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(AdjustmentInput { path: PathBuf::from(path), source_hash, captured_at: captured, expected_dimensions: width.zip(height), })
+    Ok(AdjustmentInput {
+        path: PathBuf::from(path),
+        source_hash,
+        captured_at: captured,
+        expected_dimensions: width.zip(height),
+    })
 }
 
 fn image_statistics(image: &image::DynamicImage) -> ImageStatistics {
     let rgb = image.to_rgb8();
     let step = ((rgb.width() as usize * rgb.height() as usize) / 250_000).max(1);
-    let mut luminance_bins = vec![0_u64; 64]; let mut red_bins = vec![0_u64; 64]; let mut green_bins = vec![0_u64; 64]; let mut blue_bins = vec![0_u64; 64];
-    let mut luminances = Vec::new(); let mut saturation_total = 0.0_f32; let mut channel_total = [0.0_f32; 3]; let mut shadows = 0_u64; let mut highlights = 0_u64;
+    let mut luminance_bins = vec![0_u64; 64];
+    let mut red_bins = vec![0_u64; 64];
+    let mut green_bins = vec![0_u64; 64];
+    let mut blue_bins = vec![0_u64; 64];
+    let mut luminances = Vec::new();
+    let mut saturation_total = 0.0_f32;
+    let mut channel_total = [0.0_f32; 3];
+    let mut shadows = 0_u64;
+    let mut highlights = 0_u64;
     for pixel in rgb.pixels().step_by(step) {
-        let channels = [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0,];
+        let channels = [
+            pixel[0] as f32 / 255.0,
+            pixel[1] as f32 / 255.0,
+            pixel[2] as f32 / 255.0,
+        ];
         let luminance = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
         luminance_bins[(luminance * 63.0).round().clamp(0.0, 63.0) as usize] += 1;
-        red_bins[(channels[0] * 63.0).round() as usize] += 1; green_bins[(channels[1] * 63.0).round() as usize] += 1; blue_bins[(channels[2] * 63.0).round() as usize] += 1;
-        let maximum = channels.into_iter().fold(0.0_f32, f32::max); let minimum = channels.into_iter().fold(1.0_f32, f32::min);
-        saturation_total += if maximum > 0.0 { (maximum - minimum) / maximum } else { 0.0 };
-        channel_total[0] += channels[0]; channel_total[1] += channels[1]; channel_total[2] += channels[2];
-        if luminance <= 0.02 { shadows += 1; }
-        if luminance >= 0.98 { highlights += 1; }
+        red_bins[(channels[0] * 63.0).round() as usize] += 1;
+        green_bins[(channels[1] * 63.0).round() as usize] += 1;
+        blue_bins[(channels[2] * 63.0).round() as usize] += 1;
+        let maximum = channels.into_iter().fold(0.0_f32, f32::max);
+        let minimum = channels.into_iter().fold(1.0_f32, f32::min);
+        saturation_total += if maximum > 0.0 {
+            (maximum - minimum) / maximum
+        } else {
+            0.0
+        };
+        channel_total[0] += channels[0];
+        channel_total[1] += channels[1];
+        channel_total[2] += channels[2];
+        if luminance <= 0.02 {
+            shadows += 1;
+        }
+        if luminance >= 0.98 {
+            highlights += 1;
+        }
         luminances.push(luminance);
     }
-    luminances.sort_by(|left, right| left.total_cmp(right)); let samples = luminances.len().max(1);
-    let percentile = |fraction: f32| { luminances.get(((samples - 1) as f32 * fraction).round() as usize).copied().unwrap_or(0.5)
+    luminances.sort_by(|left, right| left.total_cmp(right));
+    let samples = luminances.len().max(1);
+    let percentile = |fraction: f32| {
+        luminances
+            .get(((samples - 1) as f32 * fraction).round() as usize)
+            .copied()
+            .unwrap_or(0.5)
     };
-    ImageStatistics { luminance_bins, red_bins, green_bins, blue_bins, samples: samples as u64, average_luminance: luminances.iter().sum::<f32>() / samples as f32, p01: percentile(0.01), p50: percentile(0.50), p99: percentile(0.99), shadow_clip_fraction: shadows as f32 / samples as f32, highlight_clip_fraction: highlights as f32 / samples as f32, average_saturation: saturation_total / samples as f32, red_green_blue: [channel_total[0] / samples as f32, channel_total[1] / samples as f32, channel_total[2] / samples as f32,], dynamic_range: (percentile(0.99) - percentile(0.01)).max(0.0), }
+    ImageStatistics {
+        luminance_bins,
+        red_bins,
+        green_bins,
+        blue_bins,
+        samples: samples as u64,
+        average_luminance: luminances.iter().sum::<f32>() / samples as f32,
+        p01: percentile(0.01),
+        p50: percentile(0.50),
+        p99: percentile(0.99),
+        shadow_clip_fraction: shadows as f32 / samples as f32,
+        highlight_clip_fraction: highlights as f32 / samples as f32,
+        average_saturation: saturation_total / samples as f32,
+        red_green_blue: [
+            channel_total[0] / samples as f32,
+            channel_total[1] / samples as f32,
+            channel_total[2] / samples as f32,
+        ],
+        dynamic_range: (percentile(0.99) - percentile(0.01)).max(0.0),
+    }
 }
 
 fn auto_proposal(image: &image::DynamicImage, current: BasicAdjustments) -> AutoProposal {
-    let stats = image_statistics(image); let mut settings = current; let mut explanation = Vec::new();
+    let stats = image_statistics(image);
+    let mut settings = current;
+    let mut explanation = Vec::new();
     // Auto analyses the source-derived, bounded thumbnail and adds restrained
     // deltas to the current recipe. It deliberately never changes geometry.
     let exposure_delta = ((0.46 / stats.p50.max(0.08)).log2()).clamp(-0.35, 0.65);
-    if exposure_delta.abs() >= 0.08 { settings.exposure = (current.exposure + exposure_delta).clamp(-3.0, 3.0); explanation.push(if exposure_delta > 0.0 { "Exposure increased because midtones were under-represented.".into() } else { "Exposure reduced because midtones were already bright.".into() }); }
-    if stats.highlight_clip_fraction > 0.004 || stats.p99 > 0.94 { settings.highlights = (current.highlights - 18.0).max(-45.0); explanation.push("Highlights reduced because clipping was detected.".into()); }
-    if stats.shadow_clip_fraction > 0.012 || stats.p01 < 0.07 { settings.shadows = (current.shadows + 14.0).min(35.0); explanation.push("Shadows raised moderately because dark detail was limited.".into()); }
-    if stats.dynamic_range < 0.55 { settings.contrast = (current.contrast + 7.0).min(20.0); explanation.push("Contrast raised slightly because the tonal range was flat.".into()); }
-    if stats.average_saturation < 0.18 { settings.colour_boost = (current.colour_boost + 8.0).min(18.0); explanation.push("Vibrance increased conservatively because average saturation was low.".into()); }
-    let neutral_spread = (stats.red_green_blue[0] - stats.red_green_blue[1]).abs().max((stats.red_green_blue[2] - stats.red_green_blue[1]).abs());
+    if exposure_delta.abs() >= 0.08 {
+        settings.exposure = (current.exposure + exposure_delta).clamp(-3.0, 3.0);
+        explanation.push(if exposure_delta > 0.0 {
+            "Exposure increased because midtones were under-represented.".into()
+        } else {
+            "Exposure reduced because midtones were already bright.".into()
+        });
+    }
+    if stats.highlight_clip_fraction > 0.004 || stats.p99 > 0.94 {
+        settings.highlights = (current.highlights - 18.0).max(-45.0);
+        explanation.push("Highlights reduced because clipping was detected.".into());
+    }
+    if stats.shadow_clip_fraction > 0.012 || stats.p01 < 0.07 {
+        settings.shadows = (current.shadows + 14.0).min(35.0);
+        explanation.push("Shadows raised moderately because dark detail was limited.".into());
+    }
+    if stats.dynamic_range < 0.55 {
+        settings.contrast = (current.contrast + 7.0).min(20.0);
+        explanation.push("Contrast raised slightly because the tonal range was flat.".into());
+    }
+    if stats.average_saturation < 0.18 {
+        settings.colour_boost = (current.colour_boost + 8.0).min(18.0);
+        explanation
+            .push("Vibrance increased conservatively because average saturation was low.".into());
+    }
+    let neutral_spread = (stats.red_green_blue[0] - stats.red_green_blue[1])
+        .abs()
+        .max((stats.red_green_blue[2] - stats.red_green_blue[1]).abs());
     let wb_confidence = (1.0 - neutral_spread * 8.0).clamp(0.0, 1.0);
     if wb_confidence >= 0.58 && stats.average_saturation < 0.42 {
-        let temperature = ((stats.red_green_blue[2] - stats.red_green_blue[0]) * 55.0).clamp(-12.0, 12.0);
-        if temperature.abs() >= 2.0 { settings.light_balance = (current.light_balance + temperature).clamp(-100.0, 100.0); explanation.push(if temperature > 0.0 { "White balance warmed using a low-saturation grey-world estimate.".into() } else { "White balance cooled using a low-saturation grey-world estimate.".into() }); }
-    } else { explanation.push("White balance unchanged because no reliable neutral estimate was found.".into()); }
-    if explanation.is_empty() { explanation.push("The image already falls within conservative Auto thresholds; no changes are proposed.".into(),); }
+        let temperature =
+            ((stats.red_green_blue[2] - stats.red_green_blue[0]) * 55.0).clamp(-12.0, 12.0);
+        if temperature.abs() >= 2.0 {
+            settings.light_balance = (current.light_balance + temperature).clamp(-100.0, 100.0);
+            explanation.push(if temperature > 0.0 {
+                "White balance warmed using a low-saturation grey-world estimate.".into()
+            } else {
+                "White balance cooled using a low-saturation grey-world estimate.".into()
+            });
+        }
+    } else {
+        explanation
+            .push("White balance unchanged because no reliable neutral estimate was found.".into());
+    }
+    if explanation.is_empty() {
+        explanation.push(
+            "The image already falls within conservative Auto thresholds; no changes are proposed."
+                .into(),
+        );
+    }
     let mut recommendations = Vec::new();
-    if stats.average_saturation > 0.24 && stats.dynamic_range > 0.55 { recommendations.push("Landscape".into()); }
-    if stats.average_saturation < 0.22 && stats.p50 > 0.38 && stats.p50 < 0.70 { recommendations.push("Portrait".into()); }
-    if stats.dynamic_range < 0.45 { recommendations.push("Soft Contrast".into()); }
-    AutoProposal { settings, explanation, confidence: ((wb_confidence + (1.0 - stats.highlight_clip_fraction * 8.0).clamp(0.0, 1.0)) / 2.0).clamp(0.25, 1.0), statistics: stats, recommendations, }
+    if stats.average_saturation > 0.24 && stats.dynamic_range > 0.55 {
+        recommendations.push("Landscape".into());
+    }
+    if stats.average_saturation < 0.22 && stats.p50 > 0.38 && stats.p50 < 0.70 {
+        recommendations.push("Portrait".into());
+    }
+    if stats.dynamic_range < 0.45 {
+        recommendations.push("Soft Contrast".into());
+    }
+    AutoProposal {
+        settings,
+        explanation,
+        confidence: ((wb_confidence + (1.0 - stats.highlight_clip_fraction * 8.0).clamp(0.0, 1.0))
+            / 2.0)
+            .clamp(0.25, 1.0),
+        statistics: stats,
+        recommendations,
+    }
 }
 
 fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments {
@@ -3030,12 +3833,17 @@ fn suggested_basic_adjustments(image: &image::DynamicImage) -> BasicAdjustments 
         } else {
             0.0
         };
-        luminances.push((pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722) / 255.0,);
+        luminances.push(
+            (pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722)
+                / 255.0,
+        );
         samples += 1;
     }
     luminances.sort_by(|left, right| left.total_cmp(right));
     let percentile = |fraction: f32| -> f32 {
-        if luminances.is_empty() { return 0.5; }
+        if luminances.is_empty() {
+            return 0.5;
+        }
         luminances[((luminances.len() - 1) as f32 * fraction).round() as usize]
     };
     let median = percentile(0.50);
@@ -3092,11 +3900,7 @@ async fn auto_basic_adjustments(
     let root = root_from(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<BasicAdjustments> {
         let connection = open_db(&root)?;
-        let preview: String = connection.query_row(
-            "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",
-            [&asset_id],
-            |row| row.get(0),
-        )?;
+        let preview = source_thumbnail_in(&connection, &asset_id)?;
         // A bounded preview keeps slider feedback independent of the size of
         // the cached browse image. Full-resolution export uses a separate path.
         let image = image::open(preview)?.thumbnail(720, 540);
@@ -3118,11 +3922,7 @@ async fn preview_basic_adjustments(
     let root = root_from(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<String> {
         let connection = open_db(&root)?;
-        let preview: String = connection.query_row(
-            "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",
-            [&asset_id],
-            |row| row.get(0),
-        )?;
+        let preview = source_thumbnail_in(&connection, &asset_id)?;
         let image = image::open(preview)?;
         let adjusted =
             image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&image, adjustments));
@@ -3155,13 +3955,17 @@ fn develop_recipe_in(connection: &Connection, asset_id: &str) -> Result<DevelopR
         |row| row.get(0),
     )?;
     if !exists {
-        return Err(KeepframeError::Message("That photograph is no longer available for Develop.".into(),));
+        return Err(KeepframeError::Message(
+            "That photograph is no longer available for Develop.".into(),
+        ));
     }
-    let recipe_json: Option<String> = connection.query_row(
-        "SELECT recipe_json FROM develop_recipes WHERE asset_id=?1",
-        [asset_id],
-        |row| row.get(0),
-    ).optional()?;
+    let recipe_json: Option<String> = connection
+        .query_row(
+            "SELECT recipe_json FROM develop_recipes WHERE asset_id=?1",
+            [asset_id],
+            |row| row.get(0),
+        )
+        .optional()?;
     match recipe_json {
         Some(json) => serde_json::from_str::<DevelopRecipe>(&json)
             .map_err(KeepframeError::from)?
@@ -3177,9 +3981,14 @@ fn get_develop_recipe(asset_id: String, state: State<'_, AppState>) -> Result<De
 }
 
 #[tauri::command]
-fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>,) -> Result<bool> {
+fn save_develop_recipe(
+    asset_id: String,
+    recipe: DevelopRecipe,
+    state: State<'_, AppState>,
+) -> Result<bool> {
     let recipe = recipe.validate()?;
-    let mut connection = open_db(&root_from(&state)?)?;
+    let root = root_from(&state)?;
+    let mut connection = open_db(&root)?;
     let _ = develop_recipe_in(&connection, &asset_id)?;
     let tx = connection.transaction()?;
     if recipe.is_edited() {
@@ -3191,141 +4000,411 @@ fn save_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_,
         tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1", [&asset_id])?;
     }
     tx.commit()?;
+    refresh_catalogue_thumbnail(&root, &connection, &asset_id)?;
     Ok(recipe.is_edited())
 }
 
-fn write_develop_recipe(tx:&rusqlite::Transaction<'_>,asset_id:&str,recipe:&DevelopRecipe)->Result<()> {
-    if recipe.is_edited(){tx.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,2,?2,?3) ON CONFLICT(asset_id) DO UPDATE SET schema_version=2,recipe_json=excluded.recipe_json,updated_at=excluded.updated_at",params![asset_id,serde_json::to_string(recipe)?,Utc::now().to_rfc3339()])?;}else{tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1",[asset_id])?;}Ok(())
+fn write_develop_recipe(
+    tx: &rusqlite::Transaction<'_>,
+    asset_id: &str,
+    recipe: &DevelopRecipe,
+) -> Result<()> {
+    if recipe.is_edited() {
+        tx.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,2,?2,?3) ON CONFLICT(asset_id) DO UPDATE SET schema_version=2,recipe_json=excluded.recipe_json,updated_at=excluded.updated_at",params![asset_id,serde_json::to_string(recipe)?,Utc::now().to_rfc3339()])?;
+    } else {
+        tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1", [asset_id])?;
+    }
+    Ok(())
 }
 
-fn recipe_snapshots(connection:&Connection,asset_ids:&[String])->Result<Value>{Ok(Value::Array(asset_ids.iter().map(|id|Ok(json!({"id":id,"recipe":develop_recipe_in(connection,id)?}))).collect::<Result<Vec<_>>>()?))}
-
-fn apply_recipe_snapshots(tx:&rusqlite::Transaction<'_>,snapshots:&Value)->Result<()> {
-    for item in snapshots.as_array().ok_or_else(||KeepframeError::Message("Batch recipe history is invalid".into()))?{let id=item["id"].as_str().ok_or_else(||KeepframeError::Message("Batch recipe history has no asset id".into()))?;let recipe=serde_json::from_value::<DevelopRecipe>(item["recipe"].clone())?.validate()?;write_develop_recipe(tx,id,&recipe)?;}Ok(())
+fn recipe_snapshots(connection: &Connection, asset_ids: &[String]) -> Result<Value> {
+    Ok(Value::Array(
+        asset_ids
+            .iter()
+            .map(|id| Ok(json!({"id":id,"recipe":develop_recipe_in(connection,id)?})))
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
-fn copy_setting_categories(target:&mut BasicAdjustments,source:&BasicAdjustments,categories:&HashSet<String>){
-    if categories.contains("whiteBalance"){target.light_balance=source.light_balance;target.tint=source.tint;}
-    if categories.contains("tone"){target.exposure=source.exposure;target.contrast=source.contrast;target.highlights=source.highlights;target.shadows=source.shadows;target.whites=source.whites;target.blacks=source.blacks;target.dynamic_range=source.dynamic_range;target.curve_highlights=source.curve_highlights;target.curve_lights=source.curve_lights;target.curve_darks=source.curve_darks;target.curve_shadows=source.curve_shadows;}
-    if categories.contains("presence"){target.texture=source.texture;target.clarity=source.clarity;target.dehaze=source.dehaze;}
-    if categories.contains("colour"){target.colour_boost=source.colour_boost;target.saturation=source.saturation;}
-    if categories.contains("transform"){target.crop_left=source.crop_left;target.crop_top=source.crop_top;target.crop_width=source.crop_width;target.crop_height=source.crop_height;target.rotate_quadrants=source.rotate_quadrants;target.straighten=source.straighten;target.horizontal_flip=source.horizontal_flip;target.vertical_flip=source.vertical_flip;}
+fn apply_recipe_snapshots(tx: &rusqlite::Transaction<'_>, snapshots: &Value) -> Result<()> {
+    for item in snapshots
+        .as_array()
+        .ok_or_else(|| KeepframeError::Message("Batch recipe history is invalid".into()))?
+    {
+        let id = item["id"].as_str().ok_or_else(|| {
+            KeepframeError::Message("Batch recipe history has no asset id".into())
+        })?;
+        let recipe = serde_json::from_value::<DevelopRecipe>(item["recipe"].clone())?.validate()?;
+        write_develop_recipe(tx, id, &recipe)?;
+    }
+    Ok(())
 }
 
-fn apply_batch_recipes(connection:&mut Connection,asset_ids:Vec<String>,recipes:Vec<DevelopRecipe>)->Result<BatchSummary>{
-    let requested=asset_ids.len();if requested==0||requested!=recipes.len()||requested>10_000{return Err(KeepframeError::Message("The Develop batch is invalid".into()));}
-    let old=recipe_snapshots(connection,&asset_ids)?;let tx=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;let mut changed=0;let mut new=Vec::with_capacity(requested);
-    for (id,recipe) in asset_ids.iter().zip(recipes){let recipe=recipe.validate()?;let before=old.as_array().unwrap().iter().find(|item|item["id"]==*id).unwrap()["recipe"].clone();let after=serde_json::to_value(&recipe)?;if before!=after{changed+=1;}write_develop_recipe(&tx,id,&recipe)?;new.push(json!({"id":id,"recipe":recipe}));}
-    if changed>0{tx.execute("DELETE FROM audit_log WHERE undone=1",[])?;tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('batch',?1,'batch_recipes',?2,?3,?4)",params![Uuid::new_v4().to_string(),old.to_string(),Value::Array(new).to_string(),Utc::now().to_rfc3339()])?;}tx.commit()?;Ok(BatchSummary{requested,changed,failed:0,cancelled:0})
+fn copy_setting_categories(
+    target: &mut BasicAdjustments,
+    source: &BasicAdjustments,
+    categories: &HashSet<String>,
+) {
+    if categories.contains("whiteBalance") {
+        target.light_balance = source.light_balance;
+        target.tint = source.tint;
+    }
+    if categories.contains("tone") {
+        target.exposure = source.exposure;
+        target.contrast = source.contrast;
+        target.highlights = source.highlights;
+        target.shadows = source.shadows;
+        target.whites = source.whites;
+        target.blacks = source.blacks;
+        target.dynamic_range = source.dynamic_range;
+        target.curve_highlights = source.curve_highlights;
+        target.curve_lights = source.curve_lights;
+        target.curve_darks = source.curve_darks;
+        target.curve_shadows = source.curve_shadows;
+    }
+    if categories.contains("presence") {
+        target.texture = source.texture;
+        target.clarity = source.clarity;
+        target.dehaze = source.dehaze;
+    }
+    if categories.contains("colour") {
+        target.colour_boost = source.colour_boost;
+        target.saturation = source.saturation;
+    }
+    if categories.contains("transform") {
+        target.crop_left = source.crop_left;
+        target.crop_top = source.crop_top;
+        target.crop_width = source.crop_width;
+        target.crop_height = source.crop_height;
+        target.rotate_quadrants = source.rotate_quadrants;
+        target.straighten = source.straighten;
+        target.horizontal_flip = source.horizontal_flip;
+        target.vertical_flip = source.vertical_flip;
+    }
+}
+
+fn apply_batch_recipes(
+    connection: &mut Connection,
+    asset_ids: Vec<String>,
+    recipes: Vec<DevelopRecipe>,
+) -> Result<BatchSummary> {
+    let requested = asset_ids.len();
+    if requested == 0 || requested != recipes.len() || requested > 10_000 {
+        return Err(KeepframeError::Message(
+            "The Develop batch is invalid".into(),
+        ));
+    }
+    let old = recipe_snapshots(connection, &asset_ids)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut changed = 0;
+    let mut new = Vec::with_capacity(requested);
+    for (id, recipe) in asset_ids.iter().zip(recipes) {
+        let recipe = recipe.validate()?;
+        let before = old
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == *id)
+            .unwrap()["recipe"]
+            .clone();
+        let after = serde_json::to_value(&recipe)?;
+        if before != after {
+            changed += 1;
+        }
+        write_develop_recipe(&tx, id, &recipe)?;
+        new.push(json!({"id":id,"recipe":recipe}));
+    }
+    if changed > 0 {
+        tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
+        tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('batch',?1,'batch_recipes',?2,?3,?4)",params![Uuid::new_v4().to_string(),old.to_string(),Value::Array(new).to_string(),Utc::now().to_rfc3339()])?;
+    }
+    tx.commit()?;
+    Ok(BatchSummary {
+        requested,
+        changed,
+        failed: 0,
+        cancelled: 0,
+    })
 }
 
 #[tauri::command]
-fn sync_develop_settings(request:SyncDevelopRequest,state:State<'_,AppState>)->Result<BatchSummary>{
-    let mut connection=open_db(&root_from(&state)?)?;sync_develop_settings_in(&mut connection,request)
+fn sync_develop_settings(
+    request: SyncDevelopRequest,
+    state: State<'_, AppState>,
+) -> Result<BatchSummary> {
+    let root = root_from(&state)?;
+    let ids = request.target_ids.clone();
+    let mut connection = open_db(&root)?;
+    let summary = sync_develop_settings_in(&mut connection, request)?;
+    for id in ids {
+        refresh_catalogue_thumbnail(&root, &connection, &id)?;
+    }
+    Ok(summary)
 }
 
-fn sync_develop_settings_in(connection:&mut Connection,request:SyncDevelopRequest)->Result<BatchSummary>{
-    let allowed=["tone","whiteBalance","presence","colour","transform","manualMasks","intelligentMasks"];if request.categories.is_empty()||request.categories.iter().any(|value|!allowed.contains(&value.as_str())){return Err(KeepframeError::Message("Choose valid Develop categories to sync".into()));}
-    let categories=request.categories.into_iter().collect::<HashSet<_>>();let mut ids=request.target_ids.into_iter().filter(|id|id!=&request.source_id).collect::<Vec<_>>();ids.sort();ids.dedup();let source=develop_recipe_in(connection,&request.source_id)?;let mut recipes=Vec::with_capacity(ids.len());
-    for id in &ids{let mut target=develop_recipe_in(connection,id)?;copy_setting_categories(&mut target.settings,&source.settings,&categories);let manual=categories.contains("manualMasks");let intelligent=categories.contains("intelligentMasks");if manual||intelligent{target.masks.retain(|mask|match mask.geometry{MaskGeometry::Semantic{..}=>!intelligent,_=>!manual});for mask in source.masks.iter().filter(|mask|match mask.geometry{MaskGeometry::Semantic{..}=>intelligent,_=>manual}){let mut copied=mask.clone();copied.id=Uuid::new_v4().to_string();target.masks.push(copied);}}recipes.push(target);}
-    apply_batch_recipes(connection,ids,recipes)
+fn sync_develop_settings_in(
+    connection: &mut Connection,
+    request: SyncDevelopRequest,
+) -> Result<BatchSummary> {
+    let allowed = [
+        "tone",
+        "whiteBalance",
+        "presence",
+        "colour",
+        "transform",
+        "manualMasks",
+        "intelligentMasks",
+    ];
+    if request.categories.is_empty()
+        || request
+            .categories
+            .iter()
+            .any(|value| !allowed.contains(&value.as_str()))
+    {
+        return Err(KeepframeError::Message(
+            "Choose valid Develop categories to sync".into(),
+        ));
+    }
+    let categories = request.categories.into_iter().collect::<HashSet<_>>();
+    let mut ids = request
+        .target_ids
+        .into_iter()
+        .filter(|id| id != &request.source_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    let source = develop_recipe_in(connection, &request.source_id)?;
+    let mut recipes = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let mut target = develop_recipe_in(connection, id)?;
+        copy_setting_categories(&mut target.settings, &source.settings, &categories);
+        let manual = categories.contains("manualMasks");
+        let intelligent = categories.contains("intelligentMasks");
+        if manual || intelligent {
+            target.masks.retain(|mask| match mask.geometry {
+                MaskGeometry::Semantic { .. } => !intelligent,
+                _ => !manual,
+            });
+            for mask in source.masks.iter().filter(|mask| match mask.geometry {
+                MaskGeometry::Semantic { .. } => intelligent,
+                _ => manual,
+            }) {
+                let mut copied = mask.clone();
+                copied.id = Uuid::new_v4().to_string();
+                target.masks.push(copied);
+            }
+        }
+        recipes.push(target);
+    }
+    apply_batch_recipes(connection, ids, recipes)
 }
 
 #[tauri::command]
-fn apply_preset_to_selection(request:ApplyPresetBatchRequest,state:State<'_,AppState>)->Result<BatchSummary>{
-    let mut connection=open_db(&root_from(&state)?)?;let preset=if let Some(preset)=built_in_presets().into_iter().find(|preset|preset.id==request.preset_id){preset}else{let json:String=connection.query_row("SELECT preset_json FROM develop_presets WHERE id=?1",[&request.preset_id],|row|row.get(0))?;serde_json::from_str::<DevelopPreset>(&json)?.validate(true)?};
-    apply_preset_batch_in(&mut connection,request.asset_ids,&preset)
+fn apply_preset_to_selection(
+    request: ApplyPresetBatchRequest,
+    state: State<'_, AppState>,
+) -> Result<BatchSummary> {
+    let root = root_from(&state)?;
+    let ids = request.asset_ids.clone();
+    let mut connection = open_db(&root)?;
+    let preset = if let Some(preset) = built_in_presets()
+        .into_iter()
+        .find(|preset| preset.id == request.preset_id)
+    {
+        preset
+    } else {
+        let json: String = connection.query_row(
+            "SELECT preset_json FROM develop_presets WHERE id=?1",
+            [&request.preset_id],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str::<DevelopPreset>(&json)?.validate(true)?
+    };
+    let summary = apply_preset_batch_in(&mut connection, request.asset_ids, &preset)?;
+    for id in ids {
+        refresh_catalogue_thumbnail(&root, &connection, &id)?;
+    }
+    Ok(summary)
 }
 
-fn apply_preset_batch_in(connection:&mut Connection,mut ids:Vec<String>,preset:&DevelopPreset)->Result<BatchSummary>{
-    let categories=preset.categories.iter().cloned().collect::<HashSet<_>>();ids.sort();ids.dedup();let mut recipes=Vec::with_capacity(ids.len());for id in &ids{let mut recipe=develop_recipe_in(connection,id)?;copy_setting_categories(&mut recipe.settings,&preset.settings,&categories);recipes.push(recipe);}apply_batch_recipes(connection,ids,recipes)
+fn apply_preset_batch_in(
+    connection: &mut Connection,
+    mut ids: Vec<String>,
+    preset: &DevelopPreset,
+) -> Result<BatchSummary> {
+    let categories = preset.categories.iter().cloned().collect::<HashSet<_>>();
+    ids.sort();
+    ids.dedup();
+    let mut recipes = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let mut recipe = develop_recipe_in(connection, id)?;
+        copy_setting_categories(&mut recipe.settings, &preset.settings, &categories);
+        recipes.push(recipe);
+    }
+    apply_batch_recipes(connection, ids, recipes)
 }
 
 #[tauri::command]
-async fn preview_develop_recipe(asset_id: String, recipe: DevelopRecipe, state: State<'_, AppState>,) -> Result<String> {
+async fn preview_develop_recipe(
+    asset_id: String,
+    recipe: DevelopRecipe,
+    state: State<'_, AppState>,
+) -> Result<String> {
     let recipe = recipe.validate()?;
     let root = root_from(&state)?;
-    let generation_counter=Arc::clone(&state.preview_generation);
-    let generation=generation_counter.fetch_add(1,Ordering::AcqRel)+1;
-    let caches=Arc::clone(&state.renderer_caches);
+    let generation_counter = Arc::clone(&state.preview_generation);
+    let generation = generation_counter.fetch_add(1, Ordering::AcqRel) + 1;
+    let caches = Arc::clone(&state.renderer_caches);
     tauri::async_runtime::spawn_blocking(move || -> Result<String> {
         let connection = open_db(&root)?;
         let _ = develop_recipe_in(&connection, &asset_id)?;
-        let preview: String = connection.query_row(
-            "SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL", [&asset_id], |row| row.get(0),
-        )?;
+        let preview = source_thumbnail_in(&connection, &asset_id)?;
         // Keep interactive work bounded even when the browsing thumbnail cache
         // was built at a larger size. Export always decodes the original.
-        let (source_key,image)=decode_preview_cached(Path::new(&preview),&caches)?;
-        let adjusted=image::DynamicImage::ImageRgb8(render_develop_recipe_cached(&image,&source_key,&recipe,&caches,Some((&generation_counter,generation)))?);
-        if generation_counter.load(Ordering::Acquire)!=generation{return Err(KeepframeError::Message("Superseded Develop preview.".into()));}
+        let (source_key, image) = decode_preview_cached(Path::new(&preview), &caches)?;
+        let adjusted = image::DynamicImage::ImageRgb8(render_develop_recipe_cached(
+            &image,
+            &source_key,
+            &recipe,
+            &caches,
+            Some((&generation_counter, generation)),
+        )?);
+        if generation_counter.load(Ordering::Acquire) != generation {
+            return Err(KeepframeError::Message(
+                "Superseded Develop preview.".into(),
+            ));
+        }
         let mut digest = Sha256::new();
         digest.update(b"keepframe-develop-preview-v3");
         digest.update(asset_id.as_bytes());
         digest.update(source_key.as_bytes());
         digest.update(serde_json::to_vec(&recipe)?);
         let key = format!("{:x}", digest.finalize());
-        let output = root.join(".keepframe/previews").join(format!("develop-{}-{}.png", asset_id, &key[..16]));
+        let output = root.join(".keepframe/previews").join(format!(
+            "develop-{}-{}.png",
+            asset_id,
+            &key[..16]
+        ));
         if !output.exists() {
             let temporary = output.with_extension("png.tmp");
             fs::write(&temporary, encode_srgb_png(&adjusted)?)?;
             fs::rename(&temporary, &output)?;
         }
         Ok(output.to_string_lossy().into())
-    }).await.map_err(|error| KeepframeError::Message(format!("Develop preview failed: {error}")))?
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Develop preview failed: {error}")))?
 }
 
 #[tauri::command]
 fn list_develop_presets(state: State<'_, AppState>) -> Result<Vec<DevelopPreset>> {
     let connection = open_db(&root_from(&state)?)?;
     let mut presets = built_in_presets();
-    let mut statement = connection.prepare("SELECT preset_json FROM develop_presets ORDER BY name COLLATE NOCASE")?;
-    let user_presets = statement.query_map([], |row| row.get::<_, String>(0))?
-        .map(|row| { row.map_err(KeepframeError::from).and_then(|json| { serde_json::from_str::<DevelopPreset>(&json).map_err(KeepframeError::from)?.validate(true)
+    let mut statement = connection
+        .prepare("SELECT preset_json FROM develop_presets ORDER BY name COLLATE NOCASE")?;
+    let user_presets = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| {
+            row.map_err(KeepframeError::from).and_then(|json| {
+                serde_json::from_str::<DevelopPreset>(&json)
+                    .map_err(KeepframeError::from)?
+                    .validate(true)
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    presets.extend(user_presets); Ok(presets)
+    presets.extend(user_presets);
+    Ok(presets)
 }
 
 #[tauri::command]
 fn save_develop_preset(preset: DevelopPreset, state: State<'_, AppState>) -> Result<DevelopPreset> {
-    let mut preset = preset.validate(true)?; preset.built_in = false;
-    let now = Utc::now().to_rfc3339(); let mut connection = open_db(&root_from(&state)?)?; let tx = connection.transaction()?;
+    let mut preset = preset.validate(true)?;
+    preset.built_in = false;
+    let now = Utc::now().to_rfc3339();
+    let mut connection = open_db(&root_from(&state)?)?;
+    let tx = connection.transaction()?;
     tx.execute("INSERT INTO develop_presets(id,name,schema_version,preset_json,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,schema_version=excluded.schema_version,preset_json=excluded.preset_json,updated_at=excluded.updated_at", params![preset.id,preset.name,preset.schema_version,serde_json::to_string(&preset)?,now])?;
-    tx.commit()?; Ok(preset)
+    tx.commit()?;
+    Ok(preset)
 }
 
 #[tauri::command]
 fn delete_develop_preset(id: String, state: State<'_, AppState>) -> Result<()> {
-    if built_in_presets().iter().any(|preset| preset.id == id) { return Err(KeepframeError::Message("Built-in presets cannot be deleted.".into(),)); }
-    let connection = open_db(&root_from(&state)?)?; connection.execute("DELETE FROM develop_presets WHERE id=?1", [id])?; Ok(())
+    if built_in_presets().iter().any(|preset| preset.id == id) {
+        return Err(KeepframeError::Message(
+            "Built-in presets cannot be deleted.".into(),
+        ));
+    }
+    let connection = open_db(&root_from(&state)?)?;
+    connection.execute("DELETE FROM develop_presets WHERE id=?1", [id])?;
+    Ok(())
 }
 
 #[tauri::command]
 fn export_develop_preset(id: String, path: String, state: State<'_, AppState>) -> Result<()> {
-    let preset = list_develop_presets(state)?.into_iter().find(|preset| preset.id == id).ok_or_else(|| KeepframeError::Message("The preset no longer exists.".into()))?;
-    let path = PathBuf::from(path); if !path.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("keepframe-preset")).unwrap_or(false) { return Err(KeepframeError::Message("Preset exports must use the .keepframe-preset extension.".into(),)); }
-    let file = PresetFile { schema_version: 1, name: preset.name, categories: preset.categories, settings: preset.settings, };
-    fs::write(path, serde_json::to_vec_pretty(&file)?)?; Ok(())
+    let preset = list_develop_presets(state)?
+        .into_iter()
+        .find(|preset| preset.id == id)
+        .ok_or_else(|| KeepframeError::Message("The preset no longer exists.".into()))?;
+    let path = PathBuf::from(path);
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("keepframe-preset"))
+        .unwrap_or(false)
+    {
+        return Err(KeepframeError::Message(
+            "Preset exports must use the .keepframe-preset extension.".into(),
+        ));
+    }
+    let file = PresetFile {
+        schema_version: 1,
+        name: preset.name,
+        categories: preset.categories,
+        settings: preset.settings,
+    };
+    fs::write(path, serde_json::to_vec_pretty(&file)?)?;
+    Ok(())
 }
 
 #[tauri::command]
 fn import_develop_preset(path: String, state: State<'_, AppState>) -> Result<DevelopPreset> {
-    let path = PathBuf::from(path); let metadata = fs::metadata(&path)?;
-    if metadata.len() > PRESET_FILE_MAX_BYTES { return Err(KeepframeError::Message("Preset file is larger than the 128 KiB safety limit.".into(),)); }
+    let path = PathBuf::from(path);
+    let metadata = fs::metadata(&path)?;
+    if metadata.len() > PRESET_FILE_MAX_BYTES {
+        return Err(KeepframeError::Message(
+            "Preset file is larger than the 128 KiB safety limit.".into(),
+        ));
+    }
     let file: PresetFile = serde_json::from_slice(&fs::read(path)?)?;
-    let preset = DevelopPreset { schema_version: file.schema_version, id: Uuid::new_v4().to_string(), name: file.name, categories: file.categories, settings: file.settings, built_in: false, };
+    let preset = DevelopPreset {
+        schema_version: file.schema_version,
+        id: Uuid::new_v4().to_string(),
+        name: file.name,
+        categories: file.categories,
+        settings: file.settings,
+        built_in: false,
+    };
     save_develop_preset(preset, state)
 }
 
 #[tauri::command]
-async fn propose_develop_auto(asset_id: String, current: BasicAdjustments, state: State<'_, AppState>,) -> Result<AutoProposal> {
-    let current = current.validate()?; let root = root_from(&state)?;
+async fn propose_develop_auto(
+    asset_id: String,
+    current: BasicAdjustments,
+    state: State<'_, AppState>,
+) -> Result<AutoProposal> {
+    let current = current.validate()?;
+    let root = root_from(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<AutoProposal> {
-        let connection = open_db(&root)?; let preview: String = connection.query_row("SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL", [&asset_id], |row| row.get(0),)?;
-        let image = image::open(preview)?.thumbnail(720, 540); Ok(auto_proposal(&image, current))
-    }).await.map_err(|error| { KeepframeError::Message(format!("Automatic Develop analysis failed: {error}"))
+        let connection = open_db(&root)?;
+        let preview = source_thumbnail_in(&connection, &asset_id)?;
+        let image = image::open(preview)?.thumbnail(720, 540);
+        Ok(auto_proposal(&image, current))
+    })
+    .await
+    .map_err(|error| {
+        KeepframeError::Message(format!("Automatic Develop analysis failed: {error}"))
     })?
 }
 
@@ -3584,7 +4663,11 @@ async fn import_photos(
             let persist_result = (|| -> Result<()> {
                 let tx = connection.transaction()?;
                 if !asset_exists {
-                    let location_source = if meta.latitude.is_some() && meta.longitude.is_some() { "embedded" } else { "none" };
+                    let location_source = if meta.latitude.is_some() && meta.longitude.is_some() {
+                        "embedded"
+                    } else {
+                        "none"
+                    };
                     tx.execute("INSERT INTO assets(id,filename,captured_at,date_fallback,camera,width,height,latitude,longitude,embedded_latitude,embedded_longitude,location_source,thumbnail_path,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?8,?9,?10,?11,?12)",params![asset_id,original_name,captured_string,meta.fallback,meta.camera,meta.width,meta.height,meta.latitude,meta.longitude,location_source,thumb.to_string_lossy(),Utc::now().to_rfc3339()])?;
                 }
                 tx.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![representation_id,asset_id,target.to_string_lossy(),source_hash,extension,stem,byte_size,RAW.contains(&extension.as_str())])?;
@@ -3628,9 +4711,11 @@ async fn import_photos(
                 let source_action = if remove_source {
                     safety::delete_verified_external_source(
                         source,
-                        managed_path.as_deref().ok_or_else(|| { KeepframeError::Message(
-                            "No verified managed copy was available; the source was retained.".into(),
-                        )
+                        managed_path.as_deref().ok_or_else(|| {
+                            KeepframeError::Message(
+                                "No verified managed copy was available; the source was retained."
+                                    .into(),
+                            )
                         })?,
                         &source_hash,
                         &root,
@@ -3775,124 +4860,344 @@ async fn resume_import(
     .await
 }
 
-fn asset_where(filter: &AssetFilter) -> (String, Vec<SqlValue>) {
-    let mut clauses = Vec::new();
+fn asset_where(connection: &Connection, filter: &AssetFilter) -> Result<(String, Vec<SqlValue>)> {
+    let mut clauses: Vec<String> = Vec::new();
     let mut values = Vec::new();
     clauses.push(if filter.trashed.unwrap_or(false) {
         "a.trashed_at IS NOT NULL AND EXISTS (SELECT 1 FROM trash_items ti WHERE ti.asset_id=a.id AND ti.state IN ('moved','restore_failed','empty_failed'))"
     } else {
         "a.trashed_at IS NULL"
-    });
+    }.into());
     if filter.decision != "all" {
-        clauses.push("a.decision = ?");
+        clauses.push("a.decision = ?".into());
         values.push(SqlValue::Text(filter.decision.clone()));
     }
     if let Some(year) = filter.year {
-        clauses.push("a.captured_at >= ? AND a.captured_at < ?");
+        clauses.push("s.captured_at >= ? AND s.captured_at < ?".into());
         values.push(SqlValue::Text(format!("{year:04}-01-01")));
         values.push(SqlValue::Text(format!("{:04}-01-01", year + 1)));
     }
     if let Some(tag) = filter.tag.as_ref().filter(|tag| !tag.trim().is_empty()) {
-        clauses.push("EXISTS (SELECT 1 FROM asset_tags fat JOIN tags ft ON ft.id=fat.tag_id WHERE fat.asset_id=a.id AND ft.name=? COLLATE NOCASE)");
+        clauses.push("EXISTS (SELECT 1 FROM asset_tags fat JOIN tags ft ON ft.id=fat.tag_id WHERE fat.asset_id=a.id AND ft.name=? COLLATE NOCASE)".into());
         values.push(SqlValue::Text(tag.trim().to_string()));
     }
-    if let Some(date_from) = filter.date_from.as_ref().filter(|date| !date.trim().is_empty()) {
-        clauses.push("a.captured_at >= ?");
+    if let Some(date_from) = filter
+        .date_from
+        .as_ref()
+        .filter(|date| !date.trim().is_empty())
+    {
+        clauses.push("s.captured_at >= ?".into());
         values.push(SqlValue::Text(date_from.trim().to_string()));
     }
-    if let Some(date_to) = filter.date_to.as_ref().filter(|date| !date.trim().is_empty()) {
-        clauses.push("a.captured_at < datetime(?,'+1 day')");
+    if let Some(date_to) = filter
+        .date_to
+        .as_ref()
+        .filter(|date| !date.trim().is_empty())
+    {
+        clauses.push("s.captured_at < datetime(?,'+1 day')".into());
         values.push(SqlValue::Text(date_to.trim().to_string()));
     }
-    if let Some(camera) = filter.camera.as_ref().filter(|camera| !camera.trim().is_empty()) {
-        clauses.push("a.camera = ? COLLATE NOCASE");
+    if let Some(camera) = filter
+        .camera
+        .as_ref()
+        .filter(|camera| !camera.trim().is_empty())
+    {
+        clauses.push("s.camera = ? COLLATE NOCASE".into());
         values.push(SqlValue::Text(camera.trim().to_string()));
     }
     if let Some(tagged) = filter.tagged {
-        clauses.push(if tagged { "EXISTS (SELECT 1 FROM asset_tags ata WHERE ata.asset_id=a.id)" } else { "NOT EXISTS (SELECT 1 FROM asset_tags ata WHERE ata.asset_id=a.id)" });
+        clauses.push(
+            if tagged {
+                "EXISTS (SELECT 1 FROM asset_tags ata WHERE ata.asset_id=a.id)"
+            } else {
+                "NOT EXISTS (SELECT 1 FROM asset_tags ata WHERE ata.asset_id=a.id)"
+            }
+            .into(),
+        );
     }
     if let Some(located) = filter.located {
-        clauses.push(if located { "a.latitude IS NOT NULL AND a.longitude IS NOT NULL" } else { "a.latitude IS NULL OR a.longitude IS NULL" });
+        clauses.push(
+            if located {
+                "s.latitude IS NOT NULL AND s.longitude IS NOT NULL"
+            } else {
+                "s.latitude IS NULL OR s.longitude IS NULL"
+            }
+            .into(),
+        );
     }
     if let Some(rating) = filter.rating {
-        clauses.push("a.rating = ?");
+        clauses.push("a.rating = ?".into());
         values.push(SqlValue::Integer(rating.clamp(0, 5)));
     }
     if let Some(edited) = filter.edited {
-        clauses.push(if edited { "EXISTS(SELECT 1 FROM develop_recipes edr WHERE edr.asset_id=a.id)" } else { "NOT EXISTS(SELECT 1 FROM develop_recipes edr WHERE edr.asset_id=a.id)" });
+        clauses.push(
+            if edited {
+                "EXISTS(SELECT 1 FROM develop_recipes edr WHERE edr.asset_id=a.id)"
+            } else {
+                "NOT EXISTS(SELECT 1 FROM develop_recipes edr WHERE edr.asset_id=a.id)"
+            }
+            .into(),
+        );
     }
-    if let Some(file_type) = filter.file_type.as_ref().filter(|value| !value.trim().is_empty()) {
-        clauses.push("EXISTS(SELECT 1 FROM representations fr WHERE fr.asset_id=a.id AND lower(fr.extension)=?)");
-        values.push(SqlValue::Text(file_type.trim().trim_start_matches('.').to_lowercase()));
+    if let Some(file_type) = filter
+        .file_type
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        clauses.push("EXISTS(SELECT 1 FROM representations fr WHERE fr.source_id=a.source_id AND lower(fr.extension)=?)".into());
+        values.push(SqlValue::Text(
+            file_type.trim().trim_start_matches('.').to_lowercase(),
+        ));
     }
     if !filter.search.trim().is_empty() {
-        clauses.push("(lower(a.filename) LIKE ? OR lower(COALESCE(a.camera,'')) LIKE ? OR lower(COALESCE(a.title,'')) LIKE ? OR lower(COALESCE(a.caption,'')) LIKE ? OR EXISTS (SELECT 1 FROM asset_tags sat JOIN tags st ON st.id=sat.tag_id WHERE sat.asset_id=a.id AND lower(st.name) LIKE ?))");
+        clauses.push("(lower(s.filename) LIKE ? OR lower(COALESCE(s.camera,'')) LIKE ? OR lower(COALESCE(a.version_name,'')) LIKE ? OR lower(COALESCE(a.title,'')) LIKE ? OR lower(COALESCE(a.caption,'')) LIKE ? OR EXISTS (SELECT 1 FROM asset_tags sat JOIN tags st ON st.id=sat.tag_id WHERE sat.asset_id=a.id AND lower(st.name) LIKE ?))".into());
         let search = SqlValue::Text(format!("%{}%", filter.search.trim().to_lowercase()));
-        values.extend([search.clone(), search.clone(), search.clone(), search.clone(), search]);
+        values.extend([
+            search.clone(),
+            search.clone(),
+            search.clone(),
+            search.clone(),
+            search.clone(),
+            search,
+        ]);
     }
+    if let Some(collection_id) = filter
+        .collection_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let (clause, mut parameters) =
+            organisation::collection_filter_clause(connection, collection_id.trim())?;
+        clauses.push(clause);
+        values.append(&mut parameters);
+    }
+    match filter.version_mode.as_deref() {
+        Some("primary") => clauses.push("a.is_primary=1".into()),
+        Some("virtual") => clauses.push("a.is_primary=0".into()),
+        Some("all") | None => {}
+        Some(_) => {
+            return Err(KeepframeError::Message(
+                "Version filter must be all, primary or virtual.".into(),
+            ))
+        }
+    }
+    match filter.stack_mode.as_deref() {
+        Some("stacked") => {
+            clauses.push("EXISTS(SELECT 1 FROM stack_items fsi WHERE fsi.item_id=a.id)".into())
+        }
+        Some("unstacked") => {
+            clauses.push("NOT EXISTS(SELECT 1 FROM stack_items fsi WHERE fsi.item_id=a.id)".into())
+        }
+        Some("all") | None => {}
+        Some(_) => {
+            return Err(KeepframeError::Message(
+                "Stack filter must be all, stacked or unstacked.".into(),
+            ))
+        }
+    }
+    clauses.push("(s.versions_collapsed=0 OR a.is_primary=1)".into());
+    clauses.push("NOT EXISTS(SELECT 1 FROM stack_items csi JOIN stacks cs ON cs.id=csi.stack_id WHERE csi.item_id=a.id AND cs.collapsed=1 AND cs.top_item_id<>a.id)".into());
     let sql = if clauses.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", clauses.join(" AND "))
     };
-    (sql, values)
+    Ok((sql, values))
 }
 
-fn analyse_auto_batch(root:&Path,asset_ids:&[String],generation:u64,counter:&AtomicU64,app:Option<&AppHandle>)->Result<(Vec<String>,Vec<DevelopRecipe>,usize,usize)>{
-    let connection=open_db(root)?;let total=asset_ids.len();let mut ids=Vec::new();let mut recipes=Vec::new();let mut failed=0;let mut low_confidence=0;
-    for (index,id) in asset_ids.iter().enumerate(){if counter.load(Ordering::Acquire)!=generation{break;}let analysed=(||->Result<DevelopRecipe>{let mut recipe=develop_recipe_in(&connection,id)?;let preview:String=connection.query_row("SELECT thumbnail_path FROM assets WHERE id=?1 AND trashed_at IS NULL",[id],|row|row.get(0))?;let image=image::open(preview)?.thumbnail(720,540);let proposal=auto_proposal(&image,recipe.settings);if proposal.confidence<0.55{low_confidence+=1;}recipe.settings=proposal.settings;Ok(recipe)})();match analysed{Ok(recipe)=>{ids.push(id.clone());recipes.push(recipe);},Err(_)=>failed+=1}if let Some(app)=app{let _=app.emit("batch-progress",json!({"kind":"Batch Auto","current":index+1,"total":total,"failed":failed}));}}
-    Ok((ids,recipes,failed,low_confidence))
+fn analyse_auto_batch(
+    root: &Path,
+    asset_ids: &[String],
+    generation: u64,
+    counter: &AtomicU64,
+    app: Option<&AppHandle>,
+) -> Result<(Vec<String>, Vec<DevelopRecipe>, usize, usize)> {
+    let connection = open_db(root)?;
+    let total = asset_ids.len();
+    let mut ids = Vec::new();
+    let mut recipes = Vec::new();
+    let mut failed = 0;
+    let mut low_confidence = 0;
+    for (index, id) in asset_ids.iter().enumerate() {
+        if counter.load(Ordering::Acquire) != generation {
+            break;
+        }
+        let analysed = (|| -> Result<DevelopRecipe> {
+            let mut recipe = develop_recipe_in(&connection, id)?;
+            let preview = source_thumbnail_in(&connection, id)?;
+            let image = image::open(preview)?.thumbnail(720, 540);
+            let proposal = auto_proposal(&image, recipe.settings);
+            if proposal.confidence < 0.55 {
+                low_confidence += 1;
+            }
+            recipe.settings = proposal.settings;
+            Ok(recipe)
+        })();
+        match analysed {
+            Ok(recipe) => {
+                ids.push(id.clone());
+                recipes.push(recipe);
+            }
+            Err(_) => failed += 1,
+        }
+        if let Some(app) = app {
+            let _ = app.emit(
+                "batch-progress",
+                json!({"kind":"Batch Auto","current":index+1,"total":total,"failed":failed}),
+            );
+        }
+    }
+    Ok((ids, recipes, failed, low_confidence))
 }
 
 #[tauri::command]
-async fn preview_batch_auto(asset_ids:Vec<String>,state:State<'_,AppState>)->Result<BatchAutoSummary>{
-    let requested=asset_ids.len();if requested==0||requested>10_000{return Err(KeepframeError::Message("Select between 1 and 10,000 photographs".into()));}let root=root_from(&state)?;let counter=Arc::clone(&state.batch_generation);let generation=counter.fetch_add(1,Ordering::AcqRel)+1;
-    let (ids,_,failed,low)=tauri::async_runtime::spawn_blocking(move||analyse_auto_batch(&root,&asset_ids,generation,&counter,None)).await.map_err(|error|KeepframeError::Message(format!("Batch Auto preview failed: {error}")))??;
-    Ok(BatchAutoSummary{requested,changed:0,failed,cancelled:0,analyzable:ids.len(),low_confidence_white_balance:low,skipped:failed})
+async fn preview_batch_auto(
+    asset_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<BatchAutoSummary> {
+    let requested = asset_ids.len();
+    if requested == 0 || requested > 10_000 {
+        return Err(KeepframeError::Message(
+            "Select between 1 and 10,000 photographs".into(),
+        ));
+    }
+    let root = root_from(&state)?;
+    let counter = Arc::clone(&state.batch_generation);
+    let generation = counter.fetch_add(1, Ordering::AcqRel) + 1;
+    let (ids, _, failed, low) = tauri::async_runtime::spawn_blocking(move || {
+        analyse_auto_batch(&root, &asset_ids, generation, &counter, None)
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Batch Auto preview failed: {error}")))??;
+    Ok(BatchAutoSummary {
+        requested,
+        changed: 0,
+        failed,
+        cancelled: 0,
+        analyzable: ids.len(),
+        low_confidence_white_balance: low,
+        skipped: failed,
+    })
 }
 
 #[tauri::command]
-async fn apply_batch_auto(asset_ids:Vec<String>,app:AppHandle,state:State<'_,AppState>)->Result<BatchAutoSummary>{
-    let requested=asset_ids.len();if requested==0||requested>10_000{return Err(KeepframeError::Message("Select between 1 and 10,000 photographs".into()));}let root=root_from(&state)?;let counter=Arc::clone(&state.batch_generation);let generation=counter.fetch_add(1,Ordering::AcqRel)+1;
-    tauri::async_runtime::spawn_blocking(move||{let (ids,recipes,failed,low)=analyse_auto_batch(&root,&asset_ids,generation,&counter,Some(&app))?;let cancelled=if counter.load(Ordering::Acquire)!=generation{requested.saturating_sub(ids.len()+failed)}else{0};if cancelled>0{return Ok(BatchAutoSummary{requested,changed:0,failed,cancelled,analyzable:ids.len(),low_confidence_white_balance:low,skipped:failed});}let mut connection=open_db(&root)?;let applied=apply_batch_recipes(&mut connection,ids,recipes)?;Ok(BatchAutoSummary{requested,changed:applied.changed,failed,cancelled:0,analyzable:applied.requested,low_confidence_white_balance:low,skipped:failed})}).await.map_err(|error|KeepframeError::Message(format!("Batch Auto failed: {error}")))?
+async fn apply_batch_auto(
+    asset_ids: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<BatchAutoSummary> {
+    let requested = asset_ids.len();
+    if requested == 0 || requested > 10_000 {
+        return Err(KeepframeError::Message(
+            "Select between 1 and 10,000 photographs".into(),
+        ));
+    }
+    let root = root_from(&state)?;
+    let counter = Arc::clone(&state.batch_generation);
+    let generation = counter.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (ids, recipes, failed, low) =
+            analyse_auto_batch(&root, &asset_ids, generation, &counter, Some(&app))?;
+        let cancelled = if counter.load(Ordering::Acquire) != generation {
+            requested.saturating_sub(ids.len() + failed)
+        } else {
+            0
+        };
+        if cancelled > 0 {
+            return Ok(BatchAutoSummary {
+                requested,
+                changed: 0,
+                failed,
+                cancelled,
+                analyzable: ids.len(),
+                low_confidence_white_balance: low,
+                skipped: failed,
+            });
+        }
+        let mut connection = open_db(&root)?;
+        let refresh_ids = ids.clone();
+        let applied = apply_batch_recipes(&mut connection, ids, recipes)?;
+        for id in refresh_ids {
+            refresh_catalogue_thumbnail(&root, &connection, &id)?;
+        }
+        Ok(BatchAutoSummary {
+            requested,
+            changed: applied.changed,
+            failed,
+            cancelled: 0,
+            analyzable: applied.requested,
+            low_confidence_white_balance: low,
+            skipped: failed,
+        })
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Batch Auto failed: {error}")))?
 }
 
 #[tauri::command]
-fn cancel_library_batch(state:State<'_,AppState>){state.batch_generation.fetch_add(1,Ordering::AcqRel);}
+fn cancel_library_batch(state: State<'_, AppState>) {
+    state.batch_generation.fetch_add(1, Ordering::AcqRel);
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BatchMetadataRequest { asset_ids: Vec<String>, patch: Value }
+struct BatchMetadataRequest {
+    asset_ids: Vec<String>,
+    patch: Value,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BatchSummary { requested: usize, changed: usize, failed: usize, cancelled: usize }
+struct BatchSummary {
+    requested: usize,
+    changed: usize,
+    failed: usize,
+    cancelled: usize,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchAutoSummary {
-    requested: usize, changed: usize, failed: usize, cancelled: usize,
-    analyzable: usize, low_confidence_white_balance: usize, skipped: usize,
+    requested: usize,
+    changed: usize,
+    failed: usize,
+    cancelled: usize,
+    analyzable: usize,
+    low_confidence_white_balance: usize,
+    skipped: usize,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SyncDevelopRequest { source_id: String, target_ids: Vec<String>, categories: Vec<String> }
+struct SyncDevelopRequest {
+    source_id: String,
+    target_ids: Vec<String>,
+    categories: Vec<String>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ApplyPresetBatchRequest { asset_ids: Vec<String>, preset_id: String }
+struct ApplyPresetBatchRequest {
+    asset_ids: Vec<String>,
+    preset_id: String,
+}
 
 fn asset_order(filter: &AssetFilter) -> String {
-    let direction = if filter.descending.unwrap_or(true) { "DESC" } else { "ASC" };
+    let direction = if filter.descending.unwrap_or(true) {
+        "DESC"
+    } else {
+        "ASC"
+    };
     let field = match filter.sort.as_deref().unwrap_or("captureTime") {
-        "filename" => "a.filename COLLATE NOCASE",
+        "filename" => "s.filename COLLATE NOCASE",
         "rating" => "a.rating",
         "importTime" => "a.created_at",
-        "editedTime" => "COALESCE((SELECT updated_at FROM develop_recipes sor WHERE sor.asset_id=a.id),'')",
-        _ => "a.captured_at",
+        "editedTime" => {
+            "COALESCE((SELECT updated_at FROM develop_recipes sor WHERE sor.asset_id=a.id),'')"
+        }
+        _ => "s.captured_at",
     };
-    format!("{field} {direction},a.id")
+    format!("{field} {direction},a.source_id,a.version_index,a.id")
 }
 
 fn query_assets_in(
@@ -3903,23 +5208,29 @@ fn query_assets_in(
 ) -> Result<AssetPage> {
     let offset = offset.max(0);
     let limit = limit.clamp(1, 500);
-    let (where_sql, values) = asset_where(filter);
+    let (where_sql, values) = asset_where(connection, filter)?;
     let total = connection.query_row(
-        &format!("SELECT count(*) FROM assets a{where_sql}"),
+        &format!("SELECT count(*) FROM assets a JOIN sources s ON s.id=a.source_id{where_sql}"),
         params_from_iter(values.iter()),
         |row| row.get::<_, i64>(0),
     )?;
     let sql = format!(
-        "SELECT a.id,a.filename,a.decision,a.captured_at,a.date_fallback,a.camera,a.width,a.height,a.latitude,a.longitude,a.thumbnail_path,
-         (SELECT count(*) FROM representations r WHERE r.asset_id=a.id),
-         (SELECT path FROM representations r WHERE r.asset_id=a.id ORDER BY is_raw ASC,path ASC LIMIT 1),
+        "SELECT a.id,s.filename,a.decision,s.captured_at,s.date_fallback,s.camera,s.width,s.height,s.latitude,s.longitude,a.thumbnail_path,
+         (SELECT count(*) FROM representations r WHERE r.source_id=a.source_id),
+         (SELECT path FROM representations r WHERE r.source_id=a.source_id ORDER BY is_raw ASC,path ASC LIMIT 1),
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
-         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
-         COALESCE(a.missing_state,'available'),
+         COALESCE(s.location_source,CASE WHEN s.latitude IS NULL OR s.longitude IS NULL THEN 'none' ELSE 'embedded' END),
+         COALESCE(s.missing_state,'available'),
          EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id),
-         a.rating,a.title,a.caption,a.copyright,a.creator
-         FROM assets a{where_sql} ORDER BY {} LIMIT ? OFFSET ?", asset_order(filter)
+         a.rating,a.title,a.caption,a.copyright,a.creator,a.source_id,a.is_primary,
+         COALESCE(a.version_name,CASE WHEN a.is_primary=1 THEN 'Primary' ELSE 'Version '||a.version_index END),a.version_index,
+         (SELECT count(*) FROM assets av WHERE av.source_id=a.source_id AND av.trashed_at IS NULL),s.versions_collapsed,
+         (SELECT stack_id FROM stack_items si WHERE si.item_id=a.id),
+         COALESCE((SELECT count(*) FROM stack_items sci WHERE sci.stack_id=(SELECT stack_id FROM stack_items sti WHERE sti.item_id=a.id)),0),
+         COALESCE((SELECT collapsed FROM stacks sk JOIN stack_items ski ON ski.stack_id=sk.id WHERE ski.item_id=a.id),0),
+         EXISTS(SELECT 1 FROM stacks st WHERE st.top_item_id=a.id)
+         FROM assets a JOIN sources s ON s.id=a.source_id{where_sql} ORDER BY {} LIMIT ? OFFSET ?", asset_order(filter)
     );
     let mut page_values = values;
     page_values.push(SqlValue::Integer(limit));
@@ -3957,6 +5268,16 @@ fn query_assets_in(
             caption: row.get(20)?,
             copyright: row.get(21)?,
             creator: row.get(22)?,
+            source_id: row.get(23)?,
+            is_primary: row.get::<_, i64>(24)? != 0,
+            version_name: row.get(25)?,
+            version_index: row.get(26)?,
+            source_version_count: row.get(27)?,
+            version_group_collapsed: row.get::<_, i64>(28)? != 0,
+            stack_id: row.get(29)?,
+            stack_count: row.get(30)?,
+            stack_collapsed: row.get::<_, i64>(31)? != 0,
+            is_stack_top: row.get::<_, i64>(32)? != 0,
         })
     })?;
     let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3971,30 +5292,70 @@ fn query_assets_in(
 
 fn get_asset_in(connection: &Connection, asset_id: &str) -> Result<Option<Asset>> {
     let mut statement = connection.prepare(
-        "SELECT a.id,a.filename,a.decision,a.captured_at,a.date_fallback,a.camera,a.width,a.height,a.latitude,a.longitude,a.thumbnail_path,
-         (SELECT count(*) FROM representations r WHERE r.asset_id=a.id),
-         (SELECT path FROM representations r WHERE r.asset_id=a.id ORDER BY is_raw ASC,path ASC LIMIT 1),
+        "SELECT a.id,s.filename,a.decision,s.captured_at,s.date_fallback,s.camera,s.width,s.height,s.latitude,s.longitude,a.thumbnail_path,
+         (SELECT count(*) FROM representations r WHERE r.source_id=a.source_id),
+         (SELECT path FROM representations r WHERE r.source_id=a.source_id ORDER BY is_raw ASC,path ASC LIMIT 1),
          (SELECT path FROM versions v WHERE v.id=a.preferred_version_id),
          COALESCE((SELECT group_concat(name,char(31)) FROM (SELECT t.name AS name FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=a.id ORDER BY t.name COLLATE NOCASE)),''),
-         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END),
-         COALESCE(a.missing_state,'available'),
+         COALESCE(s.location_source,CASE WHEN s.latitude IS NULL OR s.longitude IS NULL THEN 'none' ELSE 'embedded' END),
+         COALESCE(s.missing_state,'available'),
          EXISTS(SELECT 1 FROM develop_recipes dr WHERE dr.asset_id=a.id),
-         a.rating,a.title,a.caption,a.copyright,a.creator
-         FROM assets a WHERE a.id=?1",
+         a.rating,a.title,a.caption,a.copyright,a.creator,a.source_id,a.is_primary,
+         COALESCE(a.version_name,CASE WHEN a.is_primary=1 THEN 'Primary' ELSE 'Version '||a.version_index END),a.version_index,
+         (SELECT count(*) FROM assets av WHERE av.source_id=a.source_id AND av.trashed_at IS NULL),s.versions_collapsed,
+         (SELECT stack_id FROM stack_items si WHERE si.item_id=a.id),
+         COALESCE((SELECT count(*) FROM stack_items sci WHERE sci.stack_id=(SELECT stack_id FROM stack_items sti WHERE sti.item_id=a.id)),0),
+         COALESCE((SELECT collapsed FROM stacks sk JOIN stack_items ski ON ski.stack_id=sk.id WHERE ski.item_id=a.id),0),
+         EXISTS(SELECT 1 FROM stacks st WHERE st.top_item_id=a.id)
+         FROM assets a JOIN sources s ON s.id=a.source_id WHERE a.id=?1",
     )?;
-    statement.query_row([asset_id], |row| {
-        let thumbnail: String = row.get(10)?;
-        let tag_string: String = row.get(14)?;
-        Ok(Asset {
-            id: row.get(0)?, filename: row.get(1)?, decision: row.get(2)?, captured_at: row.get(3)?,
-            date_fallback: row.get::<_, i64>(4)? != 0, camera: row.get(5)?,
-            width: row.get::<_, Option<i64>>(6)?.map(|value| value as u32), height: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
-            latitude: row.get(8)?, longitude: row.get(9)?, preview_url: thumbnail.clone(), thumbnail_url: thumbnail,
-            representation_count: row.get(11)?, source_path: row.get(12)?, preferred_version_url: row.get(13)?,
-            tags: if tag_string.is_empty() { Vec::new() } else { tag_string.split('\u{1f}').map(str::to_string).collect() }, location_source: row.get(15)?, missing_state: row.get(16)?, has_edits: row.get::<_, i64>(17)? != 0,
-            rating: row.get(18)?, title: row.get(19)?, caption: row.get(20)?, copyright: row.get(21)?, creator: row.get(22)?,
+    statement
+        .query_row([asset_id], |row| {
+            let thumbnail: String = row.get(10)?;
+            let tag_string: String = row.get(14)?;
+            Ok(Asset {
+                id: row.get(0)?,
+                filename: row.get(1)?,
+                decision: row.get(2)?,
+                captured_at: row.get(3)?,
+                date_fallback: row.get::<_, i64>(4)? != 0,
+                camera: row.get(5)?,
+                width: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
+                height: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
+                latitude: row.get(8)?,
+                longitude: row.get(9)?,
+                preview_url: thumbnail.clone(),
+                thumbnail_url: thumbnail,
+                representation_count: row.get(11)?,
+                source_path: row.get(12)?,
+                preferred_version_url: row.get(13)?,
+                tags: if tag_string.is_empty() {
+                    Vec::new()
+                } else {
+                    tag_string.split('\u{1f}').map(str::to_string).collect()
+                },
+                location_source: row.get(15)?,
+                missing_state: row.get(16)?,
+                has_edits: row.get::<_, i64>(17)? != 0,
+                rating: row.get(18)?,
+                title: row.get(19)?,
+                caption: row.get(20)?,
+                copyright: row.get(21)?,
+                creator: row.get(22)?,
+                source_id: row.get(23)?,
+                is_primary: row.get::<_, i64>(24)? != 0,
+                version_name: row.get(25)?,
+                version_index: row.get(26)?,
+                source_version_count: row.get(27)?,
+                version_group_collapsed: row.get::<_, i64>(28)? != 0,
+                stack_id: row.get(29)?,
+                stack_count: row.get(30)?,
+                stack_collapsed: row.get::<_, i64>(31)? != 0,
+                is_stack_top: row.get::<_, i64>(32)? != 0,
+            })
         })
-    }).optional().map_err(KeepframeError::from)
+        .optional()
+        .map_err(KeepframeError::from)
 }
 
 #[tauri::command]
@@ -4015,13 +5376,159 @@ fn get_asset(asset_id: String, state: State<'_, AppState>) -> Result<Option<Asse
 }
 
 #[tauri::command]
-fn export_xmp_sidecars(asset_ids: Vec<String>, replace_existing: bool, state: State<'_, AppState>,) -> Result<interoperability::SidecarExportSummary> {
+fn list_catalogue_versions(
+    item_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<organisation::CatalogueVersion>> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::list_versions_in(&connection, &item_id)
+}
+#[tauri::command]
+fn create_catalogue_version(
+    request: organisation::CreateVersionRequest,
+    state: State<'_, AppState>,
+) -> Result<Asset> {
+    let root = root_from(&state)?;
+    let mut connection = open_db(&root)?;
+    let id = organisation::create_version_in(&mut connection, request)?;
+    refresh_catalogue_thumbnail(&root, &connection, &id)?;
+    get_asset_in(&connection, &id)?
+        .ok_or_else(|| KeepframeError::Message("The new version could not be loaded.".into()))
+}
+#[tauri::command]
+fn rename_catalogue_version(
+    item_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::rename_version_in(&connection, &item_id, &name)
+}
+#[tauri::command]
+fn delete_catalogue_version(item_id: String, state: State<'_, AppState>) -> Result<String> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::delete_version_in(&connection, &item_id)
+}
+#[tauri::command]
+fn set_version_group_collapsed(
+    item_id: String,
+    collapsed: bool,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::set_versions_collapsed_in(&connection, &item_id, collapsed)
+}
+#[tauri::command]
+fn list_collections(state: State<'_, AppState>) -> Result<Vec<organisation::Collection>> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::list_collections_in(&connection)
+}
+#[tauri::command]
+fn save_collection(
+    request: organisation::SaveCollectionRequest,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    organisation::save_collection_in(&mut connection, request)
+}
+#[tauri::command]
+fn delete_collection(collection_id: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::delete_collection_in(&connection, &collection_id)
+}
+#[tauri::command]
+fn update_collection_members(
+    collection_id: String,
+    item_ids: Vec<String>,
+    add: bool,
+    state: State<'_, AppState>,
+) -> Result<usize> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    organisation::update_collection_members_in(&mut connection, &collection_id, item_ids, add)
+}
+#[tauri::command]
+fn list_collection_sets(state: State<'_, AppState>) -> Result<Vec<organisation::CollectionSet>> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::list_collection_sets_in(&connection)
+}
+#[tauri::command]
+fn create_collection_set(name: String, state: State<'_, AppState>) -> Result<String> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::create_collection_set_in(&connection, &name)
+}
+#[tauri::command]
+fn rename_collection_set(set_id: String, name: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::rename_collection_set_in(&connection, &set_id, &name)
+}
+#[tauri::command]
+fn delete_collection_set(set_id: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::delete_collection_set_in(&connection, &set_id)
+}
+#[tauri::command]
+fn list_stacks(state: State<'_, AppState>) -> Result<Vec<organisation::StackSummary>> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::list_stacks_in(&connection)
+}
+#[tauri::command]
+fn create_stack(
+    item_ids: Vec<String>,
+    top_item_id: String,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    organisation::create_stack_in(&mut connection, item_ids, &top_item_id)
+}
+#[tauri::command]
+fn set_stack_collapsed(
+    stack_id: String,
+    collapsed: bool,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::set_stack_collapsed_in(&connection, &stack_id, collapsed)
+}
+#[tauri::command]
+fn set_stack_top(stack_id: String, item_id: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::set_stack_top_in(&connection, &stack_id, &item_id)
+}
+#[tauri::command]
+fn unstack(stack_id: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    organisation::unstack_in(&connection, &stack_id)
+}
+#[tauri::command]
+fn remove_from_stack(item_id: String, state: State<'_, AppState>) -> Result<()> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    organisation::remove_from_stack_in(&mut connection, &item_id)
+}
+#[tauri::command]
+fn add_to_stack(
+    stack_id: String,
+    item_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<usize> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    organisation::add_to_stack_in(&mut connection, &stack_id, item_ids)
+}
+
+#[tauri::command]
+fn export_xmp_sidecars(
+    asset_ids: Vec<String>,
+    replace_existing: bool,
+    state: State<'_, AppState>,
+) -> Result<interoperability::SidecarExportSummary> {
     let mut connection = open_db(&root_from(&state)?)?;
     interoperability::export_sidecars(&mut connection, &asset_ids, replace_existing)
 }
 
 #[tauri::command]
-fn import_xmp_sidecar(asset_id: String, state: State<'_, AppState>,) -> Result<interoperability::SidecarImportResult> {
+fn import_xmp_sidecar(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<interoperability::SidecarImportResult> {
     let mut connection = open_db(&root_from(&state)?)?;
     interoperability::import_sidecar(&mut connection, &asset_id)
 }
@@ -4030,7 +5537,19 @@ fn import_xmp_sidecar(asset_id: String, state: State<'_, AppState>,) -> Result<i
 fn export_portable_catalogue(destination: String, state: State<'_, AppState>) -> Result<String> {
     let root = root_from(&state)?;
     let connection = open_db(&root)?;
-    Ok(interoperability::export_portable_catalogue(&connection, &root, Path::new(&destination))?.to_string_lossy().into(),)
+    Ok(
+        interoperability::export_portable_catalogue(&connection, &root, Path::new(&destination))?
+            .to_string_lossy()
+            .into(),
+    )
+}
+
+#[tauri::command]
+fn import_portable_catalogue(path: String, state: State<'_, AppState>) -> Result<usize> {
+    let root = root_from(&state)?;
+    backup_database(&root, "pre-portable-import")?;
+    let mut connection = open_db(&root)?;
+    interoperability::import_portable_catalogue(&mut connection, Path::new(&path))
 }
 
 #[tauri::command]
@@ -4041,7 +5560,11 @@ fn rescan_library(state: State<'_, AppState>) -> Result<interoperability::Integr
 }
 
 #[tauri::command]
-fn find_relink_candidates(asset_id: String, directory: String, state: State<'_, AppState>,) -> Result<Vec<interoperability::RelinkCandidate>> {
+fn find_relink_candidates(
+    asset_id: String,
+    directory: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<interoperability::RelinkCandidate>> {
     let connection = open_db(&root_from(&state)?)?;
     interoperability::relink_candidates(&connection, &asset_id, Path::new(&directory))
 }
@@ -4062,7 +5585,9 @@ fn watch_kind(kind: &EventKind) -> Option<&'static str> {
 }
 
 fn write_debounced_watch_event(root: &Path, folder: &str, path: &Path, kind: &str) {
-    let Ok(connection) = open_db(root) else { return; };
+    let Ok(connection) = open_db(root) else {
+        return;
+    };
     let _ = connection.execute(
         "INSERT INTO watch_events(folder_path,path,kind,observed_at,state)VALUES(?1,?2,?3,?4,'inbox') ON CONFLICT(folder_path,path,kind,state) DO UPDATE SET observed_at=excluded.observed_at",
         params![folder,path.to_string_lossy(),kind,Utc::now().to_rfc3339()],
@@ -4071,37 +5596,67 @@ fn write_debounced_watch_event(root: &Path, folder: &str, path: &Path, kind: &st
 
 fn restart_folder_watcher(root: &Path, state: &AppState) -> Result<()> {
     let connection = open_db(root)?;
-    let mut statement = connection.prepare("SELECT path FROM watch_folders WHERE enabled=1 ORDER BY path")?;
-    let folders = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter().map(PathBuf::from).filter(|path| path.is_dir()).collect::<Vec<_>>();
+    let mut statement =
+        connection.prepare("SELECT path FROM watch_folders WHERE enabled=1 ORDER BY path")?;
+    let folders = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
     drop(statement);
-    let mut watcher_slot = state.folder_watcher.lock().map_err(|_| KeepframeError::Message("Folder watch state lock failed".into()))?;
+    let mut watcher_slot = state
+        .folder_watcher
+        .lock()
+        .map_err(|_| KeepframeError::Message("Folder watch state lock failed".into()))?;
     *watcher_slot = None;
-    if folders.is_empty() { return Ok(()); }
+    if folders.is_empty() {
+        return Ok(());
+    }
     let (sender, receiver) = mpsc::channel::<(String, PathBuf, String)>();
     let watched_roots = folders.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        let Ok(event) = event else { return; };
-        let Some(kind) = watch_kind(&event.kind) else { return; };
+        let Ok(event) = event else {
+            return;
+        };
+        let Some(kind) = watch_kind(&event.kind) else {
+            return;
+        };
         for path in event.paths {
             if let Some(folder) = watched_roots.iter().find(|folder| path.starts_with(folder)) {
                 let _ = sender.send((folder.to_string_lossy().into(), path, kind.into()));
             }
         }
-    }).map_err(|error| KeepframeError::Message(format!("Folder watch could not start: {error}")))?;
-    for folder in &folders { watcher.watch(folder, RecursiveMode::Recursive).map_err(|error| { KeepframeError::Message(format!("Could not watch {}: {error}", folder.display()))
-            })?; }
+    })
+    .map_err(|error| KeepframeError::Message(format!("Folder watch could not start: {error}")))?;
+    for folder in &folders {
+        watcher
+            .watch(folder, RecursiveMode::Recursive)
+            .map_err(|error| {
+                KeepframeError::Message(format!("Could not watch {}: {error}", folder.display()))
+            })?;
+    }
     let root_for_thread = root.to_path_buf();
     std::thread::spawn(move || {
         let mut pending: HashMap<(String, PathBuf, String), Instant> = HashMap::new();
         loop {
             match receiver.recv_timeout(Duration::from_millis(150)) {
-                Ok((folder, path, kind)) => { pending.insert((folder, path, kind), Instant::now()); }
+                Ok((folder, path, kind)) => {
+                    pending.insert((folder, path, kind), Instant::now());
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let due = pending.iter().filter(|(_, at)| at.elapsed() >= Duration::from_millis(600)).map(|(key, _)| key.clone()).collect::<Vec<_>>();
-            for (folder, path, kind) in due { pending.remove(&(folder.clone(), path.clone(), kind.clone())); write_debounced_watch_event(&root_for_thread, &folder, &path, &kind); }
+            let due = pending
+                .iter()
+                .filter(|(_, at)| at.elapsed() >= Duration::from_millis(600))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for (folder, path, kind) in due {
+                pending.remove(&(folder.clone(), path.clone(), kind.clone()));
+                write_debounced_watch_event(&root_for_thread, &folder, &path, &kind);
+            }
         }
     });
     *watcher_slot = Some(FolderWatcher { _watcher: watcher });
@@ -4111,9 +5666,14 @@ fn restart_folder_watcher(root: &Path, state: &AppState) -> Result<()> {
 #[tauri::command]
 fn configure_folder_watch(path: String, enabled: bool, state: State<'_, AppState>) -> Result<()> {
     let root = root_from(&state)?;
-    let folder = PathBuf::from(path).canonicalize().map_err(|_| { KeepframeError::Message("Choose an existing source folder to watch.".into())
+    let folder = PathBuf::from(path).canonicalize().map_err(|_| {
+        KeepframeError::Message("Choose an existing source folder to watch.".into())
     })?;
-    if !folder.is_dir() || folder.parent().is_none() { return Err(KeepframeError::Message("Keepframe will not watch a drive root or system-wide location.".into(),)); }
+    if !folder.is_dir() || folder.parent().is_none() {
+        return Err(KeepframeError::Message(
+            "Keepframe will not watch a drive root or system-wide location.".into(),
+        ));
+    }
     let connection = open_db(&root)?;
     connection.execute("INSERT INTO watch_folders(path,enabled,created_at)VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET enabled=excluded.enabled", params![folder.to_string_lossy(),enabled as i64,Utc::now().to_rfc3339()])?;
     restart_folder_watcher(&root, &state)
@@ -4130,7 +5690,15 @@ fn disable_folder_watches(state: State<'_, AppState>) -> Result<()> {
 fn list_folder_watch_events(state: State<'_, AppState>) -> Result<Vec<WatchEventRecord>> {
     let connection = open_db(&root_from(&state)?)?;
     let mut statement = connection.prepare("SELECT id,folder_path,path,kind,observed_at FROM watch_events WHERE state='inbox' ORDER BY observed_at DESC,id DESC LIMIT 250")?;
-    let events = statement.query_map([], |row| { Ok(WatchEventRecord { id: row.get(0)?,folder_path: row.get(1)?,path: row.get(2)?,kind: row.get(3)?,observed_at: row.get(4)?, })
+    let events = statement
+        .query_map([], |row| {
+            Ok(WatchEventRecord {
+                id: row.get(0)?,
+                folder_path: row.get(1)?,
+                path: row.get(2)?,
+                kind: row.get(3)?,
+                observed_at: row.get(4)?,
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(events)
@@ -4162,30 +5730,30 @@ fn validate_map_bounds(bounds: &MapBounds) -> Result<()> {
 }
 
 fn query_map_assets_in(connection: &Connection, query: &MapQuery) -> Result<Vec<MapAsset>> {
-    let (mut where_sql, mut values) = asset_where(&query.filter);
+    let (mut where_sql, mut values) = asset_where(connection, &query.filter)?;
     append_map_clause(
         &mut where_sql,
-        "a.latitude BETWEEN -90 AND 90 AND a.longitude BETWEEN -180 AND 180",
+        "a.is_primary=1 AND s.latitude BETWEEN -90 AND 90 AND s.longitude BETWEEN -180 AND 180",
     );
     if let Some(bounds) = query.bounds.as_ref() {
         validate_map_bounds(bounds)?;
-        append_map_clause(&mut where_sql, "a.latitude >= ? AND a.latitude <= ?");
+        append_map_clause(&mut where_sql, "s.latitude >= ? AND s.latitude <= ?");
         values.push(SqlValue::Real(bounds.south));
         values.push(SqlValue::Real(bounds.north));
         if bounds.west <= bounds.east {
-            append_map_clause(&mut where_sql, "a.longitude >= ? AND a.longitude <= ?");
+            append_map_clause(&mut where_sql, "s.longitude >= ? AND s.longitude <= ?");
             values.push(SqlValue::Real(bounds.west));
             values.push(SqlValue::Real(bounds.east));
         } else {
-            append_map_clause(&mut where_sql, "(a.longitude >= ? OR a.longitude <= ?)");
+            append_map_clause(&mut where_sql, "(s.longitude >= ? OR s.longitude <= ?)");
             values.push(SqlValue::Real(bounds.west));
             values.push(SqlValue::Real(bounds.east));
         }
     }
     let sql = format!(
-        "SELECT a.id,a.filename,a.latitude,a.longitude,a.captured_at,a.thumbnail_path,a.decision,\
-         COALESCE(a.location_source,CASE WHEN a.latitude IS NULL OR a.longitude IS NULL THEN 'none' ELSE 'embedded' END)\
-         FROM assets a{where_sql} ORDER BY a.captured_at DESC,a.id"
+        "SELECT a.id,s.filename,s.latitude,s.longitude,s.captured_at,a.thumbnail_path,a.decision,\
+         COALESCE(s.location_source,CASE WHEN s.latitude IS NULL OR s.longitude IS NULL THEN 'none' ELSE 'embedded' END)\
+         FROM assets a JOIN sources s ON s.id=a.source_id{where_sql} ORDER BY s.captured_at DESC,a.id"
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
@@ -4212,9 +5780,10 @@ fn query_map_assets(query: MapQuery, state: State<'_, AppState>) -> Result<Vec<M
 #[tauri::command]
 fn query_asset_ids(filter: AssetFilter, state: State<'_, AppState>) -> Result<Vec<String>> {
     let connection = open_db(&root_from(&state)?)?;
-    let (where_sql, values) = asset_where(&filter);
+    let (where_sql, values) = asset_where(&connection, &filter)?;
     let mut statement = connection.prepare(&format!(
-        "SELECT a.id FROM assets a{where_sql} ORDER BY {}", asset_order(&filter)
+        "SELECT a.id FROM assets a JOIN sources s ON s.id=a.source_id{where_sql} ORDER BY {}",
+        asset_order(&filter)
     ))?;
     let ids = statement
         .query_map(params_from_iter(values.iter()), |row| row.get(0))?
@@ -4305,70 +5874,203 @@ fn catalogue_snapshot(connection: &Connection, asset_id: &str) -> Result<Value> 
         "SELECT rating,decision,title,caption,copyright,creator FROM assets WHERE id=?1 AND trashed_at IS NULL",
         [asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
     )?;
-    Ok(json!({"id":asset_id,"rating":rating,"decision":decision,"title":title,"caption":caption,"copyright":copyright,"creator":creator,"tags":asset_tags(connection,asset_id)?}))
+    Ok(
+        json!({"id":asset_id,"rating":rating,"decision":decision,"title":title,"caption":caption,"copyright":copyright,"creator":creator,"tags":asset_tags(connection,asset_id)?}),
+    )
 }
 
 fn apply_catalogue_snapshots(tx: &rusqlite::Transaction<'_>, snapshots: &Value) -> Result<()> {
-    let items = snapshots.as_array().ok_or_else(|| KeepframeError::Message("Batch catalogue history is invalid".into()))?;
+    let items = snapshots
+        .as_array()
+        .ok_or_else(|| KeepframeError::Message("Batch catalogue history is invalid".into()))?;
     for item in items {
-        let id=item["id"].as_str().ok_or_else(|| KeepframeError::Message("Batch catalogue history has no asset id".into()))?;
-        let rating=item["rating"].as_i64().ok_or_else(|| KeepframeError::Message("Batch rating history is invalid".into()))?;
-        let decision=item["decision"].as_str().ok_or_else(|| KeepframeError::Message("Batch flag history is invalid".into()))?;
+        let id = item["id"].as_str().ok_or_else(|| {
+            KeepframeError::Message("Batch catalogue history has no asset id".into())
+        })?;
+        let rating = item["rating"]
+            .as_i64()
+            .ok_or_else(|| KeepframeError::Message("Batch rating history is invalid".into()))?;
+        let decision = item["decision"]
+            .as_str()
+            .ok_or_else(|| KeepframeError::Message("Batch flag history is invalid".into()))?;
         tx.execute("UPDATE assets SET rating=?2,decision=?3,title=?4,caption=?5,copyright=?6,creator=?7 WHERE id=?1", params![id,rating,decision,item["title"].as_str(),item["caption"].as_str(),item["copyright"].as_str(),item["creator"].as_str()])?;
-        replace_asset_tags(tx,id,&serde_json::from_value::<Vec<String>>(item["tags"].clone())?)?;
+        replace_asset_tags(
+            tx,
+            id,
+            &serde_json::from_value::<Vec<String>>(item["tags"].clone())?,
+        )?;
     }
     Ok(())
 }
 
-fn patch_text(patch: &serde_json::Map<String,Value>, key: &str, max_chars: usize) -> Result<Option<Option<String>>> {
-    let Some(value)=patch.get(key) else{return Ok(None)};
-    if value.is_null(){return Ok(Some(None));}
-    let text=value.as_str().ok_or_else(||KeepframeError::Message(format!("{key} must be text or null")))?.trim().to_string();
-    if text.chars().count()>max_chars || text.chars().any(|character| character=='\0') {return Err(KeepframeError::Message(format!("{key} is too long or contains invalid text")));}
-    Ok(Some(if text.is_empty(){None}else{Some(text)}))
+fn patch_text(
+    patch: &serde_json::Map<String, Value>,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<Option<String>>> {
+    let Some(value) = patch.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let text = value
+        .as_str()
+        .ok_or_else(|| KeepframeError::Message(format!("{key} must be text or null")))?
+        .trim()
+        .to_string();
+    if text.chars().count() > max_chars || text.chars().any(|character| character == '\0') {
+        return Err(KeepframeError::Message(format!(
+            "{key} is too long or contains invalid text"
+        )));
+    }
+    Ok(Some(if text.is_empty() { None } else { Some(text) }))
 }
 
-fn batch_metadata_in(connection: &mut Connection, request: BatchMetadataRequest) -> Result<BatchSummary> {
-    let requested=request.asset_ids.len();
-    if requested==0 || requested>10_000{return Err(KeepframeError::Message("Select between 1 and 10,000 photographs".into()));}
-    let ids=request.asset_ids.into_iter().collect::<HashSet<_>>();
-    if ids.len()!=requested{return Err(KeepframeError::Message("The batch selection contains duplicate ids".into()));}
-    let patch=request.patch.as_object().ok_or_else(||KeepframeError::Message("The metadata patch must be an object".into()))?;
-    let title=patch_text(patch,"title",512)?;let caption=patch_text(patch,"caption",8_000)?;let copyright=patch_text(patch,"copyright",1_000)?;let creator=patch_text(patch,"creator",512)?;
-    let rating=patch.get("rating").map(|value|value.as_i64().ok_or_else(||KeepframeError::Message("Rating must be 0 to 5".into()))).transpose()?;
-    if rating.is_some_and(|value|!(0..=5).contains(&value)){return Err(KeepframeError::Message("Rating must be 0 to 5".into()));}
-    let decision=patch.get("decision").map(|value|value.as_str().ok_or_else(||KeepframeError::Message("Flag must be Pick, Unflagged or Reject".into()))).transpose()?;
-    if decision.is_some_and(|value|!["keep","undecided","discard"].contains(&value)){return Err(KeepframeError::Message("Flag must be Pick, Unflagged or Reject".into()));}
-    let read_words=|key:&str|->Result<Option<Vec<String>>>{patch.get(key).map(|value|serde_json::from_value::<Vec<String>>(value.clone()).map(normalise_tags).map_err(KeepframeError::from)).transpose()};
-    let add=read_words("addKeywords")?;let remove=read_words("removeKeywords")?;let replace=read_words("replaceKeywords")?;
-    let tx=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut old=Vec::with_capacity(requested);let mut new=Vec::with_capacity(requested);let mut changed=0;
-    for id in ids.iter(){
-        let before=catalogue_snapshot(&tx,id)?;old.push(before.clone());
-        if let Some(value)=rating{tx.execute("UPDATE assets SET rating=?2 WHERE id=?1",params![id,value])?;}
-        if let Some(value)=decision{tx.execute("UPDATE assets SET decision=?2 WHERE id=?1",params![id,value])?;}
-        for (column,value) in [("title",&title),("caption",&caption),("copyright",&copyright),("creator",&creator)]{if let Some(value)=value{tx.execute(&format!("UPDATE assets SET {column}=?2 WHERE id=?1"),params![id,value])?;}}
-        if replace.is_some()||add.is_some()||remove.is_some(){
-            let mut tags=match replace.clone(){Some(tags)=>tags,None=>asset_tags(&tx,id)?};
-            if let Some(words)=add.as_ref(){tags.extend(words.clone());}
-            if let Some(words)=remove.as_ref(){let removed=words.iter().map(|word|word.to_lowercase()).collect::<HashSet<_>>();tags.retain(|tag|!removed.contains(&tag.to_lowercase()));}
-            replace_asset_tags(&tx,id,&normalise_tags(tags))?;
-        }
-        let after=catalogue_snapshot(&tx,id)?;if after!=before{changed+=1;}new.push(after);
+fn batch_metadata_in(
+    connection: &mut Connection,
+    request: BatchMetadataRequest,
+) -> Result<BatchSummary> {
+    let requested = request.asset_ids.len();
+    if requested == 0 || requested > 10_000 {
+        return Err(KeepframeError::Message(
+            "Select between 1 and 10,000 photographs".into(),
+        ));
     }
-    if changed>0{tx.execute("DELETE FROM audit_log WHERE undone=1",[])?;tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('batch',?1,'batch_assets',?2,?3,?4)",params![Uuid::new_v4().to_string(),Value::Array(old).to_string(),Value::Array(new).to_string(),Utc::now().to_rfc3339()])?;}
-    tx.commit()?;Ok(BatchSummary{requested,changed,failed:0,cancelled:0})
+    let ids = request.asset_ids.into_iter().collect::<HashSet<_>>();
+    if ids.len() != requested {
+        return Err(KeepframeError::Message(
+            "The batch selection contains duplicate ids".into(),
+        ));
+    }
+    let patch = request
+        .patch
+        .as_object()
+        .ok_or_else(|| KeepframeError::Message("The metadata patch must be an object".into()))?;
+    let title = patch_text(patch, "title", 512)?;
+    let caption = patch_text(patch, "caption", 8_000)?;
+    let copyright = patch_text(patch, "copyright", 1_000)?;
+    let creator = patch_text(patch, "creator", 512)?;
+    let rating = patch
+        .get("rating")
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| KeepframeError::Message("Rating must be 0 to 5".into()))
+        })
+        .transpose()?;
+    if rating.is_some_and(|value| !(0..=5).contains(&value)) {
+        return Err(KeepframeError::Message("Rating must be 0 to 5".into()));
+    }
+    let decision = patch
+        .get("decision")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                KeepframeError::Message("Flag must be Pick, Unflagged or Reject".into())
+            })
+        })
+        .transpose()?;
+    if decision.is_some_and(|value| !["keep", "undecided", "discard"].contains(&value)) {
+        return Err(KeepframeError::Message(
+            "Flag must be Pick, Unflagged or Reject".into(),
+        ));
+    }
+    let read_words = |key: &str| -> Result<Option<Vec<String>>> {
+        patch
+            .get(key)
+            .map(|value| {
+                serde_json::from_value::<Vec<String>>(value.clone())
+                    .map(normalise_tags)
+                    .map_err(KeepframeError::from)
+            })
+            .transpose()
+    };
+    let add = read_words("addKeywords")?;
+    let remove = read_words("removeKeywords")?;
+    let replace = read_words("replaceKeywords")?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut old = Vec::with_capacity(requested);
+    let mut new = Vec::with_capacity(requested);
+    let mut changed = 0;
+    for id in ids.iter() {
+        let before = catalogue_snapshot(&tx, id)?;
+        old.push(before.clone());
+        if let Some(value) = rating {
+            tx.execute(
+                "UPDATE assets SET rating=?2 WHERE id=?1",
+                params![id, value],
+            )?;
+        }
+        if let Some(value) = decision {
+            tx.execute(
+                "UPDATE assets SET decision=?2 WHERE id=?1",
+                params![id, value],
+            )?;
+        }
+        for (column, value) in [
+            ("title", &title),
+            ("caption", &caption),
+            ("copyright", &copyright),
+            ("creator", &creator),
+        ] {
+            if let Some(value) = value {
+                tx.execute(
+                    &format!("UPDATE assets SET {column}=?2 WHERE id=?1"),
+                    params![id, value],
+                )?;
+            }
+        }
+        if replace.is_some() || add.is_some() || remove.is_some() {
+            let mut tags = match replace.clone() {
+                Some(tags) => tags,
+                None => asset_tags(&tx, id)?,
+            };
+            if let Some(words) = add.as_ref() {
+                tags.extend(words.clone());
+            }
+            if let Some(words) = remove.as_ref() {
+                let removed = words
+                    .iter()
+                    .map(|word| word.to_lowercase())
+                    .collect::<HashSet<_>>();
+                tags.retain(|tag| !removed.contains(&tag.to_lowercase()));
+            }
+            replace_asset_tags(&tx, id, &normalise_tags(tags))?;
+        }
+        let after = catalogue_snapshot(&tx, id)?;
+        if after != before {
+            changed += 1;
+        }
+        new.push(after);
+    }
+    if changed > 0 {
+        tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
+        tx.execute("INSERT INTO audit_log(entity_type,entity_id,action,old_json,new_json,created_at)VALUES('batch',?1,'batch_assets',?2,?3,?4)",params![Uuid::new_v4().to_string(),Value::Array(old).to_string(),Value::Array(new).to_string(),Utc::now().to_rfc3339()])?;
+    }
+    tx.commit()?;
+    Ok(BatchSummary {
+        requested,
+        changed,
+        failed: 0,
+        cancelled: 0,
+    })
 }
 
 #[tauri::command]
-fn batch_update_metadata(request: BatchMetadataRequest,state:State<'_,AppState>)->Result<BatchSummary>{let mut connection=open_db(&root_from(&state)?)?;batch_metadata_in(&mut connection,request)}
+fn batch_update_metadata(
+    request: BatchMetadataRequest,
+    state: State<'_, AppState>,
+) -> Result<BatchSummary> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    batch_metadata_in(&mut connection, request)
+}
 
 fn catalogued_paths(connection: &Connection, asset_id: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for sql in [
-        "SELECT path FROM representations WHERE asset_id=?1",
-        "SELECT path FROM versions WHERE asset_id=?1",
-        "SELECT output_path FROM jobs WHERE asset_id=?1 AND output_path IS NOT NULL",
+        "SELECT path FROM representations WHERE source_id=(SELECT source_id FROM assets WHERE id=?1)",
+        "SELECT v.path FROM versions v JOIN assets a ON a.id=v.asset_id WHERE a.source_id=(SELECT source_id FROM assets WHERE id=?1)",
+        "SELECT j.output_path FROM jobs j JOIN assets a ON a.id=j.asset_id WHERE a.source_id=(SELECT source_id FROM assets WHERE id=?1) AND j.output_path IS NOT NULL",
     ] {
         let mut statement = connection.prepare(sql)?;
         paths.extend(
@@ -4420,13 +6122,13 @@ fn move_to_trash_inner(
         let result = (|| -> Result<()> {
             let state: Option<(String, Option<String>)> = connection
                 .query_row(
-                    "SELECT decision,trashed_at FROM assets WHERE id=?1",
+                    "SELECT decision,trashed_at FROM assets WHERE id=?1 AND is_primary=1",
                     [&asset_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
             let (decision, trashed_at) = state
-                .ok_or_else(|| KeepframeError::Message("Photograph no longer exists".into()))?;
+                .ok_or_else(|| KeepframeError::Message("Only the primary item can move a physical source to Trash. Use Delete Version for a virtual version.".into()))?;
             if decision != "discard" || trashed_at.is_some() {
                 return Err(KeepframeError::Message(
                     "Only discarded photographs outside Trash can be moved to Trash".into(),
@@ -4502,7 +6204,7 @@ fn move_to_trash_inner(
                         }
                         if rollback_failed {
                             connection.execute(
-                                "UPDATE assets SET trashed_at=?2 WHERE id=?1",
+                                "UPDATE assets SET trashed_at=?2 WHERE source_id=(SELECT source_id FROM assets WHERE id=?1)",
                                 params![asset_id, Utc::now().to_rfc3339()],
                             )?;
                         }
@@ -4511,9 +6213,10 @@ fn move_to_trash_inner(
                 }
             }
             connection.execute(
-                "UPDATE assets SET trashed_at=?2 WHERE id=?1",
+                "UPDATE sources SET trashed_at=?2 WHERE id=(SELECT source_id FROM assets WHERE id=?1)",
                 params![asset_id, Utc::now().to_rfc3339()],
             )?;
+            connection.execute("UPDATE assets SET trashed_at=?2 WHERE source_id=(SELECT source_id FROM assets WHERE id=?1)",params![asset_id,Utc::now().to_rfc3339()])?;
             Ok(())
         })();
 
@@ -4614,7 +6317,8 @@ async fn restore_from_trash(
                 }
             }
             if !asset_failed && !restored.is_empty() {
-                connection.execute("UPDATE assets SET trashed_at=NULL WHERE id=?1", [&asset_id])?;
+                connection.execute("UPDATE sources SET trashed_at=NULL WHERE id=(SELECT source_id FROM assets WHERE id=?1)",[&asset_id])?;
+                connection.execute("UPDATE assets SET trashed_at=NULL WHERE source_id=(SELECT source_id FROM assets WHERE id=?1)",[&asset_id])?;
                 affected += 1;
             } else {
                 failed += 1;
@@ -4781,7 +6485,12 @@ fn update_location_in(
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     )?;
-    if old.0 == Some(latitude) && old.1 == Some(longitude) && old.2 == Some(latitude) && old.3 == Some(longitude) && old.4 == "manual" {
+    if old.0 == Some(latitude)
+        && old.1 == Some(longitude)
+        && old.2 == Some(latitude)
+        && old.3 == Some(longitude)
+        && old.4 == "manual"
+    {
         return Ok(());
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -4806,13 +6515,25 @@ fn update_location(
     update_location_in(&mut connection, &asset_id, latitude, longitude)
 }
 
-fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitude: f64, longitude: f64,) -> Result<usize> {
+fn update_locations_in(
+    connection: &mut Connection,
+    asset_ids: &[String],
+    latitude: f64,
+    longitude: f64,
+) -> Result<usize> {
     if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
-        return Err(KeepframeError::Message("Coordinates are outside the valid range".into(),));
+        return Err(KeepframeError::Message(
+            "Coordinates are outside the valid range".into(),
+        ));
     }
     let mut unique = HashSet::new();
-    let ids = asset_ids.iter().filter(|id| unique.insert(id.as_str())).collect::<Vec<_>>();
-    if ids.is_empty() { return Ok(0); }
+    let ids = asset_ids
+        .iter()
+        .filter(|id| unique.insert(id.as_str()))
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(0);
+    }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     for asset_id in &ids {
@@ -4828,7 +6549,12 @@ fn update_locations_in(connection: &mut Connection, asset_ids: &[String], latitu
 }
 
 #[tauri::command]
-fn update_locations(asset_ids: Vec<String>, latitude: f64, longitude: f64, state: State<'_, AppState>,) -> Result<usize> {
+fn update_locations(
+    asset_ids: Vec<String>,
+    latitude: f64,
+    longitude: f64,
+    state: State<'_, AppState>,
+) -> Result<usize> {
     let mut connection = open_db(&root_from(&state)?)?;
     update_locations_in(&mut connection, &asset_ids, latitude, longitude)
 }
@@ -4847,7 +6573,11 @@ fn clear_manual_location_in(connection: &mut Connection, asset_id: &str) -> Resu
         [asset_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let source = if embedded.0.is_some() && embedded.1.is_some() { "embedded" } else { "none" };
+    let source = if embedded.0.is_some() && embedded.1.is_some() {
+        "embedded"
+    } else {
+        "none"
+    };
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM audit_log WHERE undone=1", [])?;
     tx.execute(
@@ -4919,8 +6649,12 @@ const EDIT_INTENTS: &[&str] = &[
     "custom",
 ];
 const AI_ACTIONS: &[&str] = &[
-    "improve_photo", "improve_lighting", "enhance_colour", "restore_old_photo",
-    "remove_distraction", "custom_instruction",
+    "improve_photo",
+    "improve_lighting",
+    "enhance_colour",
+    "restore_old_photo",
+    "remove_distraction",
+    "custom_instruction",
 ];
 const PRESERVE_CONSTRAINTS: &[&str] = &[
     "identity_faces",
@@ -4949,7 +6683,10 @@ fn validate_recipe(recipe: &EditRecipe, asset_id: &str) -> Result<()> {
             .preserve
             .iter()
             .all(|value| PRESERVE_CONSTRAINTS.contains(&value.as_str()))
-        || recipe.action.as_ref().is_some_and(|value| !AI_ACTIONS.contains(&value.as_str()))
+        || recipe
+            .action
+            .as_ref()
+            .is_some_and(|value| !AI_ACTIONS.contains(&value.as_str()))
         || !["subtle", "balanced", "strong"].contains(&recipe.strength.as_str())
         || recipe.output.format != "png"
         || !recipe.output.preserve_dimensions
@@ -5659,7 +7396,12 @@ fn transition_job_in(connection: &Connection, job_id: &str, action: &str) -> Res
         "cancel"
             if matches!(
                 current.as_str(),
-                "draft" | "analysing" | "review_required" | "queued" | "running" | "waiting_external"
+                "draft"
+                    | "analysing"
+                    | "review_required"
+                    | "queued"
+                    | "running"
+                    | "waiting_external"
             ) =>
         {
             "cancelled"
@@ -5975,23 +7717,47 @@ async fn start_export_batch(
 fn redo_last_action_in(connection: &mut Connection) -> Result<bool> {
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let action: Option<(i64,String,String,String)> = tx.query_row("SELECT id,entity_id,action,new_json FROM audit_log WHERE undone=1 ORDER BY id ASC LIMIT 1", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
-    let Some((id,entity,kind,new_json))=action else { tx.commit()?; return Ok(false); };
-    let value: Value=serde_json::from_str(&new_json)?;
+    let Some((id, entity, kind, new_json)) = action else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    let value: Value = serde_json::from_str(&new_json)?;
     match kind.as_str() {
-        "decision" => { let decision=value["decision"].as_str().ok_or_else(||KeepframeError::Message("Decision redo record is invalid".into()))?; tx.execute("UPDATE assets SET decision=?2 WHERE id=?1",params![entity,decision])?; }
-        "tags" => replace_asset_tags(&tx,&entity,&serde_json::from_value::<Vec<String>>(value["tags"].clone())?)?,
-        "location" => { tx.execute("UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?4,manual_longitude=?5,location_source=?6 WHERE id=?1",params![entity,value["latitude"].as_f64(),value["longitude"].as_f64(),value["manualLatitude"].as_f64(),value["manualLongitude"].as_f64(),value["locationSource"].as_str().unwrap_or(if value["latitude"].is_null(){"none"}else{"embedded"})])?; }
-        "batch_assets" => apply_catalogue_snapshots(&tx,&value)?,
-        "batch_recipes" => apply_recipe_snapshots(&tx,&value)?,
-        _ => return Err(KeepframeError::Message(format!("Unsupported redo action: {kind}"))),
+        "decision" => {
+            let decision = value["decision"]
+                .as_str()
+                .ok_or_else(|| KeepframeError::Message("Decision redo record is invalid".into()))?;
+            tx.execute(
+                "UPDATE assets SET decision=?2 WHERE id=?1",
+                params![entity, decision],
+            )?;
+        }
+        "tags" => replace_asset_tags(
+            &tx,
+            &entity,
+            &serde_json::from_value::<Vec<String>>(value["tags"].clone())?,
+        )?,
+        "location" => {
+            tx.execute("UPDATE assets SET latitude=?2,longitude=?3,manual_latitude=?4,manual_longitude=?5,location_source=?6 WHERE id=?1",params![entity,value["latitude"].as_f64(),value["longitude"].as_f64(),value["manualLatitude"].as_f64(),value["manualLongitude"].as_f64(),value["locationSource"].as_str().unwrap_or(if value["latitude"].is_null(){"none"}else{"embedded"})])?;
+        }
+        "batch_assets" => apply_catalogue_snapshots(&tx, &value)?,
+        "batch_recipes" => apply_recipe_snapshots(&tx, &value)?,
+        _ => {
+            return Err(KeepframeError::Message(format!(
+                "Unsupported redo action: {kind}"
+            )))
+        }
     }
-    tx.execute("UPDATE audit_log SET undone=0 WHERE id=?1",[id])?;
+    tx.execute("UPDATE audit_log SET undone=0 WHERE id=?1", [id])?;
     tx.commit()?;
     Ok(true)
 }
 
 #[tauri::command]
-fn redo_last_action(state: State<'_,AppState>) -> Result<bool> { let mut connection=open_db(&root_from(&state)?)?; redo_last_action_in(&mut connection) }
+fn redo_last_action(state: State<'_, AppState>) -> Result<bool> {
+    let mut connection = open_db(&root_from(&state)?)?;
+    redo_last_action_in(&mut connection)
+}
 
 #[tauri::command]
 fn cancel_export_batch(state: State<'_, AppState>) {
@@ -5999,12 +7765,17 @@ fn cancel_export_batch(state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn list_export_presets(state: State<'_, AppState>) -> Result<Vec<professional_export::ExportPreset>> {
+fn list_export_presets(
+    state: State<'_, AppState>,
+) -> Result<Vec<professional_export::ExportPreset>> {
     professional_export::list_presets(&root_from(&state)?)
 }
 
 #[tauri::command]
-fn save_export_preset(preset: professional_export::ExportPreset, state: State<'_, AppState>) -> Result<professional_export::ExportPreset> {
+fn save_export_preset(
+    preset: professional_export::ExportPreset,
+    state: State<'_, AppState>,
+) -> Result<professional_export::ExportPreset> {
     professional_export::save_preset(&root_from(&state)?, preset)
 }
 
@@ -6019,13 +7790,23 @@ fn export_export_preset(id: String, path: String, state: State<'_, AppState>) ->
 }
 
 #[tauri::command]
-fn import_export_preset(path: String, state: State<'_, AppState>) -> Result<professional_export::ExportPreset> {
+fn import_export_preset(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<professional_export::ExportPreset> {
     professional_export::import_preset(&root_from(&state)?, Path::new(&path))
 }
 
-fn export_asset_image_with_cache(root: &Path, asset_id: &str, destination: &Path, renderer_caches: Option<&Mutex<RendererCaches>>) -> Result<PathBuf> {
+fn export_asset_image_with_cache(
+    root: &Path,
+    asset_id: &str,
+    destination: &Path,
+    renderer_caches: Option<&Mutex<RendererCaches>>,
+) -> Result<PathBuf> {
     if !destination.is_dir() {
-        return Err(KeepframeError::Message("Choose an existing export folder.".into(),));
+        return Err(KeepframeError::Message(
+            "Choose an existing export folder.".into(),
+        ));
     }
     let connection = open_db(root)?;
     let (filename, width, height, preferred): (String, Option<u32>, Option<u32>, Option<String>) = connection.query_row(
@@ -6045,18 +7826,48 @@ fn export_asset_image_with_cache(root: &Path, asset_id: &str, destination: &Path
     let recipe = develop_recipe_in(&connection, asset_id)?;
     if recipe.is_edited() {
         let input = original_adjustment_input(&connection, asset_id)?;
-        let rendered=if let Some(caches)=renderer_caches{
-            let(expected_width,expected_height)=input.expected_dimensions.unwrap_or((0,0));
-            let source_key=format!("full:{}:{}",input.source_hash,decoded_source_key(&input.path,expected_width,expected_height)?);
-            let cached=caches.lock().expect("renderer cache lock").decoded.get(&source_key);
-            let image=if let Some(image)=cached{image}else{
-                let image=Arc::new(prepare_full_resolution_image(&input.path,input.expected_dimensions,&root.join(".keepframe/staging/working"))?);
-                let bytes=image.as_bytes().len();caches.lock().expect("renderer cache lock").decoded.insert(source_key.clone(),Arc::clone(&image),bytes);image
+        let rendered = if let Some(caches) = renderer_caches {
+            let (expected_width, expected_height) = input.expected_dimensions.unwrap_or((0, 0));
+            let source_key = format!(
+                "full:{}:{}",
+                input.source_hash,
+                decoded_source_key(&input.path, expected_width, expected_height)?
+            );
+            let cached = caches
+                .lock()
+                .expect("renderer cache lock")
+                .decoded
+                .get(&source_key);
+            let image = if let Some(image) = cached {
+                image
+            } else {
+                let image = Arc::new(prepare_full_resolution_image(
+                    &input.path,
+                    input.expected_dimensions,
+                    &root.join(".keepframe/staging/working"),
+                )?);
+                let bytes = image.as_bytes().len();
+                caches.lock().expect("renderer cache lock").decoded.insert(
+                    source_key.clone(),
+                    Arc::clone(&image),
+                    bytes,
+                );
+                image
             };
-            image::DynamicImage::ImageRgb8(render_develop_recipe_cached(&image,&source_key,&recipe,caches,None)?)
-        }else{
-            let image=prepare_full_resolution_image(&input.path,input.expected_dimensions,&root.join(".keepframe/staging/working"))?;
-            image::DynamicImage::ImageRgb8(render_develop_recipe(&image,&recipe))
+            image::DynamicImage::ImageRgb8(render_develop_recipe_cached(
+                &image,
+                &source_key,
+                &recipe,
+                caches,
+                None,
+            )?)
+        } else {
+            let image = prepare_full_resolution_image(
+                &input.path,
+                input.expected_dimensions,
+                &root.join(".keepframe/staging/working"),
+            )?;
+            image::DynamicImage::ImageRgb8(render_develop_recipe(&image, &recipe))
         };
         let output = unused_export_path(destination, stem, "png");
         fs::write(&output, encode_srgb_png(&rendered)?)?;
@@ -6072,7 +7883,11 @@ fn export_asset_image_with_cache(root: &Path, asset_id: &str, destination: &Path
         let source = contained_library_file(root, Path::new(&stored))?.ok_or_else(|| {
             KeepframeError::Message("The preferred image is missing from the library.".into())
         })?;
-        let extension = source.extension().and_then(OsStr::to_str).unwrap_or("png").to_ascii_lowercase();
+        let extension = source
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("png")
+            .to_ascii_lowercase();
         let output = unused_export_path(destination, stem, &extension);
         fs::copy(source, &output)?;
         return Ok(output);
@@ -6096,15 +7911,19 @@ fn export_asset_image_with_cache(root: &Path, asset_id: &str, destination: &Path
         fs::write(&output, encode_srgb_png(&image)?)?;
         return Ok(output);
     }
-    let extension = source.extension().and_then(OsStr::to_str).unwrap_or("png").to_ascii_lowercase();
+    let extension = source
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("png")
+        .to_ascii_lowercase();
     let output = unused_export_path(destination, stem, &extension);
     fs::copy(source, &output)?;
     Ok(output)
 }
 
 #[cfg(test)]
-fn export_asset_image_in(root:&Path,asset_id:&str,destination:&Path)->Result<PathBuf>{
-    export_asset_image_with_cache(root,asset_id,destination,None)
+fn export_asset_image_in(root: &Path, asset_id: &str, destination: &Path) -> Result<PathBuf> {
+    export_asset_image_with_cache(root, asset_id, destination, None)
 }
 
 #[tauri::command]
@@ -6114,9 +7933,9 @@ async fn export_asset_image(
     state: State<'_, AppState>,
 ) -> Result<String> {
     let root = root_from(&state)?;
-    let caches=Arc::clone(&state.renderer_caches);
+    let caches = Arc::clone(&state.renderer_caches);
     tauri::async_runtime::spawn_blocking(move || {
-        export_asset_image_with_cache(&root, &asset_id, Path::new(&destination),Some(&caches))
+        export_asset_image_with_cache(&root, &asset_id, Path::new(&destination), Some(&caches))
             .map(|path| path.to_string_lossy().into_owned())
     })
     .await
@@ -6304,7 +8123,8 @@ fn import_returned_edit_in(
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional()?;
     let had_waiting = waiting.is_some();
-    let (job_id, batch_id) = waiting.unwrap_or_else(|| (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()));
+    let (job_id, batch_id) =
+        waiting.unwrap_or_else(|| (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()));
     let tx = connection.transaction()?;
     if !had_waiting {
         tx.execute(
@@ -6312,7 +8132,10 @@ fn import_returned_edit_in(
             params![batch_id, prompt, now],
         )?;
     } else {
-        tx.execute("UPDATE batches SET state='succeeded' WHERE id=?1", [&batch_id],)?;
+        tx.execute(
+            "UPDATE batches SET state='succeeded' WHERE id=?1",
+            [&batch_id],
+        )?;
     }
     let recipe_json = recipe.as_ref().map(serde_json::to_string).transpose()?;
     if had_waiting {
@@ -6431,9 +8254,30 @@ pub fn run() {
             resume_import,
             query_assets,
             get_asset,
+            list_catalogue_versions,
+            create_catalogue_version,
+            rename_catalogue_version,
+            delete_catalogue_version,
+            set_version_group_collapsed,
+            list_collections,
+            save_collection,
+            delete_collection,
+            update_collection_members,
+            list_collection_sets,
+            create_collection_set,
+            rename_collection_set,
+            delete_collection_set,
+            list_stacks,
+            create_stack,
+            set_stack_collapsed,
+            set_stack_top,
+            unstack,
+            remove_from_stack,
+            add_to_stack,
             export_xmp_sidecars,
             import_xmp_sidecar,
             export_portable_catalogue,
+            import_portable_catalogue,
             rescan_library,
             find_relink_candidates,
             relink_asset,
@@ -6509,10 +8353,71 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn local(exposure:f32)->LocalAdjustments{LocalAdjustments{exposure,..LocalAdjustments::default()}}
-    fn linear_mask(id:&str,exposure:f32)->DevelopMask{DevelopMask{id:id.into(),name:"Linear".into(),enabled:true,inverted:false,opacity:1.0,feather:1.0,geometry:MaskGeometry::Linear{start:MaskPoint{x:0.0,y:0.5},end:MaskPoint{x:1.0,y:0.5},},adjustments:local(exposure),}}
-    fn radial_mask(id:&str,exposure:f32)->DevelopMask{DevelopMask{id:id.into(),name:"Radial".into(),enabled:true,inverted:false,opacity:1.0,feather:0.5,geometry:MaskGeometry::Radial{centre:MaskPoint{x:0.5,y:0.5},radius_x:0.35,radius_y:0.25,rotation:25.0,},adjustments:local(exposure),}}
-    fn brush_mask(id:&str,erase:bool)->DevelopMask{DevelopMask{id:id.into(),name:"Brush".into(),enabled:true,inverted:false,opacity:1.0,feather:0.5,geometry:MaskGeometry::Brush{strokes:vec![BrushStroke{points:vec![MaskPoint{x:0.2,y:0.5},MaskPoint{x:0.8,y:0.5}],radius:0.2,feather:0.5,flow:1.0,erase:false,},BrushStroke{points:vec![MaskPoint{x:0.5,y:0.5}],radius:0.08,feather:0.2,flow:1.0,erase,},],},adjustments:local(1.0),
+    fn local(exposure: f32) -> LocalAdjustments {
+        LocalAdjustments {
+            exposure,
+            ..LocalAdjustments::default()
+        }
+    }
+    fn linear_mask(id: &str, exposure: f32) -> DevelopMask {
+        DevelopMask {
+            id: id.into(),
+            name: "Linear".into(),
+            enabled: true,
+            inverted: false,
+            opacity: 1.0,
+            feather: 1.0,
+            geometry: MaskGeometry::Linear {
+                start: MaskPoint { x: 0.0, y: 0.5 },
+                end: MaskPoint { x: 1.0, y: 0.5 },
+            },
+            adjustments: local(exposure),
+        }
+    }
+    fn radial_mask(id: &str, exposure: f32) -> DevelopMask {
+        DevelopMask {
+            id: id.into(),
+            name: "Radial".into(),
+            enabled: true,
+            inverted: false,
+            opacity: 1.0,
+            feather: 0.5,
+            geometry: MaskGeometry::Radial {
+                centre: MaskPoint { x: 0.5, y: 0.5 },
+                radius_x: 0.35,
+                radius_y: 0.25,
+                rotation: 25.0,
+            },
+            adjustments: local(exposure),
+        }
+    }
+    fn brush_mask(id: &str, erase: bool) -> DevelopMask {
+        DevelopMask {
+            id: id.into(),
+            name: "Brush".into(),
+            enabled: true,
+            inverted: false,
+            opacity: 1.0,
+            feather: 0.5,
+            geometry: MaskGeometry::Brush {
+                strokes: vec![
+                    BrushStroke {
+                        points: vec![MaskPoint { x: 0.2, y: 0.5 }, MaskPoint { x: 0.8, y: 0.5 }],
+                        radius: 0.2,
+                        feather: 0.5,
+                        flow: 1.0,
+                        erase: false,
+                    },
+                    BrushStroke {
+                        points: vec![MaskPoint { x: 0.5, y: 0.5 }],
+                        radius: 0.08,
+                        feather: 0.2,
+                        flow: 1.0,
+                        erase,
+                    },
+                ],
+            },
+            adjustments: local(1.0),
         }
     }
     fn semantic_mask(id: &str, exposure: f32) -> DevelopMask {
@@ -6551,7 +8456,9 @@ mod tests {
                 }),
                 refinements: Vec::new(),
             },
-            adjustments: local(exposure),}}
+            adjustments: local(exposure),
+        }
+    }
     #[test]
     fn supported_formats_are_lowercase_and_unique() {
         let mut values = SUPPORTED.to_vec();
@@ -6596,36 +8503,98 @@ mod tests {
         source.put_pixel(0, 1, image::Rgb([255, 255, 0]));
         source.put_pixel(1, 1, image::Rgb([0, 255, 255]));
         source.put_pixel(2, 1, image::Rgb([255, 0, 255]));
-        let rotated = apply_geometry(&source, BasicAdjustments { rotate_quadrants: 1, ..BasicAdjustments::default() },);
+        let rotated = apply_geometry(
+            &source,
+            BasicAdjustments {
+                rotate_quadrants: 1,
+                ..BasicAdjustments::default()
+            },
+        );
         assert_eq!(rotated.dimensions(), (2, 3));
         assert_eq!(rotated.get_pixel(1, 0), &image::Rgb([255, 0, 0]));
-        let cropped = apply_geometry(&source, BasicAdjustments { crop_left: 1.0 / 3.0, crop_width: 2.0 / 3.0, crop_height: 1.0, ..BasicAdjustments::default() },);
+        let cropped = apply_geometry(
+            &source,
+            BasicAdjustments {
+                crop_left: 1.0 / 3.0,
+                crop_width: 2.0 / 3.0,
+                crop_height: 1.0,
+                ..BasicAdjustments::default()
+            },
+        );
         assert_eq!(cropped.dimensions(), (2, 2));
         assert_eq!(cropped.get_pixel(0, 0), &image::Rgb([0, 255, 0]));
     }
 
     #[test]
     fn develop_recipe_is_versioned_deterministic_and_supports_flips() {
-        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.5, horizontal_flip: true, ..BasicAdjustments::neutral() }, masks: Vec::new(), };
-        let round_trip: DevelopRecipe = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.5,
+                horizontal_flip: true,
+                ..BasicAdjustments::neutral()
+            },
+            masks: Vec::new(),
+        };
+        let round_trip: DevelopRecipe =
+            serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
         assert_eq!(round_trip.validate().unwrap(), recipe);
         assert!(recipe.is_edited());
-        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(3, 2, |x, y| { image::Rgb([(x * 40) as u8, (y * 70) as u8, 30])
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(3, 2, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 70) as u8, 30])
         }));
-        assert_eq!(apply_adjustments_to_image(&source, recipe.settings), apply_adjustments_to_image(&source, recipe.settings));
-        let flipped = apply_geometry(&source.to_rgb8(), BasicAdjustments { horizontal_flip: true, ..BasicAdjustments::neutral() },);
+        assert_eq!(
+            apply_adjustments_to_image(&source, recipe.settings),
+            apply_adjustments_to_image(&source, recipe.settings)
+        );
+        let flipped = apply_geometry(
+            &source.to_rgb8(),
+            BasicAdjustments {
+                horizontal_flip: true,
+                ..BasicAdjustments::neutral()
+            },
+        );
         assert_eq!(flipped.get_pixel(0, 0), source.to_rgb8().get_pixel(2, 0));
     }
 
     #[test]
     fn legacy_v1_recipe_migrates_in_memory_without_visual_change() {
-        let json=serde_json::json!({"schemaVersion":1,"settings":BasicAdjustments{exposure:0.4,..BasicAdjustments::neutral()}});let migrated=serde_json::from_value::<DevelopRecipe>(json).unwrap().validate().unwrap();assert_eq!(migrated.schema_version,2);assert!(migrated.masks.is_empty());let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(8,8,image::Rgb([80,90,100])));assert_eq!(render_develop_recipe(&source,&migrated),apply_adjustments_to_image(&source,migrated.settings));
+        let json = serde_json::json!({"schemaVersion":1,"settings":BasicAdjustments{exposure:0.4,..BasicAdjustments::neutral()}});
+        let migrated = serde_json::from_value::<DevelopRecipe>(json)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(migrated.schema_version, 2);
+        assert!(migrated.masks.is_empty());
+        let source =
+            image::DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 8, image::Rgb([80, 90, 100])));
+        assert_eq!(
+            render_develop_recipe(&source, &migrated),
+            apply_adjustments_to_image(&source, migrated.settings)
+        );
     }
 
     #[test]
     fn mask_geometry_round_trips_and_disabled_masks_still_count_as_edits() {
-        let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",1.0),radial_mask("radial",-0.5),brush_mask("brush",true),
-                semantic_mask("subject", 0.4),],};recipe.masks[0].enabled=false;let json=serde_json::to_string(&recipe).unwrap();let decoded=serde_json::from_str::<DevelopRecipe>(&json).unwrap().validate().unwrap();assert_eq!(decoded,recipe);assert!(decoded.is_edited());assert!(!json.contains("bitmap"));
+        let mut recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![
+                linear_mask("linear", 1.0),
+                radial_mask("radial", -0.5),
+                brush_mask("brush", true),
+                semantic_mask("subject", 0.4),
+            ],
+        };
+        recipe.masks[0].enabled = false;
+        let json = serde_json::to_string(&recipe).unwrap();
+        let decoded = serde_json::from_str::<DevelopRecipe>(&json)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(decoded, recipe);
+        assert!(decoded.is_edited());
+        assert!(!json.contains("bitmap"));
         assert!(json.contains("coveragePng"));
     }
 
@@ -6741,38 +8710,153 @@ mod tests {
 
     #[test]
     fn linear_radial_and_inverted_masks_apply_bounded_local_adjustments() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(41,31,image::Rgb([80,80,80])));let linear=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",1.0)],};let output=render_develop_recipe(&source,&linear);assert!(output.get_pixel(38,15)[0]>output.get_pixel(2,15)[0]);let radial=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![radial_mask("radial",1.0)],};let inside=render_develop_recipe(&source,&radial);assert!(inside.get_pixel(20,15)[0]>inside.get_pixel(0,0)[0]);let mut inverted=radial.clone();inverted.masks[0].inverted=true;inverted.masks[0].opacity=0.5;let outside=render_develop_recipe(&source,&inverted);assert!(outside.get_pixel(0,0)[0]>outside.get_pixel(20,15)[0]);
+        let source =
+            image::DynamicImage::ImageRgb8(RgbImage::from_pixel(41, 31, image::Rgb([80, 80, 80])));
+        let linear = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![linear_mask("linear", 1.0)],
+        };
+        let output = render_develop_recipe(&source, &linear);
+        assert!(output.get_pixel(38, 15)[0] > output.get_pixel(2, 15)[0]);
+        let radial = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![radial_mask("radial", 1.0)],
+        };
+        let inside = render_develop_recipe(&source, &radial);
+        assert!(inside.get_pixel(20, 15)[0] > inside.get_pixel(0, 0)[0]);
+        let mut inverted = radial.clone();
+        inverted.masks[0].inverted = true;
+        inverted.masks[0].opacity = 0.5;
+        let outside = render_develop_recipe(&source, &inverted);
+        assert!(outside.get_pixel(0, 0)[0] > outside.get_pixel(20, 15)[0]);
     }
 
     #[test]
     fn brush_erase_removes_coverage_and_one_stroke_is_compact() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(51,51,image::Rgb([64,64,64])));let paint=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![brush_mask("brush",false)],};let erased=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![brush_mask("brush",true)],};assert!(render_develop_recipe(&source,&paint).get_pixel(25,25)[0]>render_develop_recipe(&source,&erased).get_pixel(25,25)[0]);assert_eq!(match &erased.masks[0].geometry{MaskGeometry::Brush{strokes}=>strokes.len(),_=>0,},2);
+        let source =
+            image::DynamicImage::ImageRgb8(RgbImage::from_pixel(51, 51, image::Rgb([64, 64, 64])));
+        let paint = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![brush_mask("brush", false)],
+        };
+        let erased = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![brush_mask("brush", true)],
+        };
+        assert!(
+            render_develop_recipe(&source, &paint).get_pixel(25, 25)[0]
+                > render_develop_recipe(&source, &erased).get_pixel(25, 25)[0]
+        );
+        assert_eq!(
+            match &erased.masks[0].geometry {
+                MaskGeometry::Brush { strokes } => strokes.len(),
+                _ => 0,
+            },
+            2
+        );
     }
 
     #[test]
     fn overlapping_masks_compose_deterministically_after_global_edits() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(32,24,image::Rgb([90,100,110]),));let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{contrast:10.0,..BasicAdjustments::neutral()},masks:vec![linear_mask("a",0.5),radial_mask("b",0.5)],};let first=render_develop_recipe(&source,&recipe);assert_eq!(first,render_develop_recipe(&source,&recipe));assert_ne!(first,source.to_rgb8());
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            32,
+            24,
+            image::Rgb([90, 100, 110]),
+        ));
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                contrast: 10.0,
+                ..BasicAdjustments::neutral()
+            },
+            masks: vec![linear_mask("a", 0.5), radial_mask("b", 0.5)],
+        };
+        let first = render_develop_recipe(&source, &recipe);
+        assert_eq!(first, render_develop_recipe(&source, &recipe));
+        assert_ne!(first, source.to_rgb8());
     }
 
     #[test]
     fn masks_remain_attached_when_crop_rotation_and_flips_change() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(48,32,|x,y| {image::Rgb([(x*3)as u8,(y*4)as u8,80])
-        }));let geometry=BasicAdjustments{crop_left:0.1,crop_top:0.1,crop_width:0.8,crop_height:0.8,rotate_quadrants:1,horizontal_flip:true,vertical_flip:true,..BasicAdjustments::neutral()};let recipe=DevelopRecipe{schema_version:2,settings:geometry,masks:vec![linear_mask("linear",0.7)],};let rendered=render_develop_recipe(&source,&recipe);let before=render_develop_recipe(&source,&DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:recipe.masks.clone(),},);assert_eq!(rendered,apply_geometry(&before,geometry));
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(48, 32, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 4) as u8, 80])
+        }));
+        let geometry = BasicAdjustments {
+            crop_left: 0.1,
+            crop_top: 0.1,
+            crop_width: 0.8,
+            crop_height: 0.8,
+            rotate_quadrants: 1,
+            horizontal_flip: true,
+            vertical_flip: true,
+            ..BasicAdjustments::neutral()
+        };
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: geometry,
+            masks: vec![linear_mask("linear", 0.7)],
+        };
+        let rendered = render_develop_recipe(&source, &recipe);
+        let before = render_develop_recipe(
+            &source,
+            &DevelopRecipe {
+                schema_version: 2,
+                settings: BasicAdjustments::neutral(),
+                masks: recipe.masks.clone(),
+            },
+        );
+        assert_eq!(rendered, apply_geometry(&before, geometry));
     }
 
     #[test]
     fn normalised_mask_coverage_matches_preview_and_full_resolution() {
-        let mask=linear_mask("linear",1.0);for x in [0.1_f32,0.5,0.9]{let preview=mask_coverage(&mask,(x*100.0).round()as u32,50,101,101);let full=mask_coverage(&mask,(x*1000.0).round()as u32,500,1001,1001);assert!((preview-full).abs()<0.001);}
+        let mask = linear_mask("linear", 1.0);
+        for x in [0.1_f32, 0.5, 0.9] {
+            let preview = mask_coverage(&mask, (x * 100.0).round() as u32, 50, 101, 101);
+            let full = mask_coverage(&mask, (x * 1000.0).round() as u32, 500, 1001, 1001);
+            assert!((preview - full).abs() < 0.001);
+        }
     }
 
     #[test]
     fn disabling_a_mask_restores_the_global_render() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_pixel(24,18,image::Rgb([72,82,92])));let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{contrast:8.0,..BasicAdjustments::neutral()},masks:vec![linear_mask("linear",1.0)],};let enabled=render_develop_recipe(&source,&recipe);recipe.masks[0].enabled=false;let disabled=render_develop_recipe(&source,&recipe);assert_eq!(disabled,apply_adjustments_to_image(&source,recipe.settings));assert_ne!(enabled,disabled);
+        let source =
+            image::DynamicImage::ImageRgb8(RgbImage::from_pixel(24, 18, image::Rgb([72, 82, 92])));
+        let mut recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                contrast: 8.0,
+                ..BasicAdjustments::neutral()
+            },
+            masks: vec![linear_mask("linear", 1.0)],
+        };
+        let enabled = render_develop_recipe(&source, &recipe);
+        recipe.masks[0].enabled = false;
+        let disabled = render_develop_recipe(&source, &recipe);
+        assert_eq!(
+            disabled,
+            apply_adjustments_to_image(&source, recipe.settings)
+        );
+        assert_ne!(enabled, disabled);
     }
 
     #[test]
     fn mask_geometry_changes_preview_cache_identity() {
-        let mut recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![linear_mask("linear",0.5)],};let first=Sha256::digest(serde_json::to_vec(&recipe).unwrap());if let MaskGeometry::Linear{end,..}=&mut recipe.masks[0].geometry{end.x=0.8;}let second=Sha256::digest(serde_json::to_vec(&recipe).unwrap());assert_ne!(first,second);
+        let mut recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![linear_mask("linear", 0.5)],
+        };
+        let first = Sha256::digest(serde_json::to_vec(&recipe).unwrap());
+        if let MaskGeometry::Linear { end, .. } = &mut recipe.masks[0].geometry {
+            end.x = 0.8;
+        }
+        let second = Sha256::digest(serde_json::to_vec(&recipe).unwrap());
+        assert_ne!(first, second);
         let mut semantic = DevelopRecipe {
             schema_version: 2,
             settings: BasicAdjustments::neutral(),
@@ -6796,11 +8880,32 @@ mod tests {
 
     #[test]
     fn copied_develop_recipe_contains_no_asset_metadata() {
-        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.5, saturation: 12.0, ..BasicAdjustments::neutral() }, masks: Vec::new(), };
-        let copied: DevelopRecipe = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.5,
+                saturation: 12.0,
+                ..BasicAdjustments::neutral()
+            },
+            masks: Vec::new(),
+        };
+        let copied: DevelopRecipe =
+            serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
         let stored = serde_json::to_string(&copied).unwrap();
-        for forbidden in ["filename", "capturedAt", "decision", "tags", "latitude", "longitude", "path", "assetId",] {
-            assert!(!stored.contains(forbidden), "copied Develop settings leaked {forbidden}");
+        for forbidden in [
+            "filename",
+            "capturedAt",
+            "decision",
+            "tags",
+            "latitude",
+            "longitude",
+            "path",
+            "assetId",
+        ] {
+            assert!(
+                !stored.contains(forbidden),
+                "copied Develop settings leaked {forbidden}"
+            );
         }
         assert_eq!(copied.settings, recipe.settings);
     }
@@ -6811,14 +8916,31 @@ mod tests {
         initialise_layout(&root).unwrap();
         let original = root.join("Originals/photo.png");
         fs::create_dir_all(original.parent().unwrap()).unwrap();
-        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, image::Rgb([70, 90, 110]))).save(&original).unwrap();
+        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, image::Rgb([70, 90, 110])))
+            .save(&original)
+            .unwrap();
         let original_hash = hash_file(&original).unwrap();
         let connection = open_db(&root).unwrap();
         connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','photo.png','2026-09-12T12:00:00Z',64,48,?1,'2026-09-12T12:00:00Z')", [original.to_string_lossy().as_ref()]).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)", params![original.to_string_lossy(), original_hash, fs::metadata(&original).unwrap().len()]).unwrap();
-        let mut inverted_radial=radial_mask("radial",-0.3);inverted_radial.inverted=true;
-        let recipe = DevelopRecipe { schema_version: 2, settings: BasicAdjustments { exposure: 0.75, crop_left: 0.1, crop_width: 0.8, rotate_quadrants: 1, ..BasicAdjustments::neutral() }, masks: vec![linear_mask("linear",0.5),inverted_radial,brush_mask("brush",true),
-                semantic_mask("subject", 0.3),], };
+        let mut inverted_radial = radial_mask("radial", -0.3);
+        inverted_radial.inverted = true;
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.75,
+                crop_left: 0.1,
+                crop_width: 0.8,
+                rotate_quadrants: 1,
+                ..BasicAdjustments::neutral()
+            },
+            masks: vec![
+                linear_mask("linear", 0.5),
+                inverted_radial,
+                brush_mask("brush", true),
+                semantic_mask("subject", 0.3),
+            ],
+        };
         connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,?2)", params![serde_json::to_string(&recipe).unwrap(), Utc::now().to_rfc3339()]).unwrap();
         assert_eq!(develop_recipe_in(&connection, "asset").unwrap(), recipe);
         drop(connection);
@@ -6831,169 +8953,408 @@ mod tests {
 
     #[test]
     fn renderer_cache_is_bounded_and_evicts_least_recently_used_entries() {
-        let mut cache=BoundedCache::new(8);
-        cache.insert("a".into(),Arc::new(vec![1_u8;4]),4);
-        cache.insert("b".into(),Arc::new(vec![2_u8;4]),4);
+        let mut cache = BoundedCache::new(8);
+        cache.insert("a".into(), Arc::new(vec![1_u8; 4]), 4);
+        cache.insert("b".into(), Arc::new(vec![2_u8; 4]), 4);
         assert!(cache.get("a").is_some());
-        cache.insert("c".into(),Arc::new(vec![3_u8;4]),4);
+        cache.insert("c".into(), Arc::new(vec![3_u8; 4]), 4);
         assert!(cache.get("b").is_none());
         assert!(cache.get("a").is_some());
         assert!(cache.get("c").is_some());
-        assert!(cache.used_bytes<=cache.limit_bytes);
-        assert_eq!(cache.evictions,1);
+        assert!(cache.used_bytes <= cache.limit_bytes);
+        assert_eq!(cache.evictions, 1);
     }
 
     #[test]
     fn preview_decode_cache_reuses_unchanged_files_and_invalidates_source_changes() {
-        let root=std::env::temp_dir().join(format!("keepframe-render-cache-{}",Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("keepframe-render-cache-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let path=root.join("preview.png");
-        image::DynamicImage::new_rgb8(32,24).save(&path).unwrap();
-        let original_hash=hash_file(&path).unwrap();
-        let caches=Mutex::new(RendererCaches::default());
-        let(first_key,first)=decode_preview_cached(&path,&caches).unwrap();
-        let(second_key,second)=decode_preview_cached(&path,&caches).unwrap();
-        assert_eq!(first_key,second_key);assert!(Arc::ptr_eq(&first,&second));
-        assert_eq!(hash_file(&path).unwrap(),original_hash);
-        image::DynamicImage::new_rgb8(33,24).save(&path).unwrap();
-        let(third_key,third)=decode_preview_cached(&path,&caches).unwrap();
-        assert_ne!(first_key,third_key);assert!(!Arc::ptr_eq(&first,&third));
+        let path = root.join("preview.png");
+        image::DynamicImage::new_rgb8(32, 24).save(&path).unwrap();
+        let original_hash = hash_file(&path).unwrap();
+        let caches = Mutex::new(RendererCaches::default());
+        let (first_key, first) = decode_preview_cached(&path, &caches).unwrap();
+        let (second_key, second) = decode_preview_cached(&path, &caches).unwrap();
+        assert_eq!(first_key, second_key);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(hash_file(&path).unwrap(), original_hash);
+        image::DynamicImage::new_rgb8(33, 24).save(&path).unwrap();
+        let (third_key, third) = decode_preview_cached(&path, &caches).unwrap();
+        assert_ne!(first_key, third_key);
+        assert!(!Arc::ptr_eq(&first, &third));
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn full_resolution_export_reuses_safe_source_and_intermediate_caches() {
-        let root=std::env::temp_dir().join(format!("keepframe-full-render-cache-{}",Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-full-render-cache-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
-        let original=root.join("Originals/2026/09/12/photo.png");fs::create_dir_all(original.parent().unwrap()).unwrap();
-        image::DynamicImage::ImageRgb8(RgbImage::from_fn(128,96,|x,y|image::Rgb([x as u8,y as u8,(x+y)as u8]))).save(&original).unwrap();
-        let original_hash=hash_file(&original).unwrap();let connection=open_db(&root).unwrap();
+        let original = root.join("Originals/2026/09/12/photo.png");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        image::DynamicImage::ImageRgb8(RgbImage::from_fn(128, 96, |x, y| {
+            image::Rgb([x as u8, y as u8, (x + y) as u8])
+        }))
+        .save(&original)
+        .unwrap();
+        let original_hash = hash_file(&original).unwrap();
+        let connection = open_db(&root).unwrap();
         connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','photo.png','2026-09-12T12:00:00Z',128,96,?1,'2026-09-12T12:00:00Z')",[original.to_string_lossy().as_ref()]).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)",params![original.to_string_lossy(),original_hash,fs::metadata(&original).unwrap().len()]).unwrap();
-        let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:Vec::new()};
-        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,'2026-09-12T12:00:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();drop(connection);
-        let caches=Mutex::new(RendererCaches::default());let destination=root.join("Exports");
-        let first=export_asset_image_with_cache(&root,"asset",&destination,Some(&caches)).unwrap();
-        let second=export_asset_image_with_cache(&root,"asset",&destination,Some(&caches)).unwrap();
-        assert_eq!(image::open(first).unwrap().to_rgb8(),image::open(second).unwrap().to_rgb8());
-        let cache=caches.lock().unwrap();assert!(cache.decoded.hits>=1);assert!(cache.intermediates.hits>=1);drop(cache);
-        assert_eq!(hash_file(&original).unwrap(),original_hash);fs::remove_dir_all(&root).unwrap();
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.2,
+                ..BasicAdjustments::neutral()
+            },
+            masks: Vec::new(),
+        };
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,'2026-09-12T12:00:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();
+        drop(connection);
+        let caches = Mutex::new(RendererCaches::default());
+        let destination = root.join("Exports");
+        let first =
+            export_asset_image_with_cache(&root, "asset", &destination, Some(&caches)).unwrap();
+        let second =
+            export_asset_image_with_cache(&root, "asset", &destination, Some(&caches)).unwrap();
+        assert_eq!(
+            image::open(first).unwrap().to_rgb8(),
+            image::open(second).unwrap().to_rgb8()
+        );
+        let cache = caches.lock().unwrap();
+        assert!(cache.decoded.hits >= 1);
+        assert!(cache.intermediates.hits >= 1);
+        drop(cache);
+        assert_eq!(hash_file(&original).unwrap(), original_hash);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn intermediate_cache_invalidates_only_colour_dependencies() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(64,48,|x,y|image::Rgb([x as u8,y as u8,(x+y)as u8])));
-        let caches=Mutex::new(RendererCaches::default());
-        let base=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:Vec::new()};
-        render_develop_recipe_cached(&source,"source",&base,&caches,None).unwrap();
-        let mut crop=base.clone();crop.settings.crop_width=0.8;
-        render_develop_recipe_cached(&source,"source",&crop,&caches,None).unwrap();
-        let mut exposure=crop;exposure.settings.exposure=0.3;
-        render_develop_recipe_cached(&source,"source",&exposure,&caches,None).unwrap();
-        let cache=caches.lock().unwrap();
-        assert_eq!((cache.intermediates.hits,cache.intermediates.misses),(1,2));
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(64, 48, |x, y| {
+            image::Rgb([x as u8, y as u8, (x + y) as u8])
+        }));
+        let caches = Mutex::new(RendererCaches::default());
+        let base = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.2,
+                ..BasicAdjustments::neutral()
+            },
+            masks: Vec::new(),
+        };
+        render_develop_recipe_cached(&source, "source", &base, &caches, None).unwrap();
+        let mut crop = base.clone();
+        crop.settings.crop_width = 0.8;
+        render_develop_recipe_cached(&source, "source", &crop, &caches, None).unwrap();
+        let mut exposure = crop;
+        exposure.settings.exposure = 0.3;
+        render_develop_recipe_cached(&source, "source", &exposure, &caches, None).unwrap();
+        let cache = caches.lock().unwrap();
+        assert_eq!(
+            (cache.intermediates.hits, cache.intermediates.misses),
+            (1, 2)
+        );
     }
 
     #[test]
     fn mask_and_semantic_caches_reuse_coverage_and_invalidate_geometry() {
-        let mut caches=RendererCaches::default();
-        let mut mask=semantic_mask("subject",0.3);
-        let first=prepared_mask_coverage_cached(&mask,72,48,&mut caches).unwrap();
-        let second=prepared_mask_coverage_cached(&mask,72,48,&mut caches).unwrap();
-        assert!(Arc::ptr_eq(&first,&second));assert_eq!(caches.masks.hits,1);
-        mask.opacity=0.5;
-        let third=prepared_mask_coverage_cached(&mask,72,48,&mut caches).unwrap();
-        assert!(!Arc::ptr_eq(&first,&third));assert_eq!(caches.masks.misses,2);
-        assert_eq!(caches.semantics.misses,1);assert_eq!(caches.semantics.hits,1);
+        let mut caches = RendererCaches::default();
+        let mut mask = semantic_mask("subject", 0.3);
+        let first = prepared_mask_coverage_cached(&mask, 72, 48, &mut caches).unwrap();
+        let second = prepared_mask_coverage_cached(&mask, 72, 48, &mut caches).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(caches.masks.hits, 1);
+        mask.opacity = 0.5;
+        let third = prepared_mask_coverage_cached(&mask, 72, 48, &mut caches).unwrap();
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(caches.masks.misses, 2);
+        assert_eq!(caches.semantics.misses, 1);
+        assert_eq!(caches.semantics.hits, 1);
     }
 
     #[test]
     fn cached_parallel_renderer_matches_uncached_pixels_and_is_deterministic() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(96,64,|x,y|image::Rgb([(x*2)as u8,(y*3)as u8,(x+y)as u8])));
-        let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.25,clarity:12.0,crop_left:0.1,crop_width:0.8,..BasicAdjustments::neutral()},masks:vec![linear_mask("one",0.4),radial_mask("two",-0.2)]};
-        let expected=render_develop_recipe(&source,&recipe);
-        let caches=Mutex::new(RendererCaches::default());
-        let first=render_develop_recipe_cached(&source,"source",&recipe,&caches,None).unwrap();
-        let second=render_develop_recipe_cached(&source,"source",&recipe,&caches,None).unwrap();
-        assert_eq!(first,expected);assert_eq!(second,expected);
-        let expected=Arc::new(expected);
-        std::thread::scope(|scope|{for _ in 0..4{let source=&source;let recipe=&recipe;let expected=Arc::clone(&expected);scope.spawn(move||assert_eq!(render_develop_recipe(source,recipe),*expected));}});
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(96, 64, |x, y| {
+            image::Rgb([(x * 2) as u8, (y * 3) as u8, (x + y) as u8])
+        }));
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.25,
+                clarity: 12.0,
+                crop_left: 0.1,
+                crop_width: 0.8,
+                ..BasicAdjustments::neutral()
+            },
+            masks: vec![linear_mask("one", 0.4), radial_mask("two", -0.2)],
+        };
+        let expected = render_develop_recipe(&source, &recipe);
+        let caches = Mutex::new(RendererCaches::default());
+        let first =
+            render_develop_recipe_cached(&source, "source", &recipe, &caches, None).unwrap();
+        let second =
+            render_develop_recipe_cached(&source, "source", &recipe, &caches, None).unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        let expected = Arc::new(expected);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let source = &source;
+                let recipe = &recipe;
+                let expected = Arc::clone(&expected);
+                scope.spawn(move || assert_eq!(render_develop_recipe(source, recipe), *expected));
+            }
+        });
     }
 
     #[test]
     fn stale_preview_generation_is_rejected_before_rendering() {
-        let source=image::DynamicImage::new_rgb8(32,24);
-        let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:Vec::new()};
-        let caches=Mutex::new(RendererCaches::default());
-        let generation=AtomicU64::new(2);
-        let error=render_develop_recipe_cached(&source,"source",&recipe,&caches,Some((&generation,1))).unwrap_err();
-        assert_eq!(error.to_string(),"Superseded Develop preview.");
-        assert_eq!(caches.lock().unwrap().intermediates.misses,0);
+        let source = image::DynamicImage::new_rgb8(32, 24);
+        let recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: Vec::new(),
+        };
+        let caches = Mutex::new(RendererCaches::default());
+        let generation = AtomicU64::new(2);
+        let error = render_develop_recipe_cached(
+            &source,
+            "source",
+            &recipe,
+            &caches,
+            Some((&generation, 1)),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Superseded Develop preview.");
+        assert_eq!(caches.lock().unwrap().intermediates.misses, 0);
     }
 
     #[test]
     #[ignore = "opt-in Milestone 10 renderer benchmark; run scripts/benchmark-renderer.ps1"]
     fn milestone_10_renderer_performance_checkpoint() {
-        let root=std::env::temp_dir().join(format!("keepframe-m10-benchmark-{}",Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("keepframe-m10-benchmark-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let fixture=root.join("representative.jpg");
-        let source=RgbImage::from_fn(720,480,|x,y|image::Rgb([((x*7+y*3)%256)as u8,((x*2+y*5)%256)as u8,((x+y*11)%256)as u8]));
-        image::DynamicImage::ImageRgb8(source).save_with_format(&fixture,ImageFormat::Jpeg).unwrap();
+        let fixture = root.join("representative.jpg");
+        let source = RgbImage::from_fn(720, 480, |x, y| {
+            image::Rgb([
+                ((x * 7 + y * 3) % 256) as u8,
+                ((x * 2 + y * 5) % 256) as u8,
+                ((x + y * 11) % 256) as u8,
+            ])
+        });
+        image::DynamicImage::ImageRgb8(source)
+            .save_with_format(&fixture, ImageFormat::Jpeg)
+            .unwrap();
 
-        let caches=Mutex::new(RendererCaches::default());
-        let started=Instant::now();let(_,cold_decoded)=decode_preview_cached(&fixture,&caches).unwrap();let jpeg_decode_cold=started.elapsed();
-        let started=Instant::now();let(source_key,warm_decoded)=decode_preview_cached(&fixture,&caches).unwrap();let jpeg_decode_warm=started.elapsed();
-        let started=Instant::now();let working=warm_decoded.to_rgb8();let working_buffer=started.elapsed();
-        let started=Instant::now();let oriented=decode_standard_with_orientation(&fixture).unwrap();let orientation_decode=started.elapsed();
+        let caches = Mutex::new(RendererCaches::default());
+        let started = Instant::now();
+        let (_, cold_decoded) = decode_preview_cached(&fixture, &caches).unwrap();
+        let jpeg_decode_cold = started.elapsed();
+        let started = Instant::now();
+        let (source_key, warm_decoded) = decode_preview_cached(&fixture, &caches).unwrap();
+        let jpeg_decode_warm = started.elapsed();
+        let started = Instant::now();
+        let working = warm_decoded.to_rgb8();
+        let working_buffer = started.elapsed();
+        let started = Instant::now();
+        let oriented = decode_standard_with_orientation(&fixture).unwrap();
+        let orientation_decode = started.elapsed();
 
-        let stage=|settings|{let started=Instant::now();let output=apply_colour_adjustments_to_image(&oriented,settings);(started.elapsed(),output)};
-        let(tone,_)=stage(BasicAdjustments{exposure:0.35,contrast:12.0,highlights:-20.0,shadows:18.0,..BasicAdjustments::neutral()});
-        let(white_balance,_)=stage(BasicAdjustments{light_balance:10.0,tint:-4.0,..BasicAdjustments::neutral()});
-        let(presence,_)=stage(BasicAdjustments{texture:10.0,clarity:8.0,dehaze:5.0,..BasicAdjustments::neutral()});
-        let(colour,_)=stage(BasicAdjustments{colour_boost:8.0,saturation:6.0,..BasicAdjustments::neutral()});
-        let global_settings=BasicAdjustments{exposure:0.35,highlights:-20.0,shadows:18.0,texture:10.0,clarity:8.0,saturation:6.0,..BasicAdjustments::neutral()};
-        let global_recipe=DevelopRecipe{schema_version:2,settings:global_settings,masks:Vec::new()};
-        let started=Instant::now();let global_cold=render_develop_recipe_cached(&warm_decoded,&source_key,&global_recipe,&caches,None).unwrap();let overall_cold=started.elapsed();
-        let started=Instant::now();let global_warm=render_develop_recipe_cached(&warm_decoded,&source_key,&global_recipe,&caches,None).unwrap();let overall_warm=started.elapsed();
-        assert_eq!(global_cold,global_warm);assert!(Arc::ptr_eq(&cold_decoded,&warm_decoded));
+        let stage = |settings| {
+            let started = Instant::now();
+            let output = apply_colour_adjustments_to_image(&oriented, settings);
+            (started.elapsed(), output)
+        };
+        let (tone, _) = stage(BasicAdjustments {
+            exposure: 0.35,
+            contrast: 12.0,
+            highlights: -20.0,
+            shadows: 18.0,
+            ..BasicAdjustments::neutral()
+        });
+        let (white_balance, _) = stage(BasicAdjustments {
+            light_balance: 10.0,
+            tint: -4.0,
+            ..BasicAdjustments::neutral()
+        });
+        let (presence, _) = stage(BasicAdjustments {
+            texture: 10.0,
+            clarity: 8.0,
+            dehaze: 5.0,
+            ..BasicAdjustments::neutral()
+        });
+        let (colour, _) = stage(BasicAdjustments {
+            colour_boost: 8.0,
+            saturation: 6.0,
+            ..BasicAdjustments::neutral()
+        });
+        let global_settings = BasicAdjustments {
+            exposure: 0.35,
+            highlights: -20.0,
+            shadows: 18.0,
+            texture: 10.0,
+            clarity: 8.0,
+            saturation: 6.0,
+            ..BasicAdjustments::neutral()
+        };
+        let global_recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: global_settings,
+            masks: Vec::new(),
+        };
+        let started = Instant::now();
+        let global_cold =
+            render_develop_recipe_cached(&warm_decoded, &source_key, &global_recipe, &caches, None)
+                .unwrap();
+        let overall_cold = started.elapsed();
+        let started = Instant::now();
+        let global_warm =
+            render_develop_recipe_cached(&warm_decoded, &source_key, &global_recipe, &caches, None)
+                .unwrap();
+        let overall_warm = started.elapsed();
+        assert_eq!(global_cold, global_warm);
+        assert!(Arc::ptr_eq(&cold_decoded, &warm_decoded));
 
-        let mask=linear_mask("profile",0.25);let started=Instant::now();let mask_coverage=prepared_mask_coverage(&mask,720,480,None);let mask_raster=started.elapsed();
-        let mut mask_times=Vec::new();
-        for count in [1,5,10]{let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:(0..count).map(|index|linear_mask(&format!("mask-{index}"),0.12)).collect()};let started=Instant::now();let output=render_develop_recipe(&warm_decoded,&recipe);mask_times.push((count,started.elapsed(),output));}
-        let cached_mask_recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks:vec![linear_mask("cached",0.12)]};
-        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&cached_mask_recipe,&caches,None).unwrap();let cached_mask_cold=started.elapsed();
-        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&cached_mask_recipe,&caches,None).unwrap();let cached_mask_warm=started.elapsed();
-        let semantic_recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments::neutral(),masks:vec![semantic_mask("subject",0.2)]};
-        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&semantic_recipe,&caches,None).unwrap();let semantic_cold=started.elapsed();
-        let started=Instant::now();render_develop_recipe_cached(&warm_decoded,&source_key,&semantic_recipe,&caches,None).unwrap();let semantic_warm=started.elapsed();
-        let geometry=BasicAdjustments{crop_left:0.1,crop_top:0.1,crop_width:0.8,crop_height:0.8,rotate_quadrants:1,straighten:1.5,..BasicAdjustments::neutral()};
-        let started=Instant::now();let transformed=apply_geometry(&global_cold,geometry);let transform=started.elapsed();
-        let started=Instant::now();let resized=image::imageops::resize(&global_cold,360,240,image::imageops::FilterType::Triangle);let resize=started.elapsed();
-        let started=Instant::now();let encoded=encode_srgb_png(&image::DynamicImage::ImageRgb8(global_cold.clone())).unwrap();let png_encode=started.elapsed();
-        let full=image::DynamicImage::ImageRgb8(image::imageops::resize(&working,2400,1600,image::imageops::FilterType::Triangle));
-        let started=Instant::now();let full_render=apply_adjustments_to_image(&full,global_settings);let full_render_elapsed=started.elapsed();
-        let started=Instant::now();let full_png=encode_srgb_png(&image::DynamicImage::ImageRgb8(full_render)).unwrap();let full_png_elapsed=started.elapsed();
-        let cache=caches.lock().unwrap();
+        let mask = linear_mask("profile", 0.25);
+        let started = Instant::now();
+        let mask_coverage = prepared_mask_coverage(&mask, 720, 480, None);
+        let mask_raster = started.elapsed();
+        let mut mask_times = Vec::new();
+        for count in [1, 5, 10] {
+            let recipe = DevelopRecipe {
+                schema_version: 2,
+                settings: BasicAdjustments {
+                    exposure: 0.2,
+                    ..BasicAdjustments::neutral()
+                },
+                masks: (0..count)
+                    .map(|index| linear_mask(&format!("mask-{index}"), 0.12))
+                    .collect(),
+            };
+            let started = Instant::now();
+            let output = render_develop_recipe(&warm_decoded, &recipe);
+            mask_times.push((count, started.elapsed(), output));
+        }
+        let cached_mask_recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments {
+                exposure: 0.2,
+                ..BasicAdjustments::neutral()
+            },
+            masks: vec![linear_mask("cached", 0.12)],
+        };
+        let started = Instant::now();
+        render_develop_recipe_cached(
+            &warm_decoded,
+            &source_key,
+            &cached_mask_recipe,
+            &caches,
+            None,
+        )
+        .unwrap();
+        let cached_mask_cold = started.elapsed();
+        let started = Instant::now();
+        render_develop_recipe_cached(
+            &warm_decoded,
+            &source_key,
+            &cached_mask_recipe,
+            &caches,
+            None,
+        )
+        .unwrap();
+        let cached_mask_warm = started.elapsed();
+        let semantic_recipe = DevelopRecipe {
+            schema_version: 2,
+            settings: BasicAdjustments::neutral(),
+            masks: vec![semantic_mask("subject", 0.2)],
+        };
+        let started = Instant::now();
+        render_develop_recipe_cached(&warm_decoded, &source_key, &semantic_recipe, &caches, None)
+            .unwrap();
+        let semantic_cold = started.elapsed();
+        let started = Instant::now();
+        render_develop_recipe_cached(&warm_decoded, &source_key, &semantic_recipe, &caches, None)
+            .unwrap();
+        let semantic_warm = started.elapsed();
+        let geometry = BasicAdjustments {
+            crop_left: 0.1,
+            crop_top: 0.1,
+            crop_width: 0.8,
+            crop_height: 0.8,
+            rotate_quadrants: 1,
+            straighten: 1.5,
+            ..BasicAdjustments::neutral()
+        };
+        let started = Instant::now();
+        let transformed = apply_geometry(&global_cold, geometry);
+        let transform = started.elapsed();
+        let started = Instant::now();
+        let resized = image::imageops::resize(
+            &global_cold,
+            360,
+            240,
+            image::imageops::FilterType::Triangle,
+        );
+        let resize = started.elapsed();
+        let started = Instant::now();
+        let encoded =
+            encode_srgb_png(&image::DynamicImage::ImageRgb8(global_cold.clone())).unwrap();
+        let png_encode = started.elapsed();
+        let full = image::DynamicImage::ImageRgb8(image::imageops::resize(
+            &working,
+            2400,
+            1600,
+            image::imageops::FilterType::Triangle,
+        ));
+        let started = Instant::now();
+        let full_render = apply_adjustments_to_image(&full, global_settings);
+        let full_render_elapsed = started.elapsed();
+        let started = Instant::now();
+        let full_png = encode_srgb_png(&image::DynamicImage::ImageRgb8(full_render)).unwrap();
+        let full_png_elapsed = started.elapsed();
+        let cache = caches.lock().unwrap();
         eprintln!("M10 benchmark 720x480: jpeg-decode cold={jpeg_decode_cold:?} warm={jpeg_decode_warm:?}; orientation+decode={orientation_decode:?}; working-buffer={working_buffer:?}; tone/exposure={tone:?}; white-balance={white_balance:?}; presence={presence:?}; colour={colour:?}; mask-raster={mask_raster:?}; masks 1={:?} 5={:?} 10={:?}; cached-mask cold={cached_mask_cold:?} warm={cached_mask_warm:?}; semantic cold={semantic_cold:?} warm={semantic_warm:?}; transform={transform:?}; resize={resize:?}; PNG={png_encode:?}; overall cold={overall_cold:?} warm={overall_warm:?}; full 2400x1600 render={full_render_elapsed:?} PNG={full_png_elapsed:?}; cache decoded={}B intermediate={}B mask={}B semantic={}B hits={}/{}/{}/{} evictions={}/{}/{}/{}; outputs={}+{}B coverage={} transformed={}x{} resized={}x{}",mask_times[0].1,mask_times[1].1,mask_times[2].1,cache.decoded.used_bytes,cache.intermediates.used_bytes,cache.masks.used_bytes,cache.semantics.used_bytes,cache.decoded.hits,cache.intermediates.hits,cache.masks.hits,cache.semantics.hits,cache.decoded.evictions,cache.intermediates.evictions,cache.masks.evictions,cache.semantics.evictions,encoded.len(),full_png.len(),mask_coverage.iter().sum::<f32>(),transformed.width(),transformed.height(),resized.width(),resized.height());
-        assert!(overall_cold<Duration::from_millis(250));assert!(mask_times[0].1<Duration::from_millis(300));assert!(mask_times[1].1<Duration::from_millis(800));assert!(mask_times[2].1<Duration::from_millis(1500));assert!(full_render_elapsed+full_png_elapsed<Duration::from_secs(3));
+        assert!(overall_cold < Duration::from_millis(250));
+        assert!(mask_times[0].1 < Duration::from_millis(300));
+        assert!(mask_times[1].1 < Duration::from_millis(800));
+        assert!(mask_times[2].1 < Duration::from_millis(1500));
+        assert!(full_render_elapsed + full_png_elapsed < Duration::from_secs(3));
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     #[ignore = "manual performance checkpoint; run with --ignored --nocapture"]
     fn develop_render_performance_checkpoint() {
-        let preview = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| { image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        let preview = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
         }));
-        let recipe = BasicAdjustments { exposure: 0.35, highlights: -20.0, shadows: 18.0, texture: 10.0, clarity: 8.0, saturation: 6.0, ..BasicAdjustments::neutral() };
+        let recipe = BasicAdjustments {
+            exposure: 0.35,
+            highlights: -20.0,
+            shadows: 18.0,
+            texture: 10.0,
+            clarity: 8.0,
+            saturation: 6.0,
+            ..BasicAdjustments::neutral()
+        };
         let preview_started = Instant::now();
         let rendered_preview = apply_adjustments_to_image(&preview, recipe);
         let preview_elapsed = preview_started.elapsed();
         let warm_started = Instant::now();
         let cache_key = Sha256::digest(serde_json::to_vec(&recipe).unwrap());
         let warm_elapsed = warm_started.elapsed();
-        let full = image::DynamicImage::ImageRgb8(image::imageops::resize(&rendered_preview, 2400, 1600, image::imageops::FilterType::Triangle,));
+        let full = image::DynamicImage::ImageRgb8(image::imageops::resize(
+            &rendered_preview,
+            2400,
+            1600,
+            image::imageops::FilterType::Triangle,
+        ));
         let export_started = Instant::now();
-        let encoded = encode_srgb_png(&image::DynamicImage::ImageRgb8(apply_adjustments_to_image(&full, recipe,))).unwrap();
+        let encoded = encode_srgb_png(&image::DynamicImage::ImageRgb8(apply_adjustments_to_image(
+            &full, recipe,
+        )))
+        .unwrap();
         let export_elapsed = export_started.elapsed();
         eprintln!("Develop checkpoint: 720x480 preview={preview_elapsed:?}; warm recipe/cache-key={warm_elapsed:?}; 2400x1600 render+PNG={export_elapsed:?}; output={} bytes", encoded.len());
         assert!(!cache_key.is_empty());
@@ -7004,8 +9365,62 @@ mod tests {
     #[test]
     #[ignore = "manual Milestone 8 renderer and masking profile; run with --ignored --nocapture"]
     fn mask_render_performance_checkpoint() {
-        let source=image::DynamicImage::ImageRgb8(RgbImage::from_fn(720,480,|x,y| {image::Rgb([(x%220)as u8+20,(y%210)as u8+20,((x+y)%200)as u8+30,])
-        }));let bytes=encode_srgb_png(&source).unwrap();let started=Instant::now();let decoded=image::load_from_memory(&bytes).unwrap();let decode=started.elapsed();let started=Instant::now();let global=apply_colour_adjustments_to_image(&decoded,BasicAdjustments{exposure:0.2,clarity:5.0,..BasicAdjustments::neutral()},);let global_elapsed=started.elapsed();let mask=linear_mask("profile",0.25);let started=Instant::now();let mut sum=0.0;for y in 0..decoded.height(){for x in 0..decoded.width(){sum+=mask_coverage(&mask,x,y,decoded.width(),decoded.height());}}let raster=started.elapsed();let mut times=Vec::new();for count in [1,5,10]{let masks=(0..count).map(|index|linear_mask(&format!("mask-{index}"),0.12)).collect();let recipe=DevelopRecipe{schema_version:2,settings:BasicAdjustments{exposure:0.2,..BasicAdjustments::neutral()},masks,};let started=Instant::now();let rendered=render_develop_recipe(&decoded,&recipe);times.push((count,started.elapsed(),rendered));}let started=Instant::now();let resized=image::imageops::resize(&global,360,240,image::imageops::FilterType::Triangle);let resize=started.elapsed();let started=Instant::now();let encoded=encode_srgb_png(&image::DynamicImage::ImageRgb8(times[0].2.clone())).unwrap();let encode=started.elapsed();eprintln!("Milestone 8 profile 720x480: decode={decode:?}; global={global_elapsed:?}; one-mask-raster={raster:?}; local-composite 1={:?} 5={:?} 10={:?}; resize={resize:?}; encode={encode:?}; coverage={sum:.1}; bytes={} resized={}x{}",times[0].1,times[1].1,times[2].1,encoded.len(),resized.width(),resized.height());assert!(times[2].1<Duration::from_secs(30));
+        let source = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| {
+            image::Rgb([
+                (x % 220) as u8 + 20,
+                (y % 210) as u8 + 20,
+                ((x + y) % 200) as u8 + 30,
+            ])
+        }));
+        let bytes = encode_srgb_png(&source).unwrap();
+        let started = Instant::now();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        let decode = started.elapsed();
+        let started = Instant::now();
+        let global = apply_colour_adjustments_to_image(
+            &decoded,
+            BasicAdjustments {
+                exposure: 0.2,
+                clarity: 5.0,
+                ..BasicAdjustments::neutral()
+            },
+        );
+        let global_elapsed = started.elapsed();
+        let mask = linear_mask("profile", 0.25);
+        let started = Instant::now();
+        let mut sum = 0.0;
+        for y in 0..decoded.height() {
+            for x in 0..decoded.width() {
+                sum += mask_coverage(&mask, x, y, decoded.width(), decoded.height());
+            }
+        }
+        let raster = started.elapsed();
+        let mut times = Vec::new();
+        for count in [1, 5, 10] {
+            let masks = (0..count)
+                .map(|index| linear_mask(&format!("mask-{index}"), 0.12))
+                .collect();
+            let recipe = DevelopRecipe {
+                schema_version: 2,
+                settings: BasicAdjustments {
+                    exposure: 0.2,
+                    ..BasicAdjustments::neutral()
+                },
+                masks,
+            };
+            let started = Instant::now();
+            let rendered = render_develop_recipe(&decoded, &recipe);
+            times.push((count, started.elapsed(), rendered));
+        }
+        let started = Instant::now();
+        let resized =
+            image::imageops::resize(&global, 360, 240, image::imageops::FilterType::Triangle);
+        let resize = started.elapsed();
+        let started = Instant::now();
+        let encoded = encode_srgb_png(&image::DynamicImage::ImageRgb8(times[0].2.clone())).unwrap();
+        let encode = started.elapsed();
+        eprintln!("Milestone 8 profile 720x480: decode={decode:?}; global={global_elapsed:?}; one-mask-raster={raster:?}; local-composite 1={:?} 5={:?} 10={:?}; resize={resize:?}; encode={encode:?}; coverage={sum:.1}; bytes={} resized={}x{}",times[0].1,times[1].1,times[2].1,encoded.len(),resized.width(),resized.height());
+        assert!(times[2].1 < Duration::from_secs(30));
     }
 
     #[test]
@@ -7181,36 +9596,84 @@ mod tests {
     fn built_in_develop_presets_are_valid_and_never_include_geometry() {
         let presets = built_in_presets();
         assert_eq!(presets.len(), 13);
-        assert!(presets.iter().all(|preset| preset.clone().validate(false).is_ok()));
-        assert!(presets.iter().all(|preset| preset.settings.crop_left == 0.0 && preset.settings.crop_width == 1.0 && !preset.settings.horizontal_flip));
-        assert!(presets.iter().any(|preset| preset.name == "Black & White" && preset.settings.saturation == -100.0));
+        assert!(presets
+            .iter()
+            .all(|preset| preset.clone().validate(false).is_ok()));
+        assert!(presets.iter().all(|preset| preset.settings.crop_left == 0.0
+            && preset.settings.crop_width == 1.0
+            && !preset.settings.horizontal_flip));
+        assert!(presets
+            .iter()
+            .any(|preset| preset.name == "Black & White" && preset.settings.saturation == -100.0));
     }
 
     #[test]
     fn untrusted_preset_rejects_unknown_categories_and_out_of_range_values() {
-        let invalid_category = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["filesystem".into()], settings: BasicAdjustments::neutral(), built_in: false, };
+        let invalid_category = DevelopPreset {
+            schema_version: 1,
+            id: "user".into(),
+            name: "Unsafe".into(),
+            categories: vec!["filesystem".into()],
+            settings: BasicAdjustments::neutral(),
+            built_in: false,
+        };
         assert!(invalid_category.validate(true).is_err());
-        let invalid_value = DevelopPreset { schema_version: 1, id: "user".into(), name: "Unsafe".into(), categories: vec!["tone".into()], settings: BasicAdjustments { exposure: 99.0, ..BasicAdjustments::neutral() }, built_in: false, };
+        let invalid_value = DevelopPreset {
+            schema_version: 1,
+            id: "user".into(),
+            name: "Unsafe".into(),
+            categories: vec!["tone".into()],
+            settings: BasicAdjustments {
+                exposure: 99.0,
+                ..BasicAdjustments::neutral()
+            },
+            built_in: false,
+        };
         assert!(invalid_value.validate(true).is_err());
     }
 
     #[test]
     fn auto_analysis_is_image_dependent_conservative_and_preserves_geometry() {
-        let dark = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([45, 18, 8])));
-        let bright = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([245, 245, 245]),));
-        let current = BasicAdjustments { crop_left: 0.1, crop_top: 0.1, crop_width: 0.8, crop_height: 0.8, rotate_quadrants: 1, ..BasicAdjustments::neutral() };
-        let dark_proposal = auto_proposal(&dark, current); let bright_proposal = auto_proposal(&bright, current);
+        let dark =
+            image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([45, 18, 8])));
+        let bright = image::DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            96,
+            64,
+            image::Rgb([245, 245, 245]),
+        ));
+        let current = BasicAdjustments {
+            crop_left: 0.1,
+            crop_top: 0.1,
+            crop_width: 0.8,
+            crop_height: 0.8,
+            rotate_quadrants: 1,
+            ..BasicAdjustments::neutral()
+        };
+        let dark_proposal = auto_proposal(&dark, current);
+        let bright_proposal = auto_proposal(&bright, current);
         assert!(dark_proposal.settings.exposure > current.exposure);
         assert!(bright_proposal.settings.highlights < current.highlights);
-        assert_eq!((dark_proposal.settings.crop_left, dark_proposal.settings.crop_width, dark_proposal.settings.rotate_quadrants), (0.1, 0.8, 1));
+        assert_eq!(
+            (
+                dark_proposal.settings.crop_left,
+                dark_proposal.settings.crop_width,
+                dark_proposal.settings.rotate_quadrants
+            ),
+            (0.1, 0.8, 1)
+        );
         assert!(dark_proposal.statistics.p50 < bright_proposal.statistics.p50);
-        assert!(dark_proposal.explanation.iter().any(|line| line.contains("White balance unchanged")));
+        assert!(dark_proposal
+            .explanation
+            .iter()
+            .any(|line| line.contains("White balance unchanged")));
     }
 
     #[test]
     fn statistics_detect_clipping_and_channel_cast_without_a_model() {
         let mut source = RgbImage::from_pixel(100, 1, image::Rgb([50, 30, 20]));
-        for index in 0..10 { source.put_pixel(index, 0, image::Rgb([255, 255, 255])); }
+        for index in 0..10 {
+            source.put_pixel(index, 0, image::Rgb([255, 255, 255]));
+        }
         let statistics = image_statistics(&image::DynamicImage::ImageRgb8(source));
         assert!(statistics.highlight_clip_fraction > 0.05);
         assert!(statistics.red_green_blue[0] > statistics.red_green_blue[2]);
@@ -7220,13 +9683,25 @@ mod tests {
     #[test]
     #[ignore = "manual Milestone 7 performance checkpoint; run with --ignored --nocapture"]
     fn intelligent_editing_performance_checkpoint() {
-        let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| { image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * 3 + y) % 256) as u8])
+        let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(720, 480, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * 3 + y) % 256) as u8])
         }));
-        let histogram_started = Instant::now(); let statistics = image_statistics(&image); let histogram_elapsed = histogram_started.elapsed();
-        let auto_started = Instant::now(); let proposal = auto_proposal(&image, BasicAdjustments::neutral()); let auto_elapsed = auto_started.elapsed();
-        let preview_started = Instant::now(); let _preview = apply_adjustments_to_image(&image, proposal.settings); let preview_elapsed = preview_started.elapsed();
-        let warm_preset = built_in_presets().into_iter().find(|preset| preset.id == "warm").unwrap();
-        let preset_started = Instant::now(); let _preset = apply_adjustments_to_image(&image, warm_preset.settings); let preset_elapsed = preset_started.elapsed();
+        let histogram_started = Instant::now();
+        let statistics = image_statistics(&image);
+        let histogram_elapsed = histogram_started.elapsed();
+        let auto_started = Instant::now();
+        let proposal = auto_proposal(&image, BasicAdjustments::neutral());
+        let auto_elapsed = auto_started.elapsed();
+        let preview_started = Instant::now();
+        let _preview = apply_adjustments_to_image(&image, proposal.settings);
+        let preview_elapsed = preview_started.elapsed();
+        let warm_preset = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "warm")
+            .unwrap();
+        let preset_started = Instant::now();
+        let _preset = apply_adjustments_to_image(&image, warm_preset.settings);
+        let preset_elapsed = preset_started.elapsed();
         eprintln!("M7 checkpoint: histogram={histogram_elapsed:?}; auto={auto_elapsed:?}; auto-preview={preview_elapsed:?}; warm-preset-render={preset_elapsed:?}; samples={}", statistics.samples);
         assert_eq!(statistics.luminance_bins.len(), 64);
     }
@@ -7294,14 +9769,19 @@ mod tests {
 
     #[test]
     fn fresh_catalogue_records_the_current_immutable_migration() {
-        let root = std::env::temp_dir().join(format!("keepframe-migration-test-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-migration-test-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let connection = open_db(&root).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         let recorded: i64 = connection
-            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=5", [], |row| row.get(0),)
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=5",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(recorded, 1);
@@ -7316,18 +9796,36 @@ mod tests {
         connection.execute("INSERT INTO assets(id,captured_at,latitude,longitude)VALUES('embedded','2026-09-12T12:00:00Z',56.2,-3.0),('none','2026-09-12T12:00:00Z',NULL,NULL)", []).unwrap();
         migrations::apply_v5(&mut connection, true, 4).unwrap();
         let embedded: (Option<f64>, Option<f64>, String) = connection.query_row("SELECT embedded_latitude,embedded_longitude,location_source FROM assets WHERE id='embedded'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        let none: String = connection.query_row("SELECT location_source FROM assets WHERE id='none'", [], |row| row.get(0),).unwrap();
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let none: String = connection
+            .query_row(
+                "SELECT location_source FROM assets WHERE id='none'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(embedded, (Some(56.2), Some(-3.0), "embedded".into()));
         assert_eq!(none, "none");
         assert_eq!(version, 5);
-        assert_eq!(connection.query_row("SELECT COUNT(*) FROM schema_migrations WHERE version=5", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=5",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
         migrations::apply_v5(&mut connection, true, 5).unwrap();
     }
 
     #[test]
     fn interrupted_import_is_marked_for_attention_without_removing_files() {
-        let root = std::env::temp_dir().join(format!("keepframe-import-recovery-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-import-recovery-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let staged = root.join(".keepframe/staging/import-1/photo.jpg");
         fs::create_dir_all(staged.parent().unwrap()).unwrap();
@@ -7345,8 +9843,11 @@ mod tests {
 
         let notice = recover_interrupted_operations(&root).unwrap().unwrap();
         let connection = open_db(&root).unwrap();
-        let state: String = connection.query_row("SELECT state FROM imports WHERE id='import-1'", [], |row| { row.get(0)
-            }).unwrap();
+        let state: String = connection
+            .query_row("SELECT state FROM imports WHERE id='import-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(state, "needs_attention");
         assert!(notice.contains("Original source files were not deleted"));
         assert_eq!(fs::read(&staged).unwrap(), b"staged pixels");
@@ -7356,7 +9857,8 @@ mod tests {
 
     #[test]
     fn interrupted_trash_is_reconciled_without_deleting_the_managed_file() {
-        let root = std::env::temp_dir().join(format!("keepframe-trash-recovery-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-trash-recovery-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let trashed = root.join(".keepframe/Trash/operation-1/item-1/photo.jpg");
         fs::create_dir_all(trashed.parent().unwrap()).unwrap();
@@ -7375,7 +9877,13 @@ mod tests {
 
         let notice = recover_interrupted_operations(&root).unwrap().unwrap();
         let connection = open_db(&root).unwrap();
-        let is_trashed: Option<String> = connection.query_row("SELECT trashed_at FROM assets WHERE id='asset-1'", [], |row| row.get(0),).unwrap();
+        let is_trashed: Option<String> = connection
+            .query_row(
+                "SELECT trashed_at FROM assets WHERE id='asset-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(is_trashed.is_some());
         assert!(notice.contains("without deleting files"));
         assert_eq!(fs::read(&trashed).unwrap(), b"managed pixels");
@@ -7385,12 +9893,17 @@ mod tests {
 
     #[test]
     fn generated_jpeg_png_and_tiff_fixtures_produce_thumbnails_and_reject_corruption() {
-        let root = std::env::temp_dir().join(format!("keepframe-image-fixtures-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-image-fixtures-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(24, 12, |x, y| {
             image::Rgb([(x * 10) as u8, (y * 20) as u8, 90])
         }));
-        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff),] {
+        for (name, format) in [
+            ("fixture.jpg", image::ImageFormat::Jpeg),
+            ("fixture.png", image::ImageFormat::Png),
+            ("fixture.tiff", image::ImageFormat::Tiff),
+        ] {
             let source = root.join(name);
             let thumbnail = root.join(format!("{name}.thumbnail.jpg"));
             image.save_with_format(&source, format).unwrap();
@@ -7407,26 +9920,51 @@ mod tests {
 
     #[test]
     fn jpeg_png_and_tiff_full_resolution_geometry_matches_preview_renderer() {
-        let root = std::env::temp_dir().join(format!("keepframe-geometry-parity-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-geometry-parity-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let source_image = image::DynamicImage::ImageRgb8(RgbImage::from_fn(30, 20, |x, y| {
             image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8])
         }));
-        let adjustments = BasicAdjustments { crop_left: 0.2, crop_top: 0.1, crop_width: 0.5, crop_height: 0.75, rotate_quadrants: 1, straighten: 3.0, ..BasicAdjustments::default() }.validate().unwrap();
-        for (name, format) in [("fixture.jpg", image::ImageFormat::Jpeg), ("fixture.png", image::ImageFormat::Png), ("fixture.tiff", image::ImageFormat::Tiff),] {
+        let adjustments = BasicAdjustments {
+            crop_left: 0.2,
+            crop_top: 0.1,
+            crop_width: 0.5,
+            crop_height: 0.75,
+            rotate_quadrants: 1,
+            straighten: 3.0,
+            ..BasicAdjustments::default()
+        }
+        .validate()
+        .unwrap();
+        for (name, format) in [
+            ("fixture.jpg", image::ImageFormat::Jpeg),
+            ("fixture.png", image::ImageFormat::Png),
+            ("fixture.tiff", image::ImageFormat::Tiff),
+        ] {
             let source = root.join(name);
             source_image.save_with_format(&source, format).unwrap();
             let before_hash = hash_file(&source).unwrap();
             let preview = apply_adjustments_to_image(&image::open(&source).unwrap(), adjustments);
-            let full_resolution = prepare_full_resolution_image(&source, Some((30, 20)), &root.join("working")).unwrap();
+            let full_resolution =
+                prepare_full_resolution_image(&source, Some((30, 20)), &root.join("working"))
+                    .unwrap();
             let candidate = apply_adjustments_to_image(&full_resolution, adjustments);
             assert_eq!(candidate.dimensions(), (10, 23), "{name}");
             assert_eq!(candidate, preview, "{name}");
             let output = root.join(format!("{name}.candidate.png"));
-            fs::write(&output, encode_srgb_png(&image::DynamicImage::ImageRgb8(candidate)).unwrap(),).unwrap();
+            fs::write(
+                &output,
+                encode_srgb_png(&image::DynamicImage::ImageRgb8(candidate)).unwrap(),
+            )
+            .unwrap();
             let rendered = image::open(&output).unwrap();
             assert_eq!((rendered.width(), rendered.height()), (10, 23), "{name}");
-            assert_eq!(hash_file(&source).unwrap(), before_hash, "{name} source was modified");
+            assert_eq!(
+                hash_file(&source).unwrap(),
+                before_hash,
+                "{name} source was modified"
+            );
         }
         let malformed = root.join("malformed.tiff");
         fs::write(&malformed, b"not an image").unwrap();
@@ -7458,7 +9996,14 @@ mod tests {
             tagged: None,
             located: None,
             trashed: Some(true),
-            rating: None, edited: None, file_type: None, sort: None, descending: None,
+            rating: None,
+            edited: None,
+            file_type: None,
+            sort: None,
+            descending: None,
+            collection_id: None,
+            version_mode: None,
+            stack_mode: None,
         };
         let normal = AssetFilter {
             decision: "all".into(),
@@ -7471,10 +10016,18 @@ mod tests {
             tagged: None,
             located: None,
             trashed: Some(false),
-            rating: None, edited: None, file_type: None, sort: None, descending: None,
+            rating: None,
+            edited: None,
+            file_type: None,
+            sort: None,
+            descending: None,
+            collection_id: None,
+            version_mode: None,
+            stack_mode: None,
         };
-        let (trash_where, _) = asset_where(&trashed);
-        let (normal_where, _) = asset_where(&normal);
+        let connection = Connection::open_in_memory().unwrap();
+        let (trash_where, _) = asset_where(&connection, &trashed).unwrap();
+        let (normal_where, _) = asset_where(&connection, &normal).unwrap();
         assert!(trash_where.contains("trash_items"));
         assert!(trash_where.contains("empty_failed"));
         assert!(!trash_where.contains("recycled"));
@@ -7482,7 +10035,26 @@ mod tests {
     }
 
     fn map_filter() -> AssetFilter {
-        AssetFilter { decision: "all".into(), search: String::new(), year: None, tag: None, date_from: None, date_to: None, camera: None, tagged: None, located: None, trashed: Some(false), rating: None, edited: None, file_type: None, sort: None, descending: None, }
+        AssetFilter {
+            decision: "all".into(),
+            search: String::new(),
+            year: None,
+            tag: None,
+            date_from: None,
+            date_to: None,
+            camera: None,
+            tagged: None,
+            located: None,
+            trashed: Some(false),
+            rating: None,
+            edited: None,
+            file_type: None,
+            sort: None,
+            descending: None,
+            collection_id: None,
+            version_mode: None,
+            stack_mode: None,
+        }
     }
 
     #[test]
@@ -7490,23 +10062,62 @@ mod tests {
         let root = std::env::temp_dir().join(format!("keepframe-map-query-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let connection = open_db(&root).unwrap();
-        for (id, decision, latitude, longitude) in [("keep", "keep", 56.12, -3.1), ("discard", "discard", 56.15, -3.2), ("bad", "keep", 95.0, -3.3), ("none", "keep", 0.0, 0.0),] {
+        for (id, decision, latitude, longitude) in [
+            ("keep", "keep", 56.12, -3.1),
+            ("discard", "discard", 56.15, -3.2),
+            ("bad", "keep", 95.0, -3.3),
+            ("none", "keep", 0.0, 0.0),
+        ] {
             connection.execute("INSERT INTO assets(id,filename,decision,captured_at,latitude,longitude,location_source,thumbnail_path,created_at)VALUES(?1,?1,?2,'2026-09-12T12:00:00Z',?3,?4,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", params![id, decision, latitude, longitude]).unwrap();
         }
         connection.execute("UPDATE assets SET latitude=NULL,longitude=NULL,location_source='none' WHERE id='none'", []).unwrap();
-        let all = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None, },).unwrap();
+        let all = query_map_assets_in(
+            &connection,
+            &MapQuery {
+                filter: map_filter(),
+                bounds: None,
+            },
+        )
+        .unwrap();
         assert_eq!(all.len(), 2);
-        let mut keep = map_filter(); keep.decision = "keep".into();
-        let bounded = query_map_assets_in(&connection, &MapQuery { filter: keep, bounds: Some(MapBounds { south: 56.0, west: -3.15, north: 56.13, east: -3.0, }), },).unwrap();
+        let mut keep = map_filter();
+        keep.decision = "keep".into();
+        let bounded = query_map_assets_in(
+            &connection,
+            &MapQuery {
+                filter: keep,
+                bounds: Some(MapBounds {
+                    south: 56.0,
+                    west: -3.15,
+                    north: 56.13,
+                    east: -3.0,
+                }),
+            },
+        )
+        .unwrap();
         assert_eq!(bounded.len(), 1);
         assert_eq!(bounded[0].id, "keep");
-        assert!(query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: Some(MapBounds { south: 20.0, west: 0.0, north: -20.0, east: 1.0 }) }).is_err());
-        drop(connection); fs::remove_dir_all(root).unwrap();
+        assert!(query_map_assets_in(
+            &connection,
+            &MapQuery {
+                filter: map_filter(),
+                bounds: Some(MapBounds {
+                    south: 20.0,
+                    west: 0.0,
+                    north: -20.0,
+                    east: 1.0
+                })
+            }
+        )
+        .is_err());
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn manual_location_preserves_embedded_gps_and_can_be_cleared() {
-        let root = std::env::temp_dir().join(format!("keepframe-manual-location-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-manual-location-{}", Uuid::new_v4()));
         initialise_layout(&root).unwrap();
         let mut connection = open_db(&root).unwrap();
         connection.execute("INSERT INTO assets(id,filename,captured_at,latitude,longitude,embedded_latitude,embedded_longitude,location_source,thumbnail_path,created_at)VALUES('asset','photo.jpg','2026-09-12T12:00:00Z',56.1,-3.1,56.1,-3.1,'embedded','thumb.jpg','2026-09-12T12:00:00Z')", []).unwrap();
@@ -7516,7 +10127,8 @@ mod tests {
         assert!(clear_manual_location_in(&mut connection, "asset").unwrap());
         let restored: (Option<f64>, Option<f64>, Option<f64>, String) = connection.query_row("SELECT latitude,longitude,manual_latitude,location_source FROM assets WHERE id='asset'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(restored, (Some(56.1), Some(-3.1), None, "embedded".into()));
-        drop(connection); fs::remove_dir_all(root).unwrap();
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7532,11 +10144,22 @@ mod tests {
             }
             tx.commit().unwrap();
             let started = Instant::now();
-            let markers = query_map_assets_in(&connection, &MapQuery { filter: map_filter(), bounds: None, },).unwrap();
+            let markers = query_map_assets_in(
+                &connection,
+                &MapQuery {
+                    filter: map_filter(),
+                    bounds: None,
+                },
+            )
+            .unwrap();
             assert_eq!(markers.len(), expected);
-            assert!(started.elapsed() < Duration::from_secs(5), "lightweight marker query should remain responsive");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "lightweight marker query should remain responsive"
+            );
         }
-        drop(connection); fs::remove_dir_all(root).unwrap();
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn prompt_keeps_safety_constraints() {
@@ -7756,11 +10379,17 @@ mod tests {
         connection.execute("INSERT INTO assets(id,filename,captured_at,thumbnail_path,created_at)VALUES('asset','managed.jpg','2026-09-02T12:00:00Z','thumb.jpg','2026-09-02T12:00:00Z')", []).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'jpg','managed',19,0)", params![managed.to_string_lossy(), hash]).unwrap();
 
-        assert!(verified_representation_path(&connection, &hash).unwrap().is_some());
+        assert!(verified_representation_path(&connection, &hash)
+            .unwrap()
+            .is_some());
         fs::write(&managed, b"damaged").unwrap();
-        assert!(verified_representation_path(&connection, &hash).unwrap().is_none());
+        assert!(verified_representation_path(&connection, &hash)
+            .unwrap()
+            .is_none());
         fs::remove_file(&managed).unwrap();
-        assert!(verified_representation_path(&connection, &hash).unwrap().is_none());
+        assert!(verified_representation_path(&connection, &hash)
+            .unwrap()
+            .is_none());
         assert!(path_is_catalogued(&connection, &managed).unwrap());
 
         drop(connection);
@@ -7837,7 +10466,10 @@ mod tests {
         assert!(asset_tags(&connection, "asset").unwrap().is_empty());
         assert!(!undo_last_action_in(&mut connection).unwrap());
         set_decision_in(&mut connection, "asset", "keep").unwrap();
-        assert!(!redo_last_action_in(&mut connection).unwrap(), "a new catalogue branch must invalidate redo history");
+        assert!(
+            !redo_last_action_in(&mut connection).unwrap(),
+            "a new catalogue branch must invalidate redo history"
+        );
 
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
@@ -7895,7 +10527,14 @@ mod tests {
             tagged: None,
             located: None,
             trashed: None,
-            rating: None, edited: None, file_type: None, sort: None, descending: None,
+            rating: None,
+            edited: None,
+            file_type: None,
+            sort: None,
+            descending: None,
+            collection_id: None,
+            version_mode: None,
+            stack_mode: None,
         };
         let first = query_assets_in(&connection, &keep, 0, 1).unwrap();
         assert_eq!(first.total, 2);
@@ -7916,7 +10555,14 @@ mod tests {
             tagged: None,
             located: None,
             trashed: None,
-            rating: None, edited: None, file_type: None, sort: None, descending: None,
+            rating: None,
+            edited: None,
+            file_type: None,
+            sort: None,
+            descending: None,
+            collection_id: None,
+            version_mode: None,
+            stack_mode: None,
         };
         let result = query_assets_in(&connection, &tag_search, 0, 50).unwrap();
         assert_eq!(result.total, 1);
@@ -7955,13 +10601,16 @@ mod tests {
 
     #[test]
     fn ai_results_must_be_distinct_decodable_and_plausibly_sized() {
-        let root = std::env::temp_dir().join(format!("keepframe-ai-output-test-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("keepframe-ai-output-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let source = root.join("source.png");
         let same = root.join("same.png");
         let changed = root.join("changed.png");
         let tiny = root.join("tiny.png");
-        image::DynamicImage::new_rgb8(128, 96).save(&source).unwrap();
+        image::DynamicImage::new_rgb8(128, 96)
+            .save(&source)
+            .unwrap();
         fs::copy(&source, &same).unwrap();
         let mut altered = image::RgbImage::new(128, 96);
         altered.put_pixel(0, 0, image::Rgb([12, 34, 56]));
@@ -7989,33 +10638,76 @@ mod tests {
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','original',1,0)", params![original.to_string_lossy(),original_hash]).unwrap();
         drop(connection);
 
-        let prepared = prepare_cloud_handoff_in(&root, "asset", "chatgpt", "Improve the lighting naturally.").unwrap();
+        let prepared =
+            prepare_cloud_handoff_in(&root, "asset", "chatgpt", "Improve the lighting naturally.")
+                .unwrap();
         assert_eq!(image::open(&prepared).unwrap().dimensions(), (128, 96));
-        assert_eq!(fs::read_to_string(prepared.with_extension("prompt.txt")).unwrap(), "Improve the lighting naturally.");
+        assert_eq!(
+            fs::read_to_string(prepared.with_extension("prompt.txt")).unwrap(),
+            "Improve the lighting naturally."
+        );
         let connection = open_db(&root).unwrap();
-        let waiting: String = connection.query_row("SELECT state FROM jobs WHERE asset_id='asset'", [], |row| { row.get(0)
-            }).unwrap();
+        let waiting: String = connection
+            .query_row("SELECT state FROM jobs WHERE asset_id='asset'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(waiting, "waiting_external");
         drop(connection);
 
         let malformed = root.join("returned-malformed.png");
         fs::write(&malformed, b"not an image").unwrap();
-        assert!(import_returned_edit_in(&root, "asset", &malformed, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).is_err());
-        assert!(import_returned_edit_in(&root, "asset", &original, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).is_err());
+        assert!(import_returned_edit_in(
+            &root,
+            "asset",
+            &malformed,
+            "chatgpt",
+            "Improve the lighting naturally.",
+            Some(test_recipe("asset"))
+        )
+        .is_err());
+        assert!(import_returned_edit_in(
+            &root,
+            "asset",
+            &original,
+            "chatgpt",
+            "Improve the lighting naturally.",
+            Some(test_recipe("asset"))
+        )
+        .is_err());
         let tiny = root.join("returned-tiny.png");
         image::DynamicImage::new_rgb8(4, 4).save(&tiny).unwrap();
-        assert!(import_returned_edit_in(&root, "asset", &tiny, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset"))).is_err());
+        assert!(import_returned_edit_in(
+            &root,
+            "asset",
+            &tiny,
+            "chatgpt",
+            "Improve the lighting naturally.",
+            Some(test_recipe("asset"))
+        )
+        .is_err());
 
         let returned = root.join("returned-edited.png");
         let mut returned_pixels = image::RgbImage::new(128, 96);
         returned_pixels.put_pixel(127, 95, image::Rgb([200, 180, 160]));
         returned_pixels.save(&returned).unwrap();
-        let job = import_returned_edit_in(&root, "asset", &returned, "chatgpt", "Improve the lighting naturally.", Some(test_recipe("asset")),).unwrap();
+        let job = import_returned_edit_in(
+            &root,
+            "asset",
+            &returned,
+            "chatgpt",
+            "Improve the lighting naturally.",
+            Some(test_recipe("asset")),
+        )
+        .unwrap();
         assert_eq!(job.state, "succeeded");
         assert_eq!(job.recipe.unwrap().asset_id, "asset");
         let connection = open_db(&root).unwrap();
         let (job_state, batch_state): (String, String) = connection.query_row("SELECT j.state,b.state FROM jobs j JOIN batches b ON b.id=j.batch_id WHERE j.id=?1", [&job.id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
-        assert_eq!((job_state, batch_state), ("succeeded".into(), "succeeded".into()));
+        assert_eq!(
+            (job_state, batch_state),
+            ("succeeded".into(), "succeeded".into())
+        );
         let (provider, prompt, recipe_json, source_hash, version_state): (String, String, String, String, String) = connection.query_row("SELECT provider,prompt,recipe_json,source_hash,state FROM versions WHERE asset_id='asset'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
         assert_eq!(provider, "chatgpt");
         assert_eq!(prompt, "Improve the lighting naturally.");
@@ -8023,8 +10715,17 @@ mod tests {
         assert_eq!(source_hash, original_hash);
         assert_eq!(version_state, "candidate");
         assert_eq!(hash_file(&original).unwrap(), original_hash);
-        assert_eq!(transition_job_in(&connection, &job.id, "accept").unwrap(), "accepted");
-        let preferred: String = connection.query_row("SELECT preferred_version_id FROM assets WHERE id='asset'", [], |row| row.get(0),).unwrap();
+        assert_eq!(
+            transition_job_in(&connection, &job.id, "accept").unwrap(),
+            "accepted"
+        );
+        let preferred: String = connection
+            .query_row(
+                "SELECT preferred_version_id FROM assets WHERE id='asset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!preferred.is_empty());
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
@@ -8086,7 +10787,10 @@ mod tests {
         assert_eq!(metadata.2.as_deref(), Some("Test Camera"));
         assert_eq!((metadata.3, metadata.4), (Some(56.2), Some(-2.9)));
         assert_eq!(metadata.5.as_deref(), Some(version.id.as_str()));
-        assert_eq!(asset_tags(&connection, "asset").unwrap(), vec!["Family", "replaced"]);
+        assert_eq!(
+            asset_tags(&connection, "asset").unwrap(),
+            vec!["Family", "replaced"]
+        );
         assert_eq!(hash_file(&original).unwrap(), original_hash);
         assert!(Path::new(&version.image_url).starts_with(root.join("Edits")));
 
@@ -8129,43 +10833,364 @@ mod tests {
         let connection = open_db(&root).unwrap();
         let count: i64 = connection.query_row("SELECT count(*) FROM watch_events WHERE folder_path=?1 AND path=?2 AND kind='new_file'", params![r"D:\Camera",path.to_string_lossy()], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
-        assert_eq!(watch_kind(&EventKind::Create(notify::event::CreateKind::File)), Some("new_file"));
-        assert_eq!(watch_kind(&EventKind::Remove(notify::event::RemoveKind::File)), Some("file_removed"));
+        assert_eq!(
+            watch_kind(&EventKind::Create(notify::event::CreateKind::File)),
+            Some("new_file")
+        );
+        assert_eq!(
+            watch_kind(&EventKind::Remove(notify::event::RemoveKind::File)),
+            Some("file_removed")
+        );
         drop(connection);
         fs::remove_dir_all(&root).unwrap();
     }
 
-    fn insert_library_productivity_assets(connection:&mut Connection,count:usize){let tx=connection.transaction().unwrap();for index in 0..count{let id=format!("asset-{index:05}");tx.execute("INSERT INTO assets(id,filename,decision,rating,captured_at,thumbnail_path,created_at)VALUES(?1,?2,'undecided',0,?3,'thumb.jpg',?3)",params![id,format!("photo-{index:05}.jpg"),format!("2026-{:02}-{:02}T12:00:00Z",1+(index%9),1+(index%27))]).unwrap();tx.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES(?1,?2,?3,?4,'jpg',?5,1,0)",params![format!("representation-{index:05}"),id,format!("C:/benchmark/photo-{index:05}.jpg"),format!("sha-{index:05}"),format!("photo-{index:05}")]).unwrap();}tx.commit().unwrap();}
-
-    #[test]
-    fn batch_metadata_is_one_transaction_and_undo_redo_unit(){
-        let root=std::env::temp_dir().join(format!("keepframe-batch-metadata-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,3);
-        let result=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()],patch:json!({"rating":5,"decision":"keep","title":"Portfolio","addKeywords":["Client","Select"]})}).unwrap();assert_eq!((result.requested,result.changed),(3,3));
-        let audit:i64=connection.query_row("SELECT count(*) FROM audit_log WHERE action='batch_assets'",[],|row|row.get(0)).unwrap();let updated:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=5 AND decision='keep' AND title='Portfolio'",[],|row|row.get(0)).unwrap();assert_eq!((audit,updated),(1,3));assert!(undo_last_action_in(&mut connection).unwrap());let restored:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=0 AND decision='undecided' AND title IS NULL",[],|row|row.get(0)).unwrap();assert_eq!(restored,3);assert!(redo_last_action_in(&mut connection).unwrap());let redone:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=5 AND decision='keep'",[],|row|row.get(0)).unwrap();assert_eq!(redone,3);assert!(batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into(),"missing".into()],patch:json!({"rating":1})}).is_err());let rolled_back:i64=connection.query_row("SELECT rating FROM assets WHERE id='asset-00000'",[],|row|row.get(0)).unwrap();assert_eq!(rolled_back,5);let removed=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into()],patch:json!({"removeKeywords":["client"]})}).unwrap();assert_eq!(removed.changed,1);assert_eq!(asset_tags(&connection,"asset-00000").unwrap(),vec!["Select"]);drop(connection);fs::remove_dir_all(root).unwrap();
+    fn insert_library_productivity_assets(connection: &mut Connection, count: usize) {
+        let tx = connection.transaction().unwrap();
+        for index in 0..count {
+            let id = format!("asset-{index:05}");
+            tx.execute("INSERT INTO assets(id,filename,decision,rating,captured_at,thumbnail_path,created_at)VALUES(?1,?2,'undecided',0,?3,'thumb.jpg',?3)",params![id,format!("photo-{index:05}.jpg"),format!("2026-{:02}-{:02}T12:00:00Z",1+(index%9),1+(index%27))]).unwrap();
+            tx.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES(?1,?2,?3,?4,'jpg',?5,1,0)",params![format!("representation-{index:05}"),id,format!("C:/benchmark/photo-{index:05}.jpg"),format!("sha-{index:05}"),format!("photo-{index:05}")]).unwrap();
+        }
+        tx.commit().unwrap();
     }
 
     #[test]
-    fn explicit_semantic_mask_sync_uses_fresh_ids_and_restores_target_recipe(){
-        let root=std::env::temp_dir().join(format!("keepframe-sync-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,2);
-        let mut source=DevelopRecipe::neutral();source.settings.exposure=1.0;source.settings.crop_left=0.2;source.settings.crop_width=0.7;source.masks.push(linear_mask("manual-source",0.2));source.masks.push(semantic_mask("semantic-source",0.4));let mut target=DevelopRecipe::neutral();target.settings.exposure = -1.0;target.masks.push(linear_mask("target-mask",-0.2));
-        {let tx=connection.transaction().unwrap();write_develop_recipe(&tx,"asset-00000",&source).unwrap();write_develop_recipe(&tx,"asset-00001",&target).unwrap();tx.commit().unwrap();}
-        let global=sync_develop_settings_in(&mut connection,SyncDevelopRequest{source_id:"asset-00000".into(),target_ids:vec!["asset-00001".into()],categories:vec!["tone".into()]}).unwrap();assert_eq!(global.changed,1);let global_synced=develop_recipe_in(&connection,"asset-00001").unwrap();assert_eq!(global_synced.settings.exposure,1.0);assert_eq!(global_synced.settings.crop_left,0.0);assert_eq!(global_synced.masks,target.masks);assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap(),target);
-        let result=sync_develop_settings_in(&mut connection,SyncDevelopRequest{source_id:"asset-00000".into(),target_ids:vec!["asset-00001".into()],categories:vec!["transform".into(),"manualMasks".into(),"intelligentMasks".into()]}).unwrap();assert_eq!(result.changed,1);let synced=develop_recipe_in(&connection,"asset-00001").unwrap();assert_eq!(synced.settings.crop_left,0.2);assert_eq!(synced.settings.crop_width,0.7);assert_eq!(synced.masks.len(),2);assert!(synced.masks.iter().all(|mask|mask.id!="manual-source"&&mask.id!="semantic-source"&&mask.id!="target-mask"));assert!(synced.masks.iter().any(|mask|matches!(mask.geometry,MaskGeometry::Semantic{..})));assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap(),target);assert!(redo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap().settings.crop_left,0.2);drop(connection);fs::remove_dir_all(root).unwrap();
+    fn batch_metadata_is_one_transaction_and_undo_redo_unit() {
+        let root =
+            std::env::temp_dir().join(format!("keepframe-batch-metadata-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        insert_library_productivity_assets(&mut connection, 3);
+        let result=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()],patch:json!({"rating":5,"decision":"keep","title":"Portfolio","addKeywords":["Client","Select"]})}).unwrap();
+        assert_eq!((result.requested, result.changed), (3, 3));
+        let audit: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM audit_log WHERE action='batch_assets'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let updated:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=5 AND decision='keep' AND title='Portfolio'",[],|row|row.get(0)).unwrap();
+        assert_eq!((audit, updated), (1, 3));
+        assert!(undo_last_action_in(&mut connection).unwrap());
+        let restored:i64=connection.query_row("SELECT count(*) FROM assets WHERE rating=0 AND decision='undecided' AND title IS NULL",[],|row|row.get(0)).unwrap();
+        assert_eq!(restored, 3);
+        assert!(redo_last_action_in(&mut connection).unwrap());
+        let redone: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM assets WHERE rating=5 AND decision='keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(redone, 3);
+        assert!(batch_metadata_in(
+            &mut connection,
+            BatchMetadataRequest {
+                asset_ids: vec!["asset-00000".into(), "missing".into()],
+                patch: json!({"rating":1})
+            }
+        )
+        .is_err());
+        let rolled_back: i64 = connection
+            .query_row(
+                "SELECT rating FROM assets WHERE id='asset-00000'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rolled_back, 5);
+        let removed = batch_metadata_in(
+            &mut connection,
+            BatchMetadataRequest {
+                asset_ids: vec!["asset-00000".into()],
+                patch: json!({"removeKeywords":["client"]}),
+            },
+        )
+        .unwrap();
+        assert_eq!(removed.changed, 1);
+        assert_eq!(
+            asset_tags(&connection, "asset-00000").unwrap(),
+            vec!["Select"]
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn preset_batch_preserves_masks_and_excluded_categories_for_mixed_edits(){
-        let root=std::env::temp_dir().join(format!("keepframe-preset-batch-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,3);let mut edited=DevelopRecipe::neutral();edited.settings.texture=17.0;edited.masks.push(linear_mask("preserved",0.3));{let tx=connection.transaction().unwrap();write_develop_recipe(&tx,"asset-00001",&edited).unwrap();tx.commit().unwrap();}let preset=built_in_presets().into_iter().find(|item|item.id=="warm").unwrap();let result=apply_preset_batch_in(&mut connection,vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()],&preset).unwrap();assert_eq!(result.changed,3);let first=develop_recipe_in(&connection,"asset-00000").unwrap();let mixed=develop_recipe_in(&connection,"asset-00001").unwrap();assert_eq!(first.settings.light_balance,14.0);assert_eq!(mixed.settings.texture,17.0);assert_eq!(mixed.masks,edited.masks);assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00001").unwrap(),edited);drop(connection);fs::remove_dir_all(root).unwrap();
+    fn explicit_semantic_mask_sync_uses_fresh_ids_and_restores_target_recipe() {
+        let root = std::env::temp_dir().join(format!("keepframe-sync-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        insert_library_productivity_assets(&mut connection, 2);
+        let mut source = DevelopRecipe::neutral();
+        source.settings.exposure = 1.0;
+        source.settings.crop_left = 0.2;
+        source.settings.crop_width = 0.7;
+        source.masks.push(linear_mask("manual-source", 0.2));
+        source.masks.push(semantic_mask("semantic-source", 0.4));
+        let mut target = DevelopRecipe::neutral();
+        target.settings.exposure = -1.0;
+        target.masks.push(linear_mask("target-mask", -0.2));
+        {
+            let tx = connection.transaction().unwrap();
+            write_develop_recipe(&tx, "asset-00000", &source).unwrap();
+            write_develop_recipe(&tx, "asset-00001", &target).unwrap();
+            tx.commit().unwrap();
+        }
+        let global = sync_develop_settings_in(
+            &mut connection,
+            SyncDevelopRequest {
+                source_id: "asset-00000".into(),
+                target_ids: vec!["asset-00001".into()],
+                categories: vec!["tone".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(global.changed, 1);
+        let global_synced = develop_recipe_in(&connection, "asset-00001").unwrap();
+        assert_eq!(global_synced.settings.exposure, 1.0);
+        assert_eq!(global_synced.settings.crop_left, 0.0);
+        assert_eq!(global_synced.masks, target.masks);
+        assert!(undo_last_action_in(&mut connection).unwrap());
+        assert_eq!(
+            develop_recipe_in(&connection, "asset-00001").unwrap(),
+            target
+        );
+        let result = sync_develop_settings_in(
+            &mut connection,
+            SyncDevelopRequest {
+                source_id: "asset-00000".into(),
+                target_ids: vec!["asset-00001".into()],
+                categories: vec![
+                    "transform".into(),
+                    "manualMasks".into(),
+                    "intelligentMasks".into(),
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(result.changed, 1);
+        let synced = develop_recipe_in(&connection, "asset-00001").unwrap();
+        assert_eq!(synced.settings.crop_left, 0.2);
+        assert_eq!(synced.settings.crop_width, 0.7);
+        assert_eq!(synced.masks.len(), 2);
+        assert!(synced.masks.iter().all(|mask| mask.id != "manual-source"
+            && mask.id != "semantic-source"
+            && mask.id != "target-mask"));
+        assert!(synced
+            .masks
+            .iter()
+            .any(|mask| matches!(mask.geometry, MaskGeometry::Semantic { .. })));
+        assert!(undo_last_action_in(&mut connection).unwrap());
+        assert_eq!(
+            develop_recipe_in(&connection, "asset-00001").unwrap(),
+            target
+        );
+        assert!(redo_last_action_in(&mut connection).unwrap());
+        assert_eq!(
+            develop_recipe_in(&connection, "asset-00001")
+                .unwrap()
+                .settings
+                .crop_left,
+            0.2
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn batch_auto_is_independent_failure_tolerant_cancellable_and_one_undo_unit(){
-        let root=std::env::temp_dir().join(format!("keepframe-batch-auto-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();insert_library_productivity_assets(&mut connection,3);let dark=root.join("dark.png");let saturated=root.join("saturated.png");image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96,64,image::Rgb([25,25,25]))).save(&dark).unwrap();image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96,64,image::Rgb([210,20,20]))).save(&saturated).unwrap();connection.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1",params!["asset-00000",dark.to_string_lossy()]).unwrap();connection.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1",params!["asset-00001",saturated.to_string_lossy()]).unwrap();connection.execute("UPDATE assets SET thumbnail_path=?2 WHERE id=?1",params!["asset-00002",root.join("missing.png").to_string_lossy()]).unwrap();let requested=vec!["asset-00000".into(),"asset-00001".into(),"asset-00002".into()];let counter=AtomicU64::new(7);let(ids,recipes,failed,low)=analyse_auto_batch(&root,&requested,7,&counter,None).unwrap();assert_eq!((ids.len(),recipes.len(),failed),(2,2,1));assert!(low>=1);assert_ne!(recipes[0].settings,recipes[1].settings);let applied=apply_batch_recipes(&mut connection,ids,recipes).unwrap();assert_eq!(applied.changed,2);assert!(undo_last_action_in(&mut connection).unwrap());assert_eq!(develop_recipe_in(&connection,"asset-00000").unwrap(),DevelopRecipe::neutral());counter.store(8,Ordering::Release);let(stale_ids,_,stale_failed,_)=analyse_auto_batch(&root,&requested,7,&counter,None).unwrap();assert!(stale_ids.is_empty());assert_eq!(stale_failed,0);drop(connection);fs::remove_dir_all(root).unwrap();
+    fn preset_batch_preserves_masks_and_excluded_categories_for_mixed_edits() {
+        let root = std::env::temp_dir().join(format!("keepframe-preset-batch-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        insert_library_productivity_assets(&mut connection, 3);
+        let mut edited = DevelopRecipe::neutral();
+        edited.settings.texture = 17.0;
+        edited.masks.push(linear_mask("preserved", 0.3));
+        {
+            let tx = connection.transaction().unwrap();
+            write_develop_recipe(&tx, "asset-00001", &edited).unwrap();
+            tx.commit().unwrap();
+        }
+        let preset = built_in_presets()
+            .into_iter()
+            .find(|item| item.id == "warm")
+            .unwrap();
+        let result = apply_preset_batch_in(
+            &mut connection,
+            vec![
+                "asset-00000".into(),
+                "asset-00001".into(),
+                "asset-00002".into(),
+            ],
+            &preset,
+        )
+        .unwrap();
+        assert_eq!(result.changed, 3);
+        let first = develop_recipe_in(&connection, "asset-00000").unwrap();
+        let mixed = develop_recipe_in(&connection, "asset-00001").unwrap();
+        assert_eq!(first.settings.light_balance, 14.0);
+        assert_eq!(mixed.settings.texture, 17.0);
+        assert_eq!(mixed.masks, edited.masks);
+        assert!(undo_last_action_in(&mut connection).unwrap());
+        assert_eq!(
+            develop_recipe_in(&connection, "asset-00001").unwrap(),
+            edited
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[ignore="manual Milestone 12 Library benchmark; run scripts/benchmark-library.ps1"]
-    fn library_productivity_performance_checkpoint(){
-        let root=std::env::temp_dir().join(format!("keepframe-library-benchmark-{}",Uuid::new_v4()));initialise_layout(&root).unwrap();let mut connection=open_db(&root).unwrap();let started=Instant::now();insert_library_productivity_assets(&mut connection,10_000);let insert_ms=started.elapsed().as_millis();let base_filter=AssetFilter{decision:"all".into(),search:String::new(),year:None,tag:None,date_from:None,date_to:None,camera:None,tagged:None,located:None,trashed:None,rating:Some(0),edited:None,file_type:Some("jpg".into()),sort:Some("filename".into()),descending:Some(false)};let started=Instant::now();let page=query_assets_in(&connection,&base_filter,0,240).unwrap();let filter_ms=started.elapsed().as_millis();let mut rating_sort=base_filter.clone();rating_sort.rating=None;rating_sort.sort=Some("rating".into());rating_sort.descending=Some(true);let started=Instant::now();let sorted=query_assets_in(&connection,&rating_sort,0,240).unwrap();let sort_ms=started.elapsed().as_millis();let ids:Vec<String>=(0..1_000).map(|index|format!("asset-{index:05}")).collect();let started=Instant::now();let rated=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:ids.clone(),patch:json!({"rating":4})}).unwrap();let rating_ms=started.elapsed().as_millis();let started=Instant::now();let keyworded=batch_metadata_in(&mut connection,BatchMetadataRequest{asset_ids:ids,patch:json!({"addKeywords":["Benchmark"]})}).unwrap();let keyword_ms=started.elapsed().as_millis();let mut source=DevelopRecipe::neutral();source.settings.exposure=0.75;{let tx=connection.transaction().unwrap();write_develop_recipe(&tx,"asset-00000",&source).unwrap();tx.commit().unwrap();}let sync_targets=(1..=100).map(|index|format!("asset-{index:05}")).collect();let started=Instant::now();let synced=sync_develop_settings_in(&mut connection,SyncDevelopRequest{source_id:"asset-00000".into(),target_ids:sync_targets,categories:vec!["tone".into()]}).unwrap();let sync_ms=started.elapsed().as_millis();println!("M12_LIBRARY_BENCHMARK records=10000 insert_ms={insert_ms} filter_10000_ms={filter_ms} sort_10000_ms={sort_ms} page={} batch_rating_1000_ms={rating_ms} batch_keyword_1000_ms={keyword_ms} sync_100_ms={sync_ms}",page.items.len());assert_eq!(page.total,10_000);assert_eq!(sorted.total,10_000);assert_eq!(rated.changed,1_000);assert_eq!(keyworded.changed,1_000);assert_eq!(synced.changed,100);drop(connection);fs::remove_dir_all(root).unwrap();
+    fn batch_auto_is_independent_failure_tolerant_cancellable_and_one_undo_unit() {
+        let root = std::env::temp_dir().join(format!("keepframe-batch-auto-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        insert_library_productivity_assets(&mut connection, 3);
+        let dark = root.join("dark.png");
+        let saturated = root.join("saturated.png");
+        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([25, 25, 25])))
+            .save(&dark)
+            .unwrap();
+        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, image::Rgb([210, 20, 20])))
+            .save(&saturated)
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sources SET thumbnail_path=?2 WHERE id=(SELECT source_id FROM assets WHERE id=?1)",
+                params!["asset-00000", dark.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sources SET thumbnail_path=?2 WHERE id=(SELECT source_id FROM assets WHERE id=?1)",
+                params!["asset-00001", saturated.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sources SET thumbnail_path=?2 WHERE id=(SELECT source_id FROM assets WHERE id=?1)",
+                params!["asset-00002", root.join("missing.png").to_string_lossy()],
+            )
+            .unwrap();
+        let requested = vec![
+            "asset-00000".into(),
+            "asset-00001".into(),
+            "asset-00002".into(),
+        ];
+        let counter = AtomicU64::new(7);
+        let (ids, recipes, failed, low) =
+            analyse_auto_batch(&root, &requested, 7, &counter, None).unwrap();
+        assert_eq!((ids.len(), recipes.len(), failed), (2, 2, 1));
+        assert!(low >= 1);
+        assert_ne!(recipes[0].settings, recipes[1].settings);
+        let applied = apply_batch_recipes(&mut connection, ids, recipes).unwrap();
+        assert_eq!(applied.changed, 2);
+        assert!(undo_last_action_in(&mut connection).unwrap());
+        assert_eq!(
+            develop_recipe_in(&connection, "asset-00000").unwrap(),
+            DevelopRecipe::neutral()
+        );
+        counter.store(8, Ordering::Release);
+        let (stale_ids, _, stale_failed, _) =
+            analyse_auto_batch(&root, &requested, 7, &counter, None).unwrap();
+        assert!(stale_ids.is_empty());
+        assert_eq!(stale_failed, 0);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual Milestone 12 Library benchmark; run scripts/benchmark-library.ps1"]
+    fn library_productivity_performance_checkpoint() {
+        let root =
+            std::env::temp_dir().join(format!("keepframe-library-benchmark-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        let started = Instant::now();
+        insert_library_productivity_assets(&mut connection, 10_000);
+        let insert_ms = started.elapsed().as_millis();
+        let base_filter = AssetFilter {
+            decision: "all".into(),
+            search: String::new(),
+            year: None,
+            tag: None,
+            date_from: None,
+            date_to: None,
+            camera: None,
+            tagged: None,
+            located: None,
+            trashed: None,
+            rating: Some(0),
+            edited: None,
+            file_type: Some("jpg".into()),
+            sort: Some("filename".into()),
+            descending: Some(false),
+            collection_id: None,
+            version_mode: None,
+            stack_mode: None,
+        };
+        let started = Instant::now();
+        let page = query_assets_in(&connection, &base_filter, 0, 240).unwrap();
+        let filter_ms = started.elapsed().as_millis();
+        let mut rating_sort = base_filter.clone();
+        rating_sort.rating = None;
+        rating_sort.sort = Some("rating".into());
+        rating_sort.descending = Some(true);
+        let started = Instant::now();
+        let sorted = query_assets_in(&connection, &rating_sort, 0, 240).unwrap();
+        let sort_ms = started.elapsed().as_millis();
+        let ids: Vec<String> = (0..1_000)
+            .map(|index| format!("asset-{index:05}"))
+            .collect();
+        let started = Instant::now();
+        let rated = batch_metadata_in(
+            &mut connection,
+            BatchMetadataRequest {
+                asset_ids: ids.clone(),
+                patch: json!({"rating":4}),
+            },
+        )
+        .unwrap();
+        let rating_ms = started.elapsed().as_millis();
+        let started = Instant::now();
+        let keyworded = batch_metadata_in(
+            &mut connection,
+            BatchMetadataRequest {
+                asset_ids: ids,
+                patch: json!({"addKeywords":["Benchmark"]}),
+            },
+        )
+        .unwrap();
+        let keyword_ms = started.elapsed().as_millis();
+        let mut source = DevelopRecipe::neutral();
+        source.settings.exposure = 0.75;
+        {
+            let tx = connection.transaction().unwrap();
+            write_develop_recipe(&tx, "asset-00000", &source).unwrap();
+            tx.commit().unwrap();
+        }
+        let sync_targets = (1..=100).map(|index| format!("asset-{index:05}")).collect();
+        let started = Instant::now();
+        let synced = sync_develop_settings_in(
+            &mut connection,
+            SyncDevelopRequest {
+                source_id: "asset-00000".into(),
+                target_ids: sync_targets,
+                categories: vec!["tone".into()],
+            },
+        )
+        .unwrap();
+        let sync_ms = started.elapsed().as_millis();
+        println!("M12_LIBRARY_BENCHMARK records=10000 insert_ms={insert_ms} filter_10000_ms={filter_ms} sort_10000_ms={sort_ms} page={} batch_rating_1000_ms={rating_ms} batch_keyword_1000_ms={keyword_ms} sync_100_ms={sync_ms}",page.items.len());
+        assert_eq!(page.total, 10_000);
+        assert_eq!(sorted.total, 10_000);
+        assert_eq!(rated.changed, 1_000);
+        assert_eq!(keyworded.changed, 1_000);
+        assert_eq!(synced.changed, 100);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 }

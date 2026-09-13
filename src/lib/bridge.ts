@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchAutoSummary, type BatchJob, type BatchSummary, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryMetadataPatch, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type SyncCategory, type TrashSummary } from "../types";
+import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchAutoSummary, type BatchJob, type BatchSummary, type CatalogueCollection, type CatalogueVersion, type CollectionSet, type Decision, type DevelopPreset, type DevelopRecipe, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryMetadataPatch, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type SmartRule, type StackSummary, type SyncCategory, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -19,6 +19,10 @@ const browserBuiltInDevelopPresets: DevelopPreset[] = [
 ].map(([id, name, changes]) => ({ schemaVersion: 1, id: id as string, name: name as string, categories: ["whiteBalance", "tone", "presence", "colour"], settings: { ...neutralAdjustments, ...(changes as Partial<BasicAdjustments>) }, builtIn: true }));
 let browserJobs = structuredClone(demoJobs);
 const browserTrash = new Set<string>();
+let browserCollections:CatalogueCollection[]=[];
+let browserCollectionSets:CollectionSet[]=[];
+let browserCollectionItems=new Map<string,Set<string>>();
+let browserStacks:StackSummary[]=[];
 type BrowserHistory =
   | { kind: "decision"; id: string; decision: Decision }
   | { kind: "tags"; id: string; tags: string[] }
@@ -84,9 +88,12 @@ const applyRecipeCategories = (target: DevelopRecipe, source: DevelopRecipe, cat
   return next;
 };
 
+const browserRuleMatches=(asset:Asset,rule:SmartRule)=>{const text=(value:unknown)=>String(value??"").toLowerCase();const contains=(value:unknown)=>text(value).includes(text(rule.value));switch(rule.field){case"rating":return rule.operator==="gte"?asset.rating>=Number(rule.value):rule.operator==="lte"?asset.rating<=Number(rule.value):asset.rating===Number(rule.value);case"flag":return asset.decision===rule.value;case"edited":return Boolean(asset.hasEdits)===Boolean(rule.value);case"fileType":return rule.operator==="notContains"?!contains(asset.filename):contains(asset.filename);case"keyword":{const found=asset.tags.some(tag=>rule.operator==="is"?text(tag)===text(rule.value):contains(tag));return rule.operator==="notContains"?!found:found;}case"camera":return rule.operator==="notContains"?!contains(asset.camera):contains(asset.camera);case"versionStatus":return rule.value==="primary"?asset.isPrimary!==false:asset.isPrimary===false;case"hasMultipleVersions":return((asset.sourceVersionCount??1)>1)===Boolean(rule.value);case"stackStatus":return rule.value==="stacked"?Boolean(asset.stackId):!asset.stackId;case"captureDate":case"importDate":{const value=asset.capturedAt;return rule.operator==="before"?value<String(rule.value):rule.operator==="after"?value>String(rule.value):value>=String(rule.value)&&value<=String(rule.secondValue);}default:return true;}};
+const browserCollectionMatches=(asset:Asset,id:string)=>{const collection=browserCollections.find(value=>value.id===id);if(!collection)return false;if(collection.kind==="manual")return browserCollectionItems.get(id)?.has(asset.id)??false;const results=collection.rules.map(rule=>browserRuleMatches(asset,rule));return collection.matchMode==="all"?results.every(Boolean):results.some(Boolean);};
+
 export const api = {
   isNative: tauri,
-  resetBrowserSession():void { if(tauri())return;browserAssets=structuredClone(demoAssets);browserDevelopRecipes.clear();browserDevelopPresets=[];browserExportPresets=[];browserJobs=structuredClone(demoJobs);browserTrash.clear();history.length=0;redoHistory.length=0; },
+  resetBrowserSession():void { if(tauri())return;browserAssets=structuredClone(demoAssets);browserDevelopRecipes.clear();browserDevelopPresets=[];browserExportPresets=[];browserJobs=structuredClone(demoJobs);browserTrash.clear();browserCollections=[];browserCollectionSets=[];browserCollectionItems=new Map();browserStacks=[];history.length=0;redoHistory.length=0; },
   async status(): Promise<LibraryStatus> {
     return tauri() ? invoke("get_library_status") : demoStatus(browserAssets);
   },
@@ -132,13 +139,14 @@ export const api = {
     return invoke("import_xmp_sidecar", { assetId });
   },
   async exportPortableCatalogue(): Promise<string | null> {
-    if (!tauri()) return "D:\\Photo Library\\keepframe-portable-catalogue-v1.json";
+    if (!tauri()) return "D:\\Photo Library\\keepframe-portable-catalogue-v3.json";
     const destination = await open({ directory: true, multiple: false, title: "Choose a local folder for the portable catalogue export" });
     if (typeof destination !== "string") return null;
     const path = await invoke<string>("export_portable_catalogue", { destination });
     await revealItemInDir(path);
     return path;
   },
+  async importPortableCatalogue():Promise<number|null>{if(!tauri())return browserAssets.length;const path=await open({multiple:false,directory:false,title:"Choose a Keepframe portable catalogue",filters:[{name:"Keepframe portable catalogue",extensions:["json"]}]});if(typeof path!=="string")return null;return invoke("import_portable_catalogue",{path});},
   async rescanLibrary(): Promise<IntegrityReport> {
     if (!tauri()) return { scannedAssets: browserAssets.length, missingOriginals: 0, missingDerivedVersions: 0, modifiedOriginals: 0, untrackedManagedFiles: 0, sidecarConflicts: 0, findings: [] };
     return invoke("rescan_library");
@@ -208,7 +216,11 @@ export const api = {
       if (filter.rating !== undefined && asset.rating < filter.rating) return false;
       if (filter.edited !== undefined && Boolean(asset.hasEdits) !== filter.edited) return false;
       if (filter.fileType && !asset.filename.toLowerCase().endsWith(`.${filter.fileType.toLowerCase().replace(/^\./, "")}`)) return false;
-      return !query || `${asset.filename} ${asset.camera ?? ""} ${asset.tags.join(" ")}`.toLocaleLowerCase().includes(query);
+      if(filter.collectionId&&!browserCollectionMatches(asset,filter.collectionId))return false;
+      if(filter.versionMode==="primary"&&asset.isPrimary===false)return false;if(filter.versionMode==="virtual"&&asset.isPrimary!==false)return false;
+      if(filter.stackMode==="stacked"&&!asset.stackId)return false;if(filter.stackMode==="unstacked"&&asset.stackId)return false;
+      if(asset.versionGroupCollapsed&&asset.isPrimary===false)return false;if(asset.stackCollapsed&&asset.stackId&&!asset.isStackTop)return false;
+      return !query || `${asset.filename} ${asset.versionName??""} ${asset.camera ?? ""} ${asset.tags.join(" ")}`.toLocaleLowerCase().includes(query);
     });
     const direction = filter.descending === false ? 1 : -1;
     matching.sort((left, right) => direction * (filter.sort === "filename" ? left.filename.localeCompare(right.filename) : filter.sort === "rating" ? left.rating - right.rating : left.capturedAt.localeCompare(right.capturedAt)) || left.id.localeCompare(right.id));
@@ -222,6 +234,26 @@ export const api = {
     }
     return browserAssets.find((asset) => asset.id === id) ?? null;
   },
+  async catalogueVersions(itemId:string):Promise<CatalogueVersion[]>{if(tauri())return invoke("list_catalogue_versions",{itemId});const item=browserAssets.find(asset=>asset.id===itemId);if(!item)return[];const sourceId=item.sourceId??item.id;return browserAssets.filter(asset=>(asset.sourceId??asset.id)===sourceId).map((asset,index)=>({id:asset.id,sourceId,name:asset.versionName??(asset.isPrimary===false?`Version ${asset.versionIndex??index+1}`:"Primary"),isPrimary:asset.isPrimary!==false,versionIndex:asset.versionIndex??index+1,hasEdits:Boolean(asset.hasEdits),rating:asset.rating,decision:asset.decision}));},
+  async createCatalogueVersion(itemId:string,mode:"current"|"default"|"duplicate",name?:string):Promise<Asset>{if(tauri())return withAssetUrls(await invoke("create_catalogue_version",{request:{itemId,mode,name}}));const source=browserAssets.find(asset=>asset.id===itemId);if(!source)throw new Error("That catalogue item no longer exists.");const sourceId=source.sourceId??source.id;const siblings=browserAssets.filter(asset=>(asset.sourceId??asset.id)===sourceId);const versionIndex=Math.max(1,...siblings.map(asset=>asset.versionIndex??1))+1;const id=crypto.randomUUID();const copyMetadata=mode==="duplicate";const created:Asset={...structuredClone(source),id,sourceId,isPrimary:false,versionIndex,versionName:name?.trim()||`Version ${versionIndex}`,decision:copyMetadata?source.decision:"undecided",rating:copyMetadata?source.rating:0,title:copyMetadata?source.title:undefined,caption:copyMetadata?source.caption:undefined,tags:copyMetadata?[...source.tags]:[],sourceVersionCount:siblings.length+1};for(const sibling of siblings)sibling.sourceVersionCount=siblings.length+1;browserAssets.push(created);if(mode!=="default"&&browserDevelopRecipes.has(itemId))browserDevelopRecipes.set(id,structuredClone(browserDevelopRecipes.get(itemId)!));return created;},
+  async renameCatalogueVersion(itemId:string,name:string):Promise<void>{if(tauri())return invoke("rename_catalogue_version",{itemId,name});const asset=browserAssets.find(value=>value.id===itemId);if(!asset||asset.isPrimary!==false)throw new Error("Only virtual versions can be renamed.");asset.versionName=name.trim();},
+  async deleteCatalogueVersion(itemId:string):Promise<void>{if(tauri()){await invoke("delete_catalogue_version",{itemId});return;}const asset=browserAssets.find(value=>value.id===itemId);if(!asset||asset.isPrimary!==false)throw new Error("The primary item cannot be deleted as a version.");browserAssets=browserAssets.filter(value=>value.id!==itemId);browserDevelopRecipes.delete(itemId);for(const items of browserCollectionItems.values())items.delete(itemId);},
+  async setVersionGroupCollapsed(itemId:string,collapsed:boolean):Promise<void>{if(tauri())return invoke("set_version_group_collapsed",{itemId,collapsed});const item=browserAssets.find(value=>value.id===itemId);if(!item)return;for(const asset of browserAssets.filter(value=>(value.sourceId??value.id)===(item.sourceId??item.id)))asset.versionGroupCollapsed=collapsed;},
+  async collections():Promise<CatalogueCollection[]>{if(tauri())return invoke("list_collections");return browserCollections.map(collection=>({...collection,count:collection.kind==="manual"?(browserCollectionItems.get(collection.id)?.size??0):browserAssets.filter(asset=>browserCollectionMatches(asset,collection.id)).length}));},
+  async saveCollection(request:{id?:string;name:string;kind:"manual"|"smart";setId?:string;matchMode:"all"|"any";rules:SmartRule[]}):Promise<string>{if(tauri())return invoke("save_collection",{request});const id=request.id??crypto.randomUUID();const existing=browserCollections.findIndex(value=>value.id===id);const value:CatalogueCollection={...request,id,position:existing<0?browserCollections.length:browserCollections[existing].position,count:0};if(existing<0)browserCollections.push(value);else browserCollections[existing]=value;if(request.kind==="manual"&&!browserCollectionItems.has(id))browserCollectionItems.set(id,new Set());return id;},
+  async deleteCollection(collectionId:string):Promise<void>{if(tauri())return invoke("delete_collection",{collectionId});browserCollections=browserCollections.filter(value=>value.id!==collectionId);browserCollectionItems.delete(collectionId);},
+  async updateCollectionMembers(collectionId:string,itemIds:string[],add:boolean):Promise<number>{if(tauri())return invoke("update_collection_members",{collectionId,itemIds,add});const items=browserCollectionItems.get(collectionId)??new Set<string>();let changed=0;for(const id of itemIds){if(add&&!items.has(id)){items.add(id);changed++;}else if(!add&&items.delete(id))changed++;}browserCollectionItems.set(collectionId,items);return changed;},
+  async collectionSets():Promise<CollectionSet[]>{return tauri()?invoke("list_collection_sets"):structuredClone(browserCollectionSets);},
+  async createCollectionSet(name:string):Promise<string>{if(tauri())return invoke("create_collection_set",{name});const id=crypto.randomUUID();browserCollectionSets.push({id,name,position:browserCollectionSets.length});return id;},
+  async renameCollectionSet(setId:string,name:string):Promise<void>{if(tauri())return invoke("rename_collection_set",{setId,name});const set=browserCollectionSets.find(value=>value.id===setId);if(set)set.name=name;},
+  async deleteCollectionSet(setId:string):Promise<void>{if(tauri())return invoke("delete_collection_set",{setId});browserCollectionSets=browserCollectionSets.filter(value=>value.id!==setId);for(const collection of browserCollections)if(collection.setId===setId)collection.setId=undefined;},
+  async stacks():Promise<StackSummary[]>{return tauri()?invoke("list_stacks"):structuredClone(browserStacks);},
+  async createStack(itemIds:string[],topItemId:string):Promise<string>{if(tauri())return invoke("create_stack",{itemIds,topItemId});const id=crypto.randomUUID();const members=[topItemId,...[...new Set(itemIds)].filter(value=>value!==topItemId)];browserStacks.push({id,collapsed:true,topItemId,memberIds:members});for(const asset of browserAssets.filter(value=>members.includes(value.id))){asset.stackId=id;asset.stackCount=members.length;asset.stackCollapsed=true;asset.isStackTop=asset.id===topItemId;}return id;},
+  async setStackCollapsed(stackId:string,collapsed:boolean):Promise<void>{if(tauri())return invoke("set_stack_collapsed",{stackId,collapsed});const stack=browserStacks.find(value=>value.id===stackId);if(stack)stack.collapsed=collapsed;for(const asset of browserAssets.filter(value=>value.stackId===stackId))asset.stackCollapsed=collapsed;},
+  async setStackTop(stackId:string,itemId:string):Promise<void>{if(tauri())return invoke("set_stack_top",{stackId,itemId});const stack=browserStacks.find(value=>value.id===stackId);if(stack)stack.topItemId=itemId;for(const asset of browserAssets.filter(value=>value.stackId===stackId))asset.isStackTop=asset.id===itemId;},
+  async addToStack(stackId:string,itemIds:string[]):Promise<number>{if(tauri())return invoke("add_to_stack",{stackId,itemIds});const stack=browserStacks.find(value=>value.id===stackId);if(!stack)throw new Error("That stack no longer exists.");let changed=0;for(const itemId of [...new Set(itemIds)]){const asset=browserAssets.find(value=>value.id===itemId);if(asset&&!asset.stackId&&!stack.memberIds.includes(itemId)){stack.memberIds.push(itemId);asset.stackId=stackId;asset.stackCollapsed=stack.collapsed;asset.isStackTop=false;changed++;}}for(const asset of browserAssets.filter(value=>value.stackId===stackId))asset.stackCount=stack.memberIds.length;return changed;},
+  async removeFromStack(itemId:string):Promise<void>{if(tauri())return invoke("remove_from_stack",{itemId});const asset=browserAssets.find(value=>value.id===itemId);if(!asset?.stackId)return;const stack=browserStacks.find(value=>value.id===asset.stackId);if(!stack)return;stack.memberIds=stack.memberIds.filter(value=>value!==itemId);asset.stackId=undefined;asset.stackCount=0;asset.stackCollapsed=false;asset.isStackTop=false;if(stack.memberIds.length<2){await this.unstack(stack.id);return;}if(stack.topItemId===itemId){stack.topItemId=stack.memberIds[0];const top=browserAssets.find(value=>value.id===stack.topItemId);if(top)top.isStackTop=true;}for(const member of browserAssets.filter(value=>value.stackId===stack.id))member.stackCount=stack.memberIds.length;},
+  async unstack(stackId:string):Promise<void>{if(tauri())return invoke("unstack",{stackId});browserStacks=browserStacks.filter(value=>value.id!==stackId);for(const asset of browserAssets.filter(value=>value.stackId===stackId)){asset.stackId=undefined;asset.stackCount=0;asset.stackCollapsed=false;asset.isStackTop=false;}},
   async mapAssets(filter: AssetFilter, bounds?: MapBounds): Promise<MapAsset[]> {
     if (tauri()) return (await invoke<MapAsset[]>("query_map_assets", { query: { filter, bounds } })).map(withMapAssetUrl);
     const page = await this.assets({ ...filter, located: true }, 0, Number.MAX_SAFE_INTEGER);
