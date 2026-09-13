@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { canonicalToDisplay, displayToCanonical, type MaskTool } from "../lib/masks";
-import type { BasicAdjustments, DevelopMask, MaskPoint } from "../types";
+import type { BasicAdjustments, DevelopMask, LensCorrections, MaskPoint } from "../types";
 
 type Props = {
   mask: DevelopMask | null;
   settings: BasicAdjustments;
   sourceAspect: number;
+  lens?: LensCorrections;
   tool: MaskTool;
   brush: { radius: number; feather: number; flow: number };
   showCoverage: boolean;
@@ -16,10 +17,10 @@ type Props = {
 type Drag = { kind: "create" | "linear-start" | "linear-end" | "radial-centre" | "radial-x" | "radial-y" | "brush"; origin: MaskPoint; original: DevelopMask };
 const pct = (value: number) => value * 100;
 
-export function MaskOverlay({ mask, settings, sourceAspect, tool, brush, showCoverage, onCommit, onCancel }: Props) {
+export function MaskOverlay({ mask, settings, sourceAspect, lens, tool, brush, showCoverage, onCommit, onCancel }: Props) {
   const svg = useRef<SVGSVGElement>(null); const [draft, setDraft] = useState<DevelopMask | null>(mask); const draftRef = useRef<DevelopMask | null>(mask); const [drag, setDrag] = useState<Drag | null>(null); draftRef.current = draft;
   useEffect(() => { if (!drag) setDraft(mask); }, [mask, drag]);
-  const fromEvent = (event: Pick<PointerEvent, "clientX" | "clientY">) => { const bounds = svg.current?.getBoundingClientRect(); if (!bounds) return { x: 0, y: 0 }; return displayToCanonical({ x: (event.clientX - bounds.left) / bounds.width, y: (event.clientY - bounds.top) / bounds.height }, settings, sourceAspect); };
+  const fromEvent = (event: Pick<PointerEvent, "clientX" | "clientY">) => { const bounds = svg.current?.getBoundingClientRect(); if (!bounds) return { x: 0, y: 0 }; return displayToCanonical({ x: (event.clientX - bounds.left) / bounds.width, y: (event.clientY - bounds.top) / bounds.height }, settings, sourceAspect, lens); };
   useEffect(() => {
     if (!drag) return;
     const move = (event: PointerEvent) => {
@@ -51,7 +52,7 @@ export function MaskOverlay({ mask, settings, sourceAspect, tool, brush, showCov
     draftRef.current = original; setDraft(original); setDrag({ kind, origin: point, original });
   };
   const linear = draft.geometry.kind === "linear" ? draft.geometry : null; const radial = draft.geometry.kind === "radial" ? draft.geometry : null; const brushing = draft.geometry.kind === "brush" ? draft.geometry : null; const semantic = draft.geometry.kind === "semantic" ? draft.geometry : null;
-  const shown = (point: MaskPoint) => canonicalToDisplay(point, settings, sourceAspect);
+  const shown = (point: MaskPoint) => canonicalToDisplay(point, settings, sourceAspect, lens);
   const start = linear ? shown(linear.start) : null; const end = linear ? shown(linear.end) : null; const centre = radial ? shown(radial.centre) : null;
   const radialPoint = (angle: number) => { if (!radial) return { x: 0, y: 0 }; const x = radial.radiusX * Math.cos(angle); const y = radial.radiusY * Math.sin(angle); const rotation = radial.rotation * Math.PI / 180; return shown({ x: radial.centre.x + Math.cos(rotation) * x - Math.sin(rotation) * y, y: radial.centre.y + Math.sin(rotation) * x + Math.cos(rotation) * y }); };
   const radialPoints = radial ? Array.from({ length: 48 }, (_, index) => { const point = radialPoint(index / 48 * Math.PI * 2); return `${pct(point.x)},${pct(point.y)}`; }).join(" ") : "";

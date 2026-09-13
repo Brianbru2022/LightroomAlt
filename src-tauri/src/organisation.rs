@@ -935,6 +935,8 @@ mod tests {
             exposure: 0.8,
             ..BasicAdjustments::neutral()
         };
+        recipe.advanced.detail.sharpen_amount = 32.0;
+        recipe.advanced.colour_mixer.bands[1].saturation = 14.0;
         {
             let tx = connection.transaction().unwrap();
             super::super::write_develop_recipe(&tx, "primary", &recipe).unwrap();
@@ -988,6 +990,26 @@ mod tests {
         assert_eq!(
             super::super::develop_recipe_in(&connection, &default).unwrap(),
             DevelopRecipe::neutral()
+        );
+        assert_eq!(
+            super::super::develop_recipe_in(&connection, &duplicate).unwrap(),
+            recipe
+        );
+        let mut sibling_recipe = recipe.clone();
+        sibling_recipe.advanced.detail.sharpen_amount = 72.0;
+        sibling_recipe.advanced.colour_mixer.bands[1].saturation = -18.0;
+        {
+            let tx = connection.transaction().unwrap();
+            super::super::write_develop_recipe(&tx, &current, &sibling_recipe).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            super::super::develop_recipe_in(&connection, "primary").unwrap(),
+            recipe
+        );
+        assert_eq!(
+            super::super::develop_recipe_in(&connection, &current).unwrap(),
+            sibling_recipe
         );
         assert_eq!(
             super::super::develop_recipe_in(&connection, &duplicate).unwrap(),
@@ -1114,7 +1136,7 @@ mod tests {
         );
         assert_eq!(
             super::super::develop_recipe_in(&connection, &current).unwrap(),
-            recipe
+            sibling_recipe
         );
         assert!(health_issues(&connection).unwrap().is_empty());
         assert_eq!(hash_file(&original).unwrap(), before);

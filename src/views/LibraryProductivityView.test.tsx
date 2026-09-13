@@ -46,7 +46,9 @@ describe("Milestone 12 Library productivity",()=>{
     fireEvent.click(screen.getByRole("button",{name:"P1060420.RW2, keep"}),{ctrlKey:true});
     fireEvent.click(screen.getByRole("button",{name:"Sync settings"}));
     const checks=[...document.querySelectorAll<HTMLInputElement>('.sync-options input[type="checkbox"]')].map(input=>input.checked);
-    expect(checks).toEqual([true,true,true,true,false,false,false]);
+    expect(checks.slice(0,4)).toEqual([true,true,true,true]);
+    expect(checks.slice(4).every(Boolean)).toBe(false);
+    expect(checks.slice(4).every(value=>!value)).toBe(true);
     expect(screen.getByText(/does not rerun AI/)).toBeInTheDocument();
   });
 

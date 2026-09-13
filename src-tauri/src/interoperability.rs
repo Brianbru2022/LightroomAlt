@@ -1345,7 +1345,8 @@ mod tests {
         let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let checksum = format!("{:x}", sha2::Sha256::digest(&bytes));
         let recipe = crate::DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: crate::advanced_develop::AdvancedDevelopSettings::default(),
             settings: crate::BasicAdjustments::neutral(),
             masks: vec![crate::DevelopMask {
                 id: "semantic".into(),

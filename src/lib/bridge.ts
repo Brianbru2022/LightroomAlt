@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { neutralAdjustments, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchAutoSummary, type BatchJob, type BatchSummary, type CatalogueCollection, type CatalogueVersion, type CollectionSet, type Decision, type DevelopPreset, type DevelopRecipe, type DiscoveryGroup, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LibraryMetadataPatch, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type SemanticIndexStatus, type SemanticSearchRequest, type SemanticSearchResponse, type SemanticSearchResult, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type SmartCollectionProposal, type SmartRule, type StackSummary, type SyncCategory, type TrashSummary } from "../types";
+import { neutralAdjustments, neutralAdvancedDevelop, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchAutoSummary, type BatchJob, type BatchSummary, type CatalogueCollection, type CatalogueVersion, type CollectionSet, type Decision, type DevelopPreset, type DevelopRecipe, type DiscoveryGroup, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LensProfileStatus, type LibraryMetadataPatch, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type SemanticIndexStatus, type SemanticSearchRequest, type SemanticSearchResponse, type SemanticSearchResult, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type SmartCollectionProposal, type SmartRule, type StackSummary, type SyncCategory, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
@@ -17,7 +17,7 @@ let browserDevelopPresets: DevelopPreset[] = [];
 let browserExportPresets: ExportPreset[] = [];
 const browserBuiltInDevelopPresets: DevelopPreset[] = [
   ["natural", "Natural", {}], ["clean", "Clean", { contrast: 4, clarity: 3, colourBoost: 3 }], ["warm", "Warm", { lightBalance: 14, tint: 2, colourBoost: 6 }], ["cool", "Cool", { lightBalance: -12, tint: -2, highlights: -8 }], ["high-contrast", "High Contrast", { contrast: 20, whites: 8, blacks: -10 }], ["soft-contrast", "Soft Contrast", { contrast: -14, highlights: -12, shadows: 12 }], ["vivid", "Vivid", { contrast: 8, colourBoost: 20, saturation: 5 }], ["muted", "Muted", { contrast: -4, colourBoost: -8, saturation: -22 }], ["portrait", "Portrait", { highlights: -10, shadows: 8, texture: -12, clarity: -5, colourBoost: 5 }], ["landscape", "Landscape", { contrast: 10, dehaze: 7, clarity: 8, colourBoost: 15 }], ["black-and-white", "Black & White", { contrast: 10, clarity: 4, saturation: -100 }], ["high-key-bw", "High-Key B&W", { exposure: .45, contrast: -8, shadows: 18, blacks: 10, saturation: -100 }], ["low-key-bw", "Low-Key B&W", { exposure: -.45, contrast: 18, highlights: -15, blacks: -18, saturation: -100 }],
-].map(([id, name, changes]) => ({ schemaVersion: 1, id: id as string, name: name as string, categories: ["whiteBalance", "tone", "presence", "colour"], settings: { ...neutralAdjustments, ...(changes as Partial<BasicAdjustments>) }, builtIn: true }));
+].map(([id, name, changes]) => ({ schemaVersion: 2, id: id as string, name: name as string, categories: ["whiteBalance", "tone", "presence", "colour"], settings: { ...neutralAdjustments, ...(changes as Partial<BasicAdjustments>) }, advanced: neutralAdvancedDevelop(), builtIn: true }));
 let browserJobs = structuredClone(demoJobs);
 const browserTrash = new Set<string>();
 let browserCollections:CatalogueCollection[]=[];
@@ -82,6 +82,12 @@ const applyRecipeCategories = (target: DevelopRecipe, source: DevelopRecipe, cat
   if (include.has("presence")) copy(["texture", "clarity", "dehaze"]);
   if (include.has("colour")) copy(["colourBoost", "saturation"]);
   if (include.has("transform")) copy(["cropLeft", "cropTop", "cropWidth", "cropHeight", "rotateQuadrants", "straighten", "horizontalFlip", "verticalFlip"]);
+  if (include.has("curve")) next.advanced.curves = structuredClone(source.advanced.curves);
+  if (include.has("colourMixer")) next.advanced.colourMixer = structuredClone(source.advanced.colourMixer);
+  if (include.has("colourGrading")) next.advanced.colourGrading = structuredClone(source.advanced.colourGrading);
+  if (include.has("detail")) next.advanced.detail = structuredClone(source.advanced.detail);
+  if (include.has("lensCorrections") || include.has("lensExact")) next.advanced.lens = structuredClone(source.advanced.lens);
+  if (include.has("lensAuto")) next.advanced.lens = { ...structuredClone(source.advanced.lens), enabled: false, profileMode: "off", profileId: undefined, profileRevision: undefined };
   if (include.has("manualMasks") || include.has("intelligentMasks")) {
     const semantic = (mask: DevelopRecipe["masks"][number]) => mask.geometry.kind === "semantic";
     next.masks = next.masks.filter(mask => semantic(mask) ? !include.has("intelligentMasks") : !include.has("manualMasks"));
@@ -307,7 +313,7 @@ export const api = {
     const ids=[...new Set(targetIds.filter(id=>id!==sourceId))];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;const source=await this.getDevelopRecipe(sourceId);for(const id of ids){const recipe=applyRecipeCategories(await this.getDevelopRecipe(id),source,categories);browserDevelopRecipes.set(id,recipe);const asset=browserAssets.find(value=>value.id===id);if(asset)asset.hasEdits=true;}return {requested:ids.length,changed:ids.length,failed:0,cancelled:0};
   },
   async applyPresetToSelection(assetIds:string[],presetId:string):Promise<BatchSummary>{
-    if(tauri())return invoke("apply_preset_to_selection",{request:{assetIds,presetId}});const preset=[...browserBuiltInDevelopPresets,...browserDevelopPresets].find(value=>value.id===presetId);if(!preset)throw new Error("That preset no longer exists.");const ids=[...new Set(assetIds)];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;const source:DevelopRecipe={schemaVersion:2,settings:preset.settings,masks:[]};for(const id of ids){const recipe=applyRecipeCategories(await this.getDevelopRecipe(id),source,preset.categories as SyncCategory[]);browserDevelopRecipes.set(id,recipe);const asset=browserAssets.find(value=>value.id===id);if(asset)asset.hasEdits=true;}return{requested:ids.length,changed:ids.length,failed:0,cancelled:0};
+    if(tauri())return invoke("apply_preset_to_selection",{request:{assetIds,presetId}});const preset=[...browserBuiltInDevelopPresets,...browserDevelopPresets].find(value=>value.id===presetId);if(!preset)throw new Error("That preset no longer exists.");const ids=[...new Set(assetIds)];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;const source:DevelopRecipe={schemaVersion:3,settings:preset.settings,advanced:preset.advanced,masks:[]};for(const id of ids){const recipe=applyRecipeCategories(await this.getDevelopRecipe(id),source,preset.categories as SyncCategory[]);browserDevelopRecipes.set(id,recipe);const asset=browserAssets.find(value=>value.id===id);if(asset)asset.hasEdits=true;}return{requested:ids.length,changed:ids.length,failed:0,cancelled:0};
   },
   async previewBatchAuto(assetIds:string[]):Promise<BatchAutoSummary>{if(tauri())return invoke("preview_batch_auto",{assetIds});return{requested:assetIds.length,changed:0,failed:0,cancelled:0,analyzable:assetIds.length,lowConfidenceWhiteBalance:0,skipped:0};},
   async applyBatchAuto(assetIds:string[]):Promise<BatchAutoSummary>{if(tauri())return invoke("apply_batch_auto",{assetIds});const ids=[...new Set(assetIds)];history.push(snapshotBrowserBatch(ids));redoHistory.length=0;for(const id of ids){const asset=browserAssets.find(value=>value.id===id);if(!asset)continue;const recipe=await this.getDevelopRecipe(id);const seed=[...asset.filename].reduce((sum,value)=>sum+value.charCodeAt(0),0);recipe.settings={...recipe.settings,exposure:((seed%9)-4)/20,contrast:6+(seed%7),highlights:-18-(seed%13),shadows:12+(seed%11),clarity:3+(seed%5),colourBoost:5+(seed%8)};browserDevelopRecipes.set(id,recipe);asset.hasEdits=true;}return{requested:ids.length,changed:ids.length,failed:0,cancelled:0,analyzable:ids.length,lowConfidenceWhiteBalance:0,skipped:0};},
@@ -403,7 +409,11 @@ export const api = {
     return { id: crypto.randomUUID(), kind: "adjusted", provider: "keepframe-controls", createdAt: new Date().toISOString(), state: "candidate", imageUrl: asset.preferredVersionUrl ?? asset.previewUrl, isPreferred: false };
   },
   async getDevelopRecipe(assetId: string): Promise<DevelopRecipe> {
-    return tauri() ? invoke("get_develop_recipe", { assetId }) : browserDevelopRecipes.get(assetId) ?? { schemaVersion: 2, settings: { ...neutralAdjustments }, masks: [] };
+    return tauri() ? invoke("get_develop_recipe", { assetId }) : browserDevelopRecipes.get(assetId) ?? { schemaVersion: 3, settings: { ...neutralAdjustments }, advanced: neutralAdvancedDevelop(), masks: [] };
+  },
+  async lensProfileStatus(assetId: string): Promise<LensProfileStatus> {
+    if (tauri()) return invoke("lens_profile_status", { assetId });
+    return { profiles: [], dataRevision: "12f5976ce30c024f98c420835125b9676ac07811", dataLicence: "CC-BY-SA-3.0", detail: "Demo asset metadata has no exact bundled lens profile match." };
   },
   async saveDevelopRecipe(assetId: string, recipe: DevelopRecipe): Promise<boolean> {
     if (tauri()) return invoke("save_develop_recipe", { assetId, recipe });

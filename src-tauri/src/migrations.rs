@@ -562,6 +562,27 @@ pub(crate) fn apply_v13(
     tx.commit()
 }
 
+/// Version 14 records nullable optical facts used for strict profile matching.
+pub(crate) fn apply_v14(
+    connection: &mut Connection,
+    _existed: bool,
+    version: i64,
+) -> rusqlite::Result<()> {
+    if version >= 14 {
+        return Ok(());
+    }
+    let tx = connection.transaction()?;
+    tx.execute("ALTER TABLE sources ADD COLUMN focal_length REAL", [])?;
+    tx.execute("ALTER TABLE sources ADD COLUMN aperture REAL", [])?;
+    tx.execute("ALTER TABLE sources ADD COLUMN iso INTEGER", [])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(14,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.pragma_update(None, "user_version", 14)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +840,31 @@ mod tests {
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
             13
+        );
+    }
+
+    #[test]
+    fn v14_migration_adds_nullable_optical_facts_idempotently() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE sources(id TEXT PRIMARY KEY,lens TEXT); INSERT INTO sources(id,lens) VALUES('source-a','Existing lens'); PRAGMA user_version=13;").unwrap();
+        apply_v14(&mut connection, true, 13).unwrap();
+        apply_v14(&mut connection, true, 14).unwrap();
+        assert!(column_exists(&connection, "sources", "focal_length").unwrap());
+        assert!(column_exists(&connection, "sources", "aperture").unwrap());
+        assert!(column_exists(&connection, "sources", "iso").unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT lens FROM sources WHERE id='source-a'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "Existing lens"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            14
         );
     }
 }

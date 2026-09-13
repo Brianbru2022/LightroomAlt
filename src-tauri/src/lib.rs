@@ -1,3 +1,4 @@
+mod advanced_develop;
 mod interoperability;
 mod migrations;
 mod organisation;
@@ -36,7 +37,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
 const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
@@ -417,6 +418,8 @@ struct DevelopRecipe {
     schema_version: i64,
     settings: BasicAdjustments,
     #[serde(default)]
+    advanced: advanced_develop::AdvancedDevelopSettings,
+    #[serde(default)]
     masks: Vec<DevelopMask>,
 }
 
@@ -648,7 +651,17 @@ fn decode_semantic_payload(coverage_png: &str, checksum: &str) -> Result<image::
     Ok(image)
 }
 
-const PRESET_CATEGORIES: &[&str] = &["whiteBalance", "tone", "presence", "colour"];
+const PRESET_CATEGORIES: &[&str] = &[
+    "whiteBalance",
+    "tone",
+    "presence",
+    "colour",
+    "curve",
+    "colourMixer",
+    "colourGrading",
+    "detail",
+    "lensCorrections",
+];
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -658,6 +671,8 @@ struct DevelopPreset {
     name: String,
     categories: Vec<String>,
     settings: BasicAdjustments,
+    #[serde(default)]
+    advanced: advanced_develop::AdvancedDevelopSettings,
     built_in: bool,
 }
 
@@ -668,7 +683,32 @@ struct PresetFile {
     name: String,
     categories: Vec<String>,
     settings: BasicAdjustments,
+    #[serde(default)]
+    advanced: advanced_develop::AdvancedDevelopSettings,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LensProfileStatus {
+    camera: Option<String>,
+    lens: Option<String>,
+    focal_length: Option<f32>,
+    aperture: Option<f32>,
+    iso: Option<i64>,
+    matched_profile: Option<advanced_develop::LensProfile>,
+    profiles: Vec<advanced_develop::LensProfile>,
+    data_revision: String,
+    data_licence: String,
+    detail: String,
+}
+
+type SourceOpticalFacts = (
+    Option<String>,
+    Option<String>,
+    Option<f32>,
+    Option<f32>,
+    Option<i64>,
+);
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -702,21 +742,23 @@ struct AutoProposal {
 impl DevelopRecipe {
     fn neutral() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             settings: BasicAdjustments::neutral(),
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             masks: Vec::new(),
         }
     }
     fn validate(mut self) -> Result<Self> {
-        if self.schema_version == 1 && self.masks.is_empty() {
-            self.schema_version = 2;
+        if matches!(self.schema_version, 1 | 2) {
+            self.schema_version = 3;
         }
-        if self.schema_version != 2 {
+        if self.schema_version != 3 {
             return Err(KeepframeError::Message(
                 "This Develop recipe version is not supported by this build.".into(),
             ));
         }
         self.settings = self.settings.validate()?;
+        self.advanced = self.advanced.validate().map_err(KeepframeError::Message)?;
         if self.masks.len() > 64 {
             return Err(KeepframeError::Message(
                 "A Develop recipe cannot contain more than 64 masks.".into(),
@@ -800,13 +842,18 @@ impl DevelopRecipe {
         Ok(self)
     }
     fn is_edited(&self) -> bool {
-        self.settings != BasicAdjustments::neutral() || !self.masks.is_empty()
+        self.settings != BasicAdjustments::neutral()
+            || self.advanced != advanced_develop::AdvancedDevelopSettings::default()
+            || !self.masks.is_empty()
     }
 }
 
 impl DevelopPreset {
     fn validate(mut self, user_authored: bool) -> Result<Self> {
-        if self.schema_version != 1 {
+        if self.schema_version == 1 {
+            self.schema_version = 2;
+        }
+        if self.schema_version != 2 {
             return Err(KeepframeError::Message(
                 "This Develop preset version is not supported by this build.".into(),
             ));
@@ -836,6 +883,7 @@ impl DevelopPreset {
             return Err(KeepframeError::Message("User presets must have an application-generated id and cannot claim to be built in.".into()));
         }
         self.settings = self.settings.validate()?;
+        self.advanced = self.advanced.validate().map_err(KeepframeError::Message)?;
         Ok(self)
     }
 }
@@ -843,11 +891,12 @@ impl DevelopPreset {
 fn built_in_presets() -> Vec<DevelopPreset> {
     let preset =
         |id: &str, name: &str, categories: &[&str], settings: BasicAdjustments| DevelopPreset {
-            schema_version: 1,
+            schema_version: 2,
             id: id.into(),
             name: name.into(),
             categories: categories.iter().map(|value| (*value).into()).collect(),
             settings,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             built_in: true,
         };
     vec![
@@ -1494,6 +1543,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v11(&mut connection, existed, version)?;
     migrations::apply_v12(&mut connection, existed, version)?;
     migrations::apply_v13(&mut connection, existed, version)?;
+    migrations::apply_v14(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -2715,8 +2765,9 @@ async fn propose_intelligent_mask(
         adjustments: LocalAdjustments::default(),
     };
     DevelopRecipe {
-        schema_version: 2,
+        schema_version: 3,
         settings: BasicAdjustments::neutral(),
+        advanced: advanced_develop::AdvancedDevelopSettings::default(),
         masks: vec![mask.clone()],
     }
     .validate()?;
@@ -3064,6 +3115,10 @@ struct Meta {
     captured: Option<DateTime<Utc>>,
     fallback: bool,
     camera: Option<String>,
+    lens: Option<String>,
+    focal_length: Option<f64>,
+    aperture: Option<f64>,
+    iso: Option<i64>,
     width: Option<u32>,
     height: Option<u32>,
     latitude: Option<f64>,
@@ -3079,6 +3134,10 @@ fn metadata(path: &Path) -> Meta {
             "-DateTimeOriginal",
             "-CreateDate",
             "-Model",
+            "-LensModel",
+            "-FocalLength",
+            "-FNumber",
+            "-ISO",
             "-ImageWidth",
             "-ImageHeight",
             "-GPSLatitude",
@@ -3098,6 +3157,13 @@ fn metadata(path: &Path) -> Meta {
                         .and_then(Value::as_str)
                         .and_then(parse_exif_date);
                     meta.camera = v.get("Model").and_then(Value::as_str).map(str::to_string);
+                    meta.lens = v
+                        .get("LensModel")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    meta.focal_length = v.get("FocalLength").and_then(Value::as_f64);
+                    meta.aperture = v.get("FNumber").and_then(Value::as_f64);
+                    meta.iso = v.get("ISO").and_then(Value::as_i64);
                     meta.width = v
                         .get("ImageWidth")
                         .and_then(Value::as_u64)
@@ -3882,8 +3948,15 @@ fn mask_coverage(mask: &DevelopMask, x: u32, y: u32, width: u32, height: u32) ->
 }
 
 fn render_develop_recipe(image: &image::DynamicImage, recipe: &DevelopRecipe) -> RgbImage {
-    // Deliberate order: EXIF-oriented source -> global colour/tone -> ordered local masks -> transform/crop.
-    let mut output = apply_colour_adjustments_to_image(image, recipe.settings);
+    // Deliberate order: oriented source -> optics -> Basic -> curves/mixer/grading
+    // -> noise reduction/sharpening -> ordered local masks -> transform/crop.
+    let corrected = advanced_develop::apply_optics(&image.to_rgb8(), &recipe.advanced.lens);
+    let mut output = apply_colour_adjustments_to_image(
+        &image::DynamicImage::ImageRgb8(corrected),
+        recipe.settings,
+    );
+    advanced_develop::apply_tone_colour(&mut output, &recipe.advanced);
+    advanced_develop::apply_detail(&mut output, recipe.advanced.detail);
     let (width, height) = output.dimensions();
     for mask in recipe
         .masks
@@ -3893,7 +3966,12 @@ fn render_develop_recipe(image: &image::DynamicImage, recipe: &DevelopRecipe) ->
         let semantic = prepared_semantic_coverage(mask, width, height)
             .ok()
             .flatten();
-        let coverage = prepared_mask_coverage(mask, width, height, semantic.as_ref());
+        let coverage = advanced_develop::remap_mask(
+            &prepared_mask_coverage(mask, width, height, semantic.as_ref()),
+            width,
+            height,
+            &recipe.advanced.lens,
+        );
         let adjusted = apply_colour_adjustments_to_image(
             &image::DynamicImage::ImageRgb8(output.clone()),
             mask.adjustments.as_basic(),
@@ -3945,8 +4023,9 @@ fn render_develop_recipe_cached(
         ));
     }
     let global_key = format!(
-        "{source_key}:{}",
-        digest_json(&colour_identity(recipe.settings))
+        "{source_key}:{}:{}",
+        digest_json(&colour_identity(recipe.settings)),
+        digest_json(&recipe.advanced),
     );
     let cached_global = caches
         .lock()
@@ -3956,7 +4035,13 @@ fn render_develop_recipe_cached(
     let mut output = if let Some(global) = cached_global {
         (*global).clone()
     } else {
-        let rendered = apply_colour_adjustments_to_image(image, recipe.settings);
+        let corrected = advanced_develop::apply_optics(&image.to_rgb8(), &recipe.advanced.lens);
+        let mut rendered = apply_colour_adjustments_to_image(
+            &image::DynamicImage::ImageRgb8(corrected),
+            recipe.settings,
+        );
+        advanced_develop::apply_tone_colour(&mut rendered, &recipe.advanced);
+        advanced_develop::apply_detail(&mut rendered, recipe.advanced.detail);
         caches
             .lock()
             .expect("renderer cache lock")
@@ -3979,12 +4064,14 @@ fn render_develop_recipe_cached(
         .iter()
         .filter(|mask| mask.enabled && mask.opacity > 0.0)
     {
-        let coverage = prepared_mask_coverage_cached(
+        let canonical_coverage = prepared_mask_coverage_cached(
             mask,
             width,
             height,
             &mut caches.lock().expect("renderer cache lock"),
         )?;
+        let coverage =
+            advanced_develop::remap_mask(&canonical_coverage, width, height, &recipe.advanced.lens);
         let adjusted = apply_colour_adjustments_to_image(
             &image::DynamicImage::ImageRgb8(output.clone()),
             mask.adjustments.as_basic(),
@@ -4433,6 +4520,36 @@ fn get_develop_recipe(asset_id: String, state: State<'_, AppState>) -> Result<De
 }
 
 #[tauri::command]
+fn lens_profile_status(asset_id: String, state: State<'_, AppState>) -> Result<LensProfileStatus> {
+    let connection = open_db(&root_from(&state)?)?;
+    let (camera, lens, focal_length, aperture, iso): SourceOpticalFacts = connection.query_row(
+        "SELECT s.camera,s.lens,s.focal_length,s.aperture,s.iso FROM assets a JOIN sources s ON s.id=a.source_id WHERE a.id=?1",
+        [&asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    )?;
+    let matched =
+        advanced_develop::match_profile(camera.as_deref(), lens.as_deref(), focal_length, aperture)
+            .copied();
+    let detail = if matched.is_some() {
+        "An exact camera, lens, focal-length and aperture profile match is available.".into()
+    } else {
+        "No exact bundled profile match. Manual optical controls remain available.".into()
+    };
+    Ok(LensProfileStatus {
+        camera,
+        lens,
+        focal_length,
+        aperture,
+        iso,
+        matched_profile: matched,
+        profiles: advanced_develop::LENS_PROFILES.to_vec(),
+        data_revision: advanced_develop::LENSFUN_DATA_REVISION.into(),
+        data_licence: advanced_develop::LENSFUN_DATA_LICENCE.into(),
+        detail,
+    })
+}
+
+#[tauri::command]
 fn save_develop_recipe(
     asset_id: String,
     recipe: DevelopRecipe,
@@ -4462,7 +4579,7 @@ fn write_develop_recipe(
     recipe: &DevelopRecipe,
 ) -> Result<()> {
     if recipe.is_edited() {
-        tx.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,2,?2,?3) ON CONFLICT(asset_id) DO UPDATE SET schema_version=2,recipe_json=excluded.recipe_json,updated_at=excluded.updated_at",params![asset_id,serde_json::to_string(recipe)?,Utc::now().to_rfc3339()])?;
+        tx.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES(?1,?2,?3,?4) ON CONFLICT(asset_id) DO UPDATE SET schema_version=excluded.schema_version,recipe_json=excluded.recipe_json,updated_at=excluded.updated_at",params![asset_id,recipe.schema_version,serde_json::to_string(recipe)?,Utc::now().to_rfc3339()])?;
     } else {
         tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1", [asset_id])?;
     }
@@ -4533,6 +4650,55 @@ fn copy_setting_categories(
         target.horizontal_flip = source.horizontal_flip;
         target.vertical_flip = source.vertical_flip;
     }
+}
+
+fn copy_advanced_categories(
+    target: &mut advanced_develop::AdvancedDevelopSettings,
+    source: &advanced_develop::AdvancedDevelopSettings,
+    categories: &HashSet<String>,
+) {
+    if categories.contains("curve") {
+        target.curves = source.curves.clone();
+    }
+    if categories.contains("colourMixer") {
+        target.colour_mixer = source.colour_mixer.clone();
+    }
+    if categories.contains("colourGrading") {
+        target.colour_grading = source.colour_grading.clone();
+    }
+    if categories.contains("detail") {
+        target.detail = source.detail;
+    }
+    if categories.contains("lensCorrections") || categories.contains("lensExact") {
+        target.lens = source.lens.clone();
+    }
+}
+
+fn auto_lens_for_asset(
+    connection: &Connection,
+    asset_id: &str,
+    source: &advanced_develop::LensCorrections,
+) -> Result<advanced_develop::LensCorrections> {
+    let facts: (Option<String>, Option<String>, Option<f32>, Option<f32>) = connection.query_row(
+        "SELECT s.camera,s.lens,s.focal_length,s.aperture FROM assets a JOIN sources s ON s.id=a.source_id WHERE a.id=?1",
+        [asset_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let mut lens = source.clone();
+    if let Some(profile) =
+        advanced_develop::match_profile(facts.0.as_deref(), facts.1.as_deref(), facts.2, facts.3)
+    {
+        lens.enabled = true;
+        lens.profile_mode = "auto".into();
+        lens.profile_id = Some(profile.id.into());
+        lens.profile_revision = Some(advanced_develop::LENSFUN_DATA_REVISION.into());
+    } else {
+        lens.enabled = false;
+        lens.profile_mode = "off".into();
+        lens.profile_id = None;
+        lens.profile_revision = None;
+    }
+    Ok(lens)
 }
 
 fn apply_batch_recipes(
@@ -4606,6 +4772,13 @@ fn sync_develop_settings_in(
         "transform",
         "manualMasks",
         "intelligentMasks",
+        "curve",
+        "colourMixer",
+        "colourGrading",
+        "detail",
+        "lensCorrections",
+        "lensExact",
+        "lensAuto",
     ];
     if request.categories.is_empty()
         || request
@@ -4630,6 +4803,10 @@ fn sync_develop_settings_in(
     for id in &ids {
         let mut target = develop_recipe_in(connection, id)?;
         copy_setting_categories(&mut target.settings, &source.settings, &categories);
+        copy_advanced_categories(&mut target.advanced, &source.advanced, &categories);
+        if categories.contains("lensAuto") {
+            target.advanced.lens = auto_lens_for_asset(connection, id, &source.advanced.lens)?;
+        }
         let manual = categories.contains("manualMasks");
         let intelligent = categories.contains("intelligentMasks");
         if manual || intelligent {
@@ -4691,6 +4868,7 @@ fn apply_preset_batch_in(
     for id in &ids {
         let mut recipe = develop_recipe_in(connection, id)?;
         copy_setting_categories(&mut recipe.settings, &preset.settings, &categories);
+        copy_advanced_categories(&mut recipe.advanced, &preset.advanced, &categories);
         recipes.push(recipe);
     }
     apply_batch_recipes(connection, ids, recipes)
@@ -4810,10 +4988,11 @@ fn export_develop_preset(id: String, path: String, state: State<'_, AppState>) -
         ));
     }
     let file = PresetFile {
-        schema_version: 1,
+        schema_version: 2,
         name: preset.name,
         categories: preset.categories,
         settings: preset.settings,
+        advanced: preset.advanced,
     };
     fs::write(path, serde_json::to_vec_pretty(&file)?)?;
     Ok(())
@@ -4835,6 +5014,7 @@ fn import_develop_preset(path: String, state: State<'_, AppState>) -> Result<Dev
         name: file.name,
         categories: file.categories,
         settings: file.settings,
+        advanced: file.advanced,
         built_in: false,
     };
     save_develop_preset(preset, state)
@@ -5123,6 +5303,10 @@ async fn import_photos(
                     tx.execute("INSERT INTO assets(id,filename,captured_at,date_fallback,camera,width,height,latitude,longitude,embedded_latitude,embedded_longitude,location_source,thumbnail_path,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?8,?9,?10,?11,?12)",params![asset_id,original_name,captured_string,meta.fallback,meta.camera,meta.width,meta.height,meta.latitude,meta.longitude,location_source,thumb.to_string_lossy(),Utc::now().to_rfc3339()])?;
                 }
                 tx.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![representation_id,asset_id,target.to_string_lossy(),source_hash,extension,stem,byte_size,RAW.contains(&extension.as_str())])?;
+                tx.execute(
+                    "UPDATE sources SET lens=COALESCE(lens,?2),focal_length=COALESCE(focal_length,?3),aperture=COALESCE(aperture,?4),iso=COALESCE(iso,?5) WHERE id=(SELECT source_id FROM assets WHERE id=?1)",
+                    params![asset_id, meta.lens, meta.focal_length, meta.aperture, meta.iso],
+                )?;
                 for name in meta.keywords {
                     let tag_id = tx
                         .query_row("SELECT id FROM tags WHERE name=?1", [&name], |r| {
@@ -8782,6 +8966,7 @@ pub fn run() {
             preview_basic_adjustments,
             apply_basic_adjustments,
             get_develop_recipe,
+            lens_profile_status,
             save_develop_recipe,
             preview_develop_recipe,
             list_develop_presets,
@@ -8999,7 +9184,8 @@ mod tests {
     #[test]
     fn develop_recipe_is_versioned_deterministic_and_supports_flips() {
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.5,
                 horizontal_flip: true,
@@ -9035,7 +9221,7 @@ mod tests {
             .unwrap()
             .validate()
             .unwrap();
-        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.schema_version, 3);
         assert!(migrated.masks.is_empty());
         let source =
             image::DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 8, image::Rgb([80, 90, 100])));
@@ -9046,9 +9232,30 @@ mod tests {
     }
 
     #[test]
+    fn v2_recipe_migrates_with_serialisable_noop_advanced_defaults() {
+        let json = serde_json::json!({"schemaVersion":2,"settings":BasicAdjustments{contrast:7.0,..BasicAdjustments::neutral()},"masks":[]});
+        let recipe = serde_json::from_value::<DevelopRecipe>(json)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(recipe.schema_version, 3);
+        assert_eq!(
+            recipe.advanced,
+            advanced_develop::AdvancedDevelopSettings::default()
+        );
+        let reopened =
+            serde_json::from_str::<DevelopRecipe>(&serde_json::to_string(&recipe).unwrap())
+                .unwrap()
+                .validate()
+                .unwrap();
+        assert_eq!(recipe, reopened);
+    }
+
+    #[test]
     fn mask_geometry_round_trips_and_disabled_masks_still_count_as_edits() {
         let mut recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![
                 linear_mask("linear", 1.0),
@@ -9073,7 +9280,8 @@ mod tests {
     fn semantic_mask_payload_is_authoritative_and_rejects_corruption() {
         let mask = semantic_mask("subject", 1.0);
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![mask.clone()],
         };
@@ -9097,7 +9305,8 @@ mod tests {
             coverage_png.push('A');
         }
         assert!(DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![corrupt]
         }
@@ -9163,7 +9372,8 @@ mod tests {
         let before = render_develop_recipe(
             &source,
             &DevelopRecipe {
-                schema_version: 2,
+                schema_version: 3,
+                advanced: advanced_develop::AdvancedDevelopSettings::default(),
                 settings: BasicAdjustments::neutral(),
                 masks: vec![mask.clone()],
             },
@@ -9171,7 +9381,8 @@ mod tests {
         let after = render_develop_recipe(
             &source,
             &DevelopRecipe {
-                schema_version: 2,
+                schema_version: 3,
+                advanced: advanced_develop::AdvancedDevelopSettings::default(),
                 settings,
                 masks: vec![mask],
             },
@@ -9184,14 +9395,16 @@ mod tests {
         let source =
             image::DynamicImage::ImageRgb8(RgbImage::from_pixel(41, 31, image::Rgb([80, 80, 80])));
         let linear = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![linear_mask("linear", 1.0)],
         };
         let output = render_develop_recipe(&source, &linear);
         assert!(output.get_pixel(38, 15)[0] > output.get_pixel(2, 15)[0]);
         let radial = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![radial_mask("radial", 1.0)],
         };
@@ -9209,12 +9422,14 @@ mod tests {
         let source =
             image::DynamicImage::ImageRgb8(RgbImage::from_pixel(51, 51, image::Rgb([64, 64, 64])));
         let paint = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![brush_mask("brush", false)],
         };
         let erased = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![brush_mask("brush", true)],
         };
@@ -9239,7 +9454,8 @@ mod tests {
             image::Rgb([90, 100, 110]),
         ));
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 contrast: 10.0,
                 ..BasicAdjustments::neutral()
@@ -9267,7 +9483,8 @@ mod tests {
             ..BasicAdjustments::neutral()
         };
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: geometry,
             masks: vec![linear_mask("linear", 0.7)],
         };
@@ -9275,7 +9492,8 @@ mod tests {
         let before = render_develop_recipe(
             &source,
             &DevelopRecipe {
-                schema_version: 2,
+                schema_version: 3,
+                advanced: advanced_develop::AdvancedDevelopSettings::default(),
                 settings: BasicAdjustments::neutral(),
                 masks: recipe.masks.clone(),
             },
@@ -9298,7 +9516,8 @@ mod tests {
         let source =
             image::DynamicImage::ImageRgb8(RgbImage::from_pixel(24, 18, image::Rgb([72, 82, 92])));
         let mut recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 contrast: 8.0,
                 ..BasicAdjustments::neutral()
@@ -9318,7 +9537,8 @@ mod tests {
     #[test]
     fn mask_geometry_changes_preview_cache_identity() {
         let mut recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![linear_mask("linear", 0.5)],
         };
@@ -9329,7 +9549,8 @@ mod tests {
         let second = Sha256::digest(serde_json::to_vec(&recipe).unwrap());
         assert_ne!(first, second);
         let mut semantic = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![semantic_mask("subject", 0.5)],
         };
@@ -9352,7 +9573,8 @@ mod tests {
     #[test]
     fn copied_develop_recipe_contains_no_asset_metadata() {
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.5,
                 saturation: 12.0,
@@ -9396,8 +9618,19 @@ mod tests {
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)", params![original.to_string_lossy(), original_hash, fs::metadata(&original).unwrap().len()]).unwrap();
         let mut inverted_radial = radial_mask("radial", -0.3);
         inverted_radial.inverted = true;
+        let mut advanced = advanced_develop::AdvancedDevelopSettings::default();
+        advanced.curves.master = vec![
+            advanced_develop::CurvePoint { x: 0.0, y: 0.0 },
+            advanced_develop::CurvePoint { x: 0.5, y: 0.58 },
+            advanced_develop::CurvePoint { x: 1.0, y: 1.0 },
+        ];
+        advanced.colour_mixer.bands[1].saturation = 18.0;
+        advanced.detail.colour_nr = 20.0;
+        advanced.lens.enabled = true;
+        advanced.lens.manual_distortion = 12.0;
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced,
             settings: BasicAdjustments {
                 exposure: 0.75,
                 crop_left: 0.1,
@@ -9412,7 +9645,7 @@ mod tests {
                 semantic_mask("subject", 0.3),
             ],
         };
-        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,?2)", params![serde_json::to_string(&recipe).unwrap(), Utc::now().to_rfc3339()]).unwrap();
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',3,?1,?2)", params![serde_json::to_string(&recipe).unwrap(), Utc::now().to_rfc3339()]).unwrap();
         assert_eq!(develop_recipe_in(&connection, "asset").unwrap(), recipe);
         drop(connection);
         let destination = root.join("Exports");
@@ -9473,14 +9706,15 @@ mod tests {
         connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,thumbnail_path,created_at)VALUES('asset','photo.png','2026-09-12T12:00:00Z',128,96,?1,'2026-09-12T12:00:00Z')",[original.to_string_lossy().as_ref()]).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','photo',?3,0)",params![original.to_string_lossy(),original_hash,fs::metadata(&original).unwrap().len()]).unwrap();
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.2,
                 ..BasicAdjustments::neutral()
             },
             masks: Vec::new(),
         };
-        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,'2026-09-12T12:00:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',3,?1,'2026-09-12T12:00:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();
         drop(connection);
         let caches = Mutex::new(RendererCaches::default());
         let destination = root.join("Exports");
@@ -9507,7 +9741,8 @@ mod tests {
         }));
         let caches = Mutex::new(RendererCaches::default());
         let base = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.2,
                 ..BasicAdjustments::neutral()
@@ -9521,10 +9756,13 @@ mod tests {
         let mut exposure = crop;
         exposure.settings.exposure = 0.3;
         render_develop_recipe_cached(&source, "source", &exposure, &caches, None).unwrap();
+        let mut hsl = exposure;
+        hsl.advanced.colour_mixer.bands[5].hue = 10.0;
+        render_develop_recipe_cached(&source, "source", &hsl, &caches, None).unwrap();
         let cache = caches.lock().unwrap();
         assert_eq!(
             (cache.intermediates.hits, cache.intermediates.misses),
-            (1, 2)
+            (1, 3)
         );
     }
 
@@ -9550,7 +9788,8 @@ mod tests {
             image::Rgb([(x * 2) as u8, (y * 3) as u8, (x + y) as u8])
         }));
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.25,
                 clarity: 12.0,
@@ -9583,7 +9822,8 @@ mod tests {
     fn stale_preview_generation_is_rejected_before_rendering() {
         let source = image::DynamicImage::new_rgb8(32, 24);
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: Vec::new(),
         };
@@ -9670,7 +9910,8 @@ mod tests {
             ..BasicAdjustments::neutral()
         };
         let global_recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: global_settings,
             masks: Vec::new(),
         };
@@ -9694,7 +9935,8 @@ mod tests {
         let mut mask_times = Vec::new();
         for count in [1, 5, 10] {
             let recipe = DevelopRecipe {
-                schema_version: 2,
+                schema_version: 3,
+                advanced: advanced_develop::AdvancedDevelopSettings::default(),
                 settings: BasicAdjustments {
                     exposure: 0.2,
                     ..BasicAdjustments::neutral()
@@ -9708,7 +9950,8 @@ mod tests {
             mask_times.push((count, started.elapsed(), output));
         }
         let cached_mask_recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.2,
                 ..BasicAdjustments::neutral()
@@ -9736,7 +9979,8 @@ mod tests {
         .unwrap();
         let cached_mask_warm = started.elapsed();
         let semantic_recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![semantic_mask("subject", 0.2)],
         };
@@ -9872,7 +10116,8 @@ mod tests {
                 .map(|index| linear_mask(&format!("mask-{index}"), 0.12))
                 .collect();
             let recipe = DevelopRecipe {
-                schema_version: 2,
+                schema_version: 3,
+                advanced: advanced_develop::AdvancedDevelopSettings::default(),
                 settings: BasicAdjustments {
                     exposure: 0.2,
                     ..BasicAdjustments::neutral()
@@ -9935,7 +10180,8 @@ mod tests {
             adjustments: local(0.25),
         };
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments::neutral(),
             masks: vec![mask],
         }
@@ -10086,6 +10332,7 @@ mod tests {
             name: "Unsafe".into(),
             categories: vec!["filesystem".into()],
             settings: BasicAdjustments::neutral(),
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             built_in: false,
         };
         assert!(invalid_category.validate(true).is_err());
@@ -10098,6 +10345,7 @@ mod tests {
                 exposure: 99.0,
                 ..BasicAdjustments::neutral()
             },
+            advanced: advanced_develop::AdvancedDevelopSettings::default(),
             built_in: false,
         };
         assert!(invalid_value.validate(true).is_err());
@@ -11466,6 +11714,66 @@ mod tests {
                 .settings
                 .crop_left,
             0.2
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn advanced_sync_separates_auto_lens_from_exact_profile_copy() {
+        let root = std::env::temp_dir().join(format!("keepframe-advanced-sync-{}", Uuid::new_v4()));
+        initialise_layout(&root).unwrap();
+        let mut connection = open_db(&root).unwrap();
+        insert_library_productivity_assets(&mut connection, 3);
+        connection.execute("UPDATE sources SET camera='Canon EOS 650D',lens='Canon EF 50mm f/1.8',focal_length=50,aperture=2.8 WHERE id=(SELECT source_id FROM assets WHERE id='asset-00001')",[]).unwrap();
+        let mut source = DevelopRecipe::neutral();
+        source.advanced.curves.red = vec![
+            advanced_develop::CurvePoint { x: 0.0, y: 0.0 },
+            advanced_develop::CurvePoint { x: 0.5, y: 0.6 },
+            advanced_develop::CurvePoint { x: 1.0, y: 1.0 },
+        ];
+        source.advanced.detail.sharpen_amount = 45.0;
+        source.advanced.lens.enabled = true;
+        source.advanced.lens.profile_mode = "manual".into();
+        source.advanced.lens.profile_id = Some("lensfun-nikon-d750-af50-f18d".into());
+        source.advanced.lens.profile_revision =
+            Some(advanced_develop::LENSFUN_DATA_REVISION.into());
+        {
+            let tx = connection.transaction().unwrap();
+            write_develop_recipe(&tx, "asset-00000", &source).unwrap();
+            tx.commit().unwrap();
+        }
+        sync_develop_settings_in(
+            &mut connection,
+            SyncDevelopRequest {
+                source_id: "asset-00000".into(),
+                target_ids: vec!["asset-00001".into()],
+                categories: vec!["curve".into(), "detail".into(), "lensAuto".into()],
+            },
+        )
+        .unwrap();
+        let automatic = develop_recipe_in(&connection, "asset-00001").unwrap();
+        assert_eq!(automatic.advanced.curves.red, source.advanced.curves.red);
+        assert_eq!(automatic.advanced.detail.sharpen_amount, 45.0);
+        assert_eq!(
+            automatic.advanced.lens.profile_id.as_deref(),
+            Some("lensfun-canon-650d-ef50-f18-aps-c")
+        );
+        sync_develop_settings_in(
+            &mut connection,
+            SyncDevelopRequest {
+                source_id: "asset-00000".into(),
+                target_ids: vec!["asset-00002".into()],
+                categories: vec!["lensExact".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            develop_recipe_in(&connection, "asset-00002")
+                .unwrap()
+                .advanced
+                .lens,
+            source.advanced.lens
         );
         drop(connection);
         fs::remove_dir_all(root).unwrap();

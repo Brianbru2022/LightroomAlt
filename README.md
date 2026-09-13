@@ -88,6 +88,8 @@ See `MILESTONE_10_RENDERER_PERFORMANCE_GUIDE.md` for reproducible cold/warm rend
 
 See `MILESTONE_14_SEMANTIC_DISCOVERY_GUIDE.md` for the optional local semantic model, source-level indexing, semantic and similarity search, conservative duplicate/burst proposals, deterministic Smart Collection assistance, privacy, performance and acceptance boundaries.
 
+See `MILESTONE_15_ADVANCED_DEVELOP_GUIDE.md` for point and channel curves, Colour Mixer, grading, capture detail, the pinned Lensfun subset, optical/mask geometry, advanced preset and Sync policy, profiling and native acceptance boundaries.
+
 ## Optional local AI
 
 The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.

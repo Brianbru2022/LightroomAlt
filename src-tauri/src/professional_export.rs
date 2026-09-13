@@ -1089,8 +1089,26 @@ mod tests {
         connection.execute("INSERT INTO assets(id,filename,captured_at,width,height,latitude,longitude,location_source,thumbnail_path,created_at)VALUES('asset','Fête portrait.png','2026-09-12T12:30:00Z',96,64,56.1,-3.1,'manual',?1,'2026-09-12T12:30:00Z')",[original.to_string_lossy().as_ref()]).unwrap();
         connection.execute("INSERT INTO representations(id,asset_id,path,sha256,extension,stem,byte_size,is_raw)VALUES('representation','asset',?1,?2,'png','Fête portrait',?3,0)",params![original.to_string_lossy(),hash,fs::metadata(&original).unwrap().len()]).unwrap();
         connection.execute_batch("INSERT INTO tags(id,name)VALUES('tag','family');INSERT INTO asset_tags(asset_id,tag_id)VALUES('asset','tag');").unwrap();
+        let mut advanced = crate::advanced_develop::AdvancedDevelopSettings::default();
+        advanced.curves.master = vec![
+            crate::advanced_develop::CurvePoint { x: 0.0, y: 0.0 },
+            crate::advanced_develop::CurvePoint { x: 0.5, y: 0.56 },
+            crate::advanced_develop::CurvePoint { x: 1.0, y: 1.0 },
+        ];
+        advanced.colour_mixer.bands[5].saturation = 18.0;
+        advanced.colour_grading.shadows.hue = 215.0;
+        advanced.colour_grading.shadows.saturation = 10.0;
+        advanced.detail.sharpen_amount = 25.0;
+        advanced.detail.luminance_nr = 12.0;
+        advanced.detail.colour_nr = 14.0;
+        advanced.lens.enabled = true;
+        advanced.lens.manual_distortion = 8.0;
+        advanced.lens.ca_red = 4.0;
+        advanced.lens.ca_blue = -4.0;
+        advanced.lens.vignette_amount = 6.0;
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced,
             settings: BasicAdjustments {
                 exposure: 0.2,
                 crop_width: 0.75,
@@ -1115,7 +1133,7 @@ mod tests {
                 },
             }],
         };
-        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',2,?1,'2026-09-12T12:30:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();
+        connection.execute("INSERT INTO develop_recipes(asset_id,schema_version,recipe_json,updated_at)VALUES('asset',3,?1,'2026-09-12T12:30:00Z')",[serde_json::to_string(&recipe).unwrap()]).unwrap();
         drop(connection);
         (root, original, hash)
     }
@@ -1642,7 +1660,8 @@ mod tests {
             ])
         }));
         let recipe = DevelopRecipe {
-            schema_version: 2,
+            schema_version: 3,
+            advanced: crate::advanced_develop::AdvancedDevelopSettings::default(),
             settings: BasicAdjustments {
                 exposure: 0.15,
                 contrast: 8.0,
@@ -1717,7 +1736,8 @@ mod tests {
                 Vec::new()
             };
             let individual = DevelopRecipe {
-                schema_version: 2,
+                schema_version: 3,
+                advanced: crate::advanced_develop::AdvancedDevelopSettings::default(),
                 settings: BasicAdjustments {
                     exposure: (index as f32 - 5.0) / 20.0,
                     contrast: index as f32,

@@ -1,0 +1,39 @@
+﻿    Finished `test` profile [optimized + debuginfo] target(s) in 0.38s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\keepframe_lib-bb8f2a4a84ffb5b0.exe)
+     Running unittests src\main.rs (src-tauri\target\debug\deps\keepframe-e304f9be85a61756.exe)
+
+running 1 test
+M15_STAGE master_curve_720x480_cold_ms=4.962 master_curve_720x480_warm_ms=3.608
+M15_STAGE rgb_curves_720x480_cold_ms=3.255 rgb_curves_720x480_warm_ms=3.563
+M15_STAGE hsl_720x480_cold_ms=3.378 hsl_720x480_warm_ms=3.250
+M15_STAGE grading_720x480_cold_ms=2.780 grading_720x480_warm_ms=2.820
+M15_STAGE sharpen_720x480_cold_ms=13.787 sharpen_720x480_warm_ms=13.706
+M15_STAGE luminance_nr_720x480_cold_ms=9.420 luminance_nr_720x480_warm_ms=8.964
+M15_STAGE colour_nr_720x480_cold_ms=10.568 colour_nr_720x480_warm_ms=11.261
+M15_STAGE detail_1024x768_cold_ms=73.401 detail_1024x768_warm_ms=74.552
+M15_STAGE distortion_720x480_cold_ms=4.338 distortion_720x480_warm_ms=4.178
+M15_STAGE ca_720x480_cold_ms=4.067 ca_720x480_warm_ms=4.758
+M15_STAGE vignette_720x480_cold_ms=4.032 vignette_720x480_warm_ms=4.750
+M15_STAGE full_advanced_2400x1600_cold_ms=435.410 full_advanced_2400x1600_warm_ms=425.688
+test advanced_develop::tests::advanced_develop_performance_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 142 filtered out; finished in 1.14s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.41s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\keepframe_lib-bb8f2a4a84ffb5b0.exe)
+M10 benchmark 720x480: jpeg-decode cold=10.7607ms warm=89.7µs; orientation+decode=2.045ms; working-buffer=48µs; tone/exposure=4.9394ms; white-balance=4.4023ms; presence=111.9584ms; colour=3.176ms; mask-raster=991.6µs; masks 1=13.7005ms 5=35.2362ms 10=58.1337ms; cached-mask cold=12.7718ms warm=5.668ms; semantic cold=18.9907ms warm=5.0753ms; transform=3.1139ms; resize=4.2884ms; PNG=24.6985ms; overall cold=71.4888ms warm=1.0876ms; full 2400x1600 render=294.7931ms PNG=819.452ms; cache decoded=1382400B intermediate=3110400B mask=2764800B semantic=345600B hits=1/3/2/0 evictions=0/0/0/0; outputs=290668+4767552B coverage=172800.05 transformed=384x576 resized=360x240
+     Running unittests src\main.rs (src-tauri\target\debug\deps\keepframe-e304f9be85a61756.exe)
+
+running 1 test
+test tests::milestone_10_renderer_performance_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 142 filtered out; finished in 1.59s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

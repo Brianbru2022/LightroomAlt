@@ -168,7 +168,7 @@ export type LibraryMetadataPatch = {
   removeKeywords?: string[];
   replaceKeywords?: string[];
 };
-export type SyncCategory = "tone" | "whiteBalance" | "presence" | "colour" | "transform" | "manualMasks" | "intelligentMasks";
+export type SyncCategory = "tone" | "whiteBalance" | "presence" | "colour" | "transform" | "manualMasks" | "intelligentMasks" | "curve" | "colourMixer" | "colourGrading" | "detail" | "lensCorrections" | "lensAuto" | "lensExact";
 export type BatchSummary = { requested: number; changed: number; failed: number; cancelled: number };
 export type BatchAutoSummary = BatchSummary & { analyzable: number; lowConfidenceWhiteBalance: number; skipped: number };
 
@@ -235,6 +235,24 @@ export const neutralAdjustments: BasicAdjustments = {
   rotateQuadrants: 0, straighten: 0, horizontalFlip: false, verticalFlip: false,
 };
 
+export type CurvePoint = { x: number; y: number };
+export type ToneCurves = { master: CurvePoint[]; red: CurvePoint[]; green: CurvePoint[]; blue: CurvePoint[] };
+export type HslBand = { hue: number; saturation: number; luminance: number };
+export type ColourMixer = { bands: HslBand[] };
+export type GradeWheel = { hue: number; saturation: number };
+export type ColourGrading = { shadows: GradeWheel; midtones: GradeWheel; highlights: GradeWheel; balance: number; blending: number };
+export type DetailSettings = { sharpenAmount: number; sharpenRadius: number; sharpenDetail: number; sharpenMasking: number; luminanceNr: number; luminanceDetail: number; luminanceContrast: number; colourNr: number; colourDetail: number; colourSmoothness: number };
+export type LensCorrections = { enabled: boolean; profileMode: "off" | "auto" | "manual"; profileId?: string; profileRevision?: string; profileAmount: number; manualDistortion: number; caRed: number; caBlue: number; vignetteAmount: number; vignetteMidpoint: number; constrainCrop: boolean };
+export type AdvancedDevelopSettings = { curves: ToneCurves; colourMixer: ColourMixer; colourGrading: ColourGrading; detail: DetailSettings; lens: LensCorrections };
+const identityCurve = (): CurvePoint[] => [{ x: 0, y: 0 }, { x: 1, y: 1 }];
+export const neutralAdvancedDevelop = (): AdvancedDevelopSettings => ({
+  curves: { master: identityCurve(), red: identityCurve(), green: identityCurve(), blue: identityCurve() },
+  colourMixer: { bands: Array.from({ length: 8 }, () => ({ hue: 0, saturation: 0, luminance: 0 })) },
+  colourGrading: { shadows: { hue: 0, saturation: 0 }, midtones: { hue: 0, saturation: 0 }, highlights: { hue: 0, saturation: 0 }, balance: 0, blending: 50 },
+  detail: { sharpenAmount: 0, sharpenRadius: 1, sharpenDetail: 25, sharpenMasking: 0, luminanceNr: 0, luminanceDetail: 50, luminanceContrast: 0, colourNr: 0, colourDetail: 50, colourSmoothness: 50 },
+  lens: { enabled: false, profileMode: "off", profileAmount: 100, manualDistortion: 0, caRed: 0, caBlue: 0, vignetteAmount: 0, vignetteMidpoint: 50, constrainCrop: true },
+});
+
 export type MaskPoint = { x: number; y: number };
 export type LocalAdjustments = {
   exposure: number; contrast: number; highlights: number; shadows: number; whites: number; blacks: number;
@@ -259,7 +277,7 @@ export type DevelopMask = {
   id: string; name: string; enabled: boolean; inverted: boolean; opacity: number; feather: number;
   geometry: MaskGeometry; adjustments: LocalAdjustments;
 };
-export type DevelopRecipe = { schemaVersion: 2; settings: BasicAdjustments; masks: DevelopMask[] };
+export type DevelopRecipe = { schemaVersion: 3; settings: BasicAdjustments; advanced: AdvancedDevelopSettings; masks: DevelopMask[] };
 export type IntelligentMaskHealth = {
   available: boolean; installed: boolean; runtimeAvailable: boolean; loaded: boolean; busy: boolean;
   provider: string; providerVersion: string; model: string; modelRevision: string; licence: string;
@@ -269,8 +287,10 @@ export type IntelligentMaskProposal = {
   requestId: number; category: IntelligentMaskCategory; confidence: number; coverageFraction: number;
   elapsedMs: number; timings: { loadMs: number; preprocessMs: number; inferenceMs: number; postprocessMs: number }; mask: DevelopMask;
 };
-export type PresetCategory = "whiteBalance" | "tone" | "presence" | "colour";
-export type DevelopPreset = { schemaVersion: 1; id: string; name: string; categories: PresetCategory[]; settings: BasicAdjustments; builtIn: boolean };
+export type PresetCategory = "whiteBalance" | "tone" | "presence" | "colour" | "curve" | "colourMixer" | "colourGrading" | "detail" | "lensCorrections";
+export type DevelopPreset = { schemaVersion: 2; id: string; name: string; categories: PresetCategory[]; settings: BasicAdjustments; advanced: AdvancedDevelopSettings; builtIn: boolean };
+export type LensProfile = { id: string; cameraContains: string; lens: string; focalLength: number; aperture: number; distortion: [number, number, number]; caScale: [number, number]; vignette: [number, number, number]; sourceFile: string };
+export type LensProfileStatus = { camera?: string; lens?: string; focalLength?: number; aperture?: number; iso?: number; matchedProfile?: LensProfile; profiles: LensProfile[]; dataRevision: string; dataLicence: string; detail: string };
 export type ImageStatistics = { luminanceBins: number[]; redBins: number[]; greenBins: number[]; blueBins: number[]; samples: number; averageLuminance: number; p01: number; p50: number; p99: number; shadowClipFraction: number; highlightClipFraction: number; averageSaturation: number; redGreenBlue: [number, number, number]; dynamicRange: number };
 export type AutoProposal = { settings: BasicAdjustments; explanation: string[]; confidence: number; statistics: ImageStatistics; recommendations: string[] };
 
