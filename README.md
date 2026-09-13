@@ -86,6 +86,8 @@ See `MILESTONE_9_INTELLIGENT_MASKING_GUIDE.md` for the optional local segmentati
 
 See `MILESTONE_10_RENDERER_PERFORMANCE_GUIDE.md` for reproducible cold/warm renderer benchmarks, profiling evidence, cache ownership and invalidation, CPU/GPU decisions, and the native acceptance checklist.
 
+See `MILESTONE_14_SEMANTIC_DISCOVERY_GUIDE.md` for the optional local semantic model, source-level indexing, semantic and similarity search, conservative duplicate/burst proposals, deterministic Smart Collection assistance, privacy, performance and acceptance boundaries.
+
 ## Optional local AI
 
 The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.
@@ -96,7 +98,7 @@ The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe r
 .\scripts\download-segmentation-model.ps1
 ```
 
-The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The optional Qwen analysis model is approximately 17.5 GB. The separate BEiT intelligent-masking model is approximately 900 MB. Both downloads require an explicit action. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
+The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The optional Qwen analysis model is approximately 17.5 GB, the BEiT intelligent-masking model is approximately 900 MB, and the separately confirmed SigLIP semantic model is approximately 778 MiB. Every model download requires an explicit action. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
 
 When the vision model is absent, Keepframe labels the recipe as a deterministic controls-only fallback. Qwen-Image-Edit at port 7868 is a separate integration and is reported independently in Settings & Health.
 
@@ -112,7 +114,7 @@ For ChatGPT and Gemini, **Prepare image and instruction** creates a local sRGB P
 
 - Windows-only, single user.
 - HEIC catalogue previews depend on available decoding; full-resolution HEIC edit/export remains disabled unless decoding succeeds.
-- No conventional RAW development, face recognition, person identity/attribute inference, semantic search, video, full Lightroom catalogue compatibility, direct cloud APIs or cloud catalogue sync. Intelligent People masking is a combined semantic class, not instance or identity recognition. XMP is a conservative keyword/location/triage sidecar subset, not a general XMP editor.
+- No conventional RAW development, face recognition, person identity/attribute inference, video, full Lightroom catalogue compatibility, direct cloud APIs or cloud catalogue sync. Optional semantic search is local source-level similarity, not factual identification. Intelligent People masking is a combined semantic class, not instance or identity recognition. XMP is a conservative keyword/location/triage sidecar subset, not a general XMP editor.
 - The 0.2 beta installer is unsigned and for named testers using disposable collection copies only.
 
 See `BETA_TESTING.md`, `MILESTONE_3_VERIFICATION.md`, `MILESTONE_4_LOCATION_GUIDE.md`, `MILESTONE_5_INTEROPERABILITY_GUIDE.md`, `PRIVACY.md`, `THIRD_PARTY_NOTICES.md` and `RELEASE_GATES.md` before distributing a build.

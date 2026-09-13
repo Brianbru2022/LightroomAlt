@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from PIL import Image
 
 from .schemas import AnalysisResponse, normalise_payload
-from . import segmentation
+from . import segmentation, semantic
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 MODEL_ROOT = Path(os.environ.get("KEEPFRAME_MODEL_ROOT", r"D:\AI Models\Keepframe"))
@@ -67,6 +67,7 @@ def health() -> dict:
         "modelPath": str(MODEL_PATH),
         "offline": True,
         "segmentation": segmentation.status(),
+        "semantic": semantic.status(),
     }
 
 
@@ -110,6 +111,7 @@ def unload() -> dict:
     _model = None
     _processor = None
     segmentation.unload()
+    semantic.unload()
     try:
         import torch
         if torch.cuda.is_available():
@@ -142,3 +144,26 @@ def segment(image: UploadFile = File(...), category: str = Form(...)) -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Local segmentation failed: {exc}") from exc
+
+
+@app.post("/v1/semantic/image", dependencies=[Depends(authorised)])
+def semantic_image(image: UploadFile = File(...)) -> dict:
+    data = image.file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="No image was supplied")
+    try:
+        return semantic.embed_image(Image.open(io.BytesIO(data)))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Local semantic image embedding failed: {exc}") from exc
+
+
+@app.post("/v1/semantic/text", dependencies=[Depends(authorised)])
+def semantic_text(query: str = Form(...)) -> dict:
+    try:
+        return semantic.embed_text(query)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Local semantic text embedding failed: {exc}") from exc

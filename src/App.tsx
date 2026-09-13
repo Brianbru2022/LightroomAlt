@@ -7,7 +7,7 @@ import { Topbar } from "./components/Topbar";
 import { api } from "./lib/bridge";
 import { clearSelection, emptySelection, navigateSelection, selectAll, selectId, visibleSelectionCount, type SelectionState } from "./lib/selection";
 import { decisionLabel } from "./lib/format";
-import type { Asset, AssetFilter, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryMetadataPatch, LibraryStatus, MapAsset, MapBounds, ServiceHealth, SyncCategory, ViewName } from "./types";
+import type { Asset, AssetFilter, BasicAdjustments, BatchJob, Decision, EditIntent, EditRecipe, ImportOptions, LibraryMetadataPatch, LibraryStatus, MapAsset, MapBounds, SemanticSearchResult, ServiceHealth, SyncCategory, ViewName } from "./types";
 import { LibraryView } from "./views/LibraryView";
 import { LibraryProductivityView, type LibraryLayout } from "./views/LibraryProductivityView";
 import { MapView } from "./views/MapView";
@@ -26,6 +26,7 @@ export function App() {
   const [status, setStatus] = useState<LibraryStatus>(emptyStatus);
   const [health, setHealth] = useState<ServiceHealth>(emptyHealth);
   const [assets, setAssets] = useState<Asset[]>([]);
+  const [semanticAssets,setSemanticAssets]=useState<Asset[]|null>(null);
   const [visibleTotal, setVisibleTotal] = useState(0);
   const [hasMoreAssets, setHasMoreAssets] = useState(false);
   const [loadingAssets, setLoadingAssets] = useState(true);
@@ -49,13 +50,15 @@ export function App() {
   const requestId = useRef(0);
   const deferredSearch = useDeferredValue(filter.search);
   const effectiveFilter = useMemo<AssetFilter>(() => ({ ...filter, search: deferredSearch, trashed: view === "trash" }), [deferredSearch, filter, view]);
+  const displayAssets=semanticAssets??assets;
   const knownTags = useMemo(() => [...new Set(assets.flatMap((asset) => asset.tags))].sort((left, right) => left.localeCompare(right)), [assets]);
   const selectedId=selection.activeId;
-  const selected = useMemo(() => assets.find((asset) => asset.id === selectedId) ?? null, [assets, selectedId]);
+  const selected = useMemo(() => displayAssets.find((asset) => asset.id === selectedId) ?? assets.find((asset)=>asset.id===selectedId) ?? null, [assets, displayAssets, selectedId]);
   const selectedAssetId = selected?.id;
   const visibleSelectedCount = useMemo(() => visibleSelectionCount(selection.selectedIds, resultIds), [resultIds, selection.selectedIds]);
   const setSingleSelection=(id:string|null)=>setSelection(id?{activeId:id,anchorId:id,selectedIds:new Set([id])}:clearSelection());
   const setAutoAdvance=(value:boolean)=>{setAutoAdvanceState(value);localStorage.setItem("keepframe.autoAdvance",String(value));};
+  const updateFilter=(patch:Partial<AssetFilter>)=>{setSemanticAssets(null);setFilter(value=>({...value,...patch}));};
 
   const loadFirstPage = useCallback(async () => {
     const request = ++requestId.current;
@@ -74,6 +77,8 @@ export function App() {
       if (request === requestId.current) setLoadingAssets(false);
     }
   }, [effectiveFilter]);
+  const showSemanticResults=async(results:SemanticSearchResult[],_label:string)=>{const loaded=(await Promise.all(results.map(result=>api.asset(result.assetId)))).filter((asset):asset is Asset=>Boolean(asset));setSemanticAssets(loaded);const ids=loaded.map(asset=>asset.id);setResultIds(ids);setVisibleTotal(ids.length);setHasMoreAssets(false);setSelection(current=>ids.length?selectId(current,ids[0],ids):clearSelection());};
+  const clearSemanticResults=()=>{setSemanticAssets(null);void loadFirstPage();};
 
   const loadMoreAssets = useCallback(async () => {
     if (loadingAssets || !hasMoreAssets) return;
@@ -462,8 +467,8 @@ export function App() {
     <div className="app-shell">
       <Sidebar view={view} status={{ ...status, ...health }} onView={(nextView) => { setView(nextView); if (nextView === "trash") setFilter((value) => ({ ...value, decision: "all" })); }} />
       <div className="workspace">
-        <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => setFilter((value) => ({ ...value, search }))} onDecision={(decision) => setFilter((value) => ({ ...value, decision }))} tags={knownTags} selectedTag={filter.tag} onTag={(tag) => setFilter((value) => ({ ...value, tag }))} dateFrom={filter.dateFrom} dateTo={filter.dateTo} onDateRange={(dateFrom, dateTo) => setFilter((value) => ({ ...value, dateFrom, dateTo }))} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={moveAllDiscarded} />
-        {view === "library" ? <LibraryProductivityView assets={assets} total={visibleTotal} visibleSelectedCount={visibleSelectedCount} loading={loadingAssets} hasMore={hasMoreAssets} onLoadMore={loadMoreAssets} filter={filter} onFilter={patch=>setFilter(value=>({...value,...patch}))} active={selected} activeId={selection.activeId} selectedIds={selection.selectedIds} layout={libraryLayout} onLayout={setLibraryLayout} onSelect={selectLibraryAsset} onSetActive={id=>setSelection(current=>current.selectedIds.has(id)?{...current,activeId:id}:selectId(current,id,resultIds))} onRemove={removeSelectedId} onClear={()=>setSelection(clearSelection())} onOpenDevelop={openAsset} onMetadata={applySelectionMetadata} onReviewAsset={reviewOne} onSync={syncSelection} onPreset={applyPresetSelection} onBatchAuto={runBatchAuto} onExport={exportSelected} autoAdvance={autoAdvance} onAutoAdvance={setAutoAdvance} onCatalogueChanged={refreshCatalogue} onNotice={setNotice} /> : null}
+        <Topbar search={filter.search} decision={filter.decision} busy={busy} onSearch={(search) => updateFilter({search})} onDecision={(decision) => updateFilter({decision})} tags={knownTags} selectedTag={filter.tag} onTag={(tag) => updateFilter({tag})} dateFrom={filter.dateFrom} dateTo={filter.dateTo} onDateRange={(dateFrom, dateTo) => updateFilter({dateFrom,dateTo})} onImport={importPhotos} onUndo={undoCatalogue} discardCount={filter.decision === "discard" ? visibleTotal : status.counts.discard} onDeleteAll={moveAllDiscarded} />
+        {view === "library" ? <LibraryProductivityView assets={displayAssets} total={semanticAssets?displayAssets.length:visibleTotal} visibleSelectedCount={visibleSelectedCount} loading={loadingAssets} hasMore={semanticAssets?false:hasMoreAssets} onLoadMore={semanticAssets?()=>{}:loadMoreAssets} filter={filter} onFilter={updateFilter} active={selected} activeId={selection.activeId} selectedIds={selection.selectedIds} layout={libraryLayout} onLayout={setLibraryLayout} onSelect={selectLibraryAsset} onSetActive={id=>setSelection(current=>current.selectedIds.has(id)?{...current,activeId:id}:selectId(current,id,resultIds))} onRemove={removeSelectedId} onClear={()=>setSelection(clearSelection())} onOpenDevelop={openAsset} onMetadata={applySelectionMetadata} onReviewAsset={reviewOne} onSync={syncSelection} onPreset={applyPresetSelection} onBatchAuto={runBatchAuto} onExport={exportSelected} autoAdvance={autoAdvance} onAutoAdvance={setAutoAdvance} onCatalogueChanged={refreshCatalogue} onNotice={setNotice} onSemanticResults={showSemanticResults} onSemanticClear={clearSemanticResults} /> : null}
         {view === "develop" ? <DevelopView assets={assets} selected={selected} selectedIds={selection.selectedIds} onSelect={selectLibraryAsset} onOpenSync={()=>{setLibraryLayout("grid");setView("library");setNotice("Selection retained. Choose Sync settings to select categories and apply from the active photograph.");}} onExport={async (asset) => {setExportSelection([...selection.selectedIds]);setExportAsset(asset);}} onRecipeSaved={() => { void refreshCatalogue(); }} /> : null}
         {view === "triage" ? <TriageView assets={assets} total={visibleTotal} hasMore={hasMoreAssets} loading={loadingAssets} onLoadMore={loadMoreAssets} selected={selected} onSelect={(asset) => setSingleSelection(asset.id)} onDecision={decide} onWorkshop={() => setView("workshop")} onMap={() => setView("map")} onTags={setTagAsset} onExport={exportImage} onReplace={replaceImage} onAutoAdjustments={api.autoBasicAdjustments} onPreviewAdjustments={api.previewBasicAdjustments} onApplyAdjustments={api.applyBasicAdjustments} onAdjustmentSaved={() => setNotice("Adjustment saved as a candidate version; the protected original is unchanged.")} /> : null}
         {view === "map" ? <MapView assets={assets} mapAssets={mapAssets} mapLoading={mapLoading} total={visibleTotal} selected={selected} onSelect={selectMapAsset} onLocations={saveLocations} onClearManualLocation={clearManualLocation} onOpenSelected={() => setView("triage")} onLocatedFilter={(located) => { setSpatialBounds(undefined); setFilter((value) => ({ ...value, located })); }} spatialBounds={spatialBounds} onUseVisibleBounds={setSpatialBounds} onClearSpatialBounds={() => setSpatialBounds(undefined)} /> : null}

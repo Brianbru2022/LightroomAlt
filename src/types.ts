@@ -149,6 +149,14 @@ export type CatalogueCollection={id:string;name:string;kind:"manual"|"smart";set
 export type CollectionSet={id:string;name:string;position:number};
 export type StackSummary={id:string;name?:string;collapsed:boolean;topItemId:string;memberIds:string[]};
 
+export type SemanticIndexStatus={available:boolean;installed:boolean;runtimeAvailable:boolean;loaded:boolean;busy:boolean;paused:boolean;provider:string;providerVersion:string;model:string;modelRevision:string;licence:string;source:string;approximateBytes:number;storagePath:string;executionProvider:string;inputResolution:number;embeddingDimensions:number;totalSources:number;indexedSources:number;queuedSources:number;failedSources:number;staleSources:number;storageBytes:number;detail:string};
+export type SemanticFilter={ratingMin?:number;decision?:Decision;fileType?:string;edited?:boolean;dateFrom?:string;dateTo?:string;collectionId?:string};
+export type SemanticSearchRequest={query:string;limit:number;semanticWeight?:number;filter:SemanticFilter};
+export type SemanticSearchResult={assetId:string;sourceId:string;score:number;semanticScore:number;metadataScore:number;strength:string;explanation:string[];missing:boolean};
+export type SemanticSearchResponse={requestId:number;results:SemanticSearchResult[];executionProvider:string;timings:Record<string,number>};
+export type DiscoveryGroup={id:string;kind:"exact_duplicate"|"near_duplicate"|"burst"|"similar_series";sourceIds:string[];assetIds:string[];score:number;explanation:string;dismissed:boolean};
+export type SmartCollectionProposal={name:string;matchMode:"all"|"any";rules:SmartRule[];explanation:string;requiresExplicitSave:true};
+
 export type LibraryMetadataPatch = {
   title?: string | null;
   caption?: string | null;

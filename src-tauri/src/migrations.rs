@@ -474,6 +474,94 @@ pub(crate) fn apply_v12(
     tx.commit()
 }
 
+/// Version 13 adds only rebuildable semantic-discovery state. Embeddings remain
+/// source-level derived data and suggestion decisions record user intent without
+/// changing ratings, keywords, collections, stacks, versions or source files.
+pub(crate) fn apply_v13(
+    connection: &mut Connection,
+    _existed: bool,
+    version: i64,
+) -> rusqlite::Result<()> {
+    if version >= 13 {
+        return Ok(());
+    }
+    let tx = connection.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_embeddings(
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            model_id TEXT NOT NULL,
+            model_revision TEXT NOT NULL,
+            preprocessing_version INTEGER NOT NULL,
+            source_hash TEXT NOT NULL,
+            dimension INTEGER NOT NULL CHECK(dimension > 0 AND dimension <= 4096),
+            vector BLOB NOT NULL,
+            perceptual_hash BLOB NOT NULL CHECK(length(perceptual_hash)=8),
+            indexed_at TEXT NOT NULL,
+            PRIMARY KEY(source_id,model_id,model_revision,preprocessing_version)
+         );
+         CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_model
+            ON semantic_embeddings(model_id,model_revision,preprocessing_version,source_id);
+         CREATE TABLE IF NOT EXISTS semantic_index_queue(
+            source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+            priority INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN('queued','running','failed','paused')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            requested_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_semantic_queue_state_priority
+            ON semantic_index_queue(state,priority DESC,requested_at,source_id);
+         CREATE TABLE IF NOT EXISTS semantic_suggestion_decisions(
+            identity_hash TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN('exact_duplicate','near_duplicate','burst','similar_series')),
+            decision TEXT NOT NULL CHECK(decision IN('dismissed','accepted')),
+            model_id TEXT NOT NULL,
+            model_revision TEXT NOT NULL,
+            member_source_ids_json TEXT NOT NULL,
+            decided_at TEXT NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS keepframe_semantic_queue_source_insert
+         AFTER INSERT ON sources BEGIN
+            INSERT INTO semantic_index_queue(source_id,priority,state,requested_at,updated_at)
+            VALUES(NEW.id,10,'queued',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(source_id) DO UPDATE SET priority=MAX(priority,10),state='queued',error=NULL,updated_at=excluded.updated_at;
+         END;
+         CREATE TRIGGER IF NOT EXISTS keepframe_semantic_queue_representation_insert
+         AFTER INSERT ON representations WHEN NEW.source_id IS NOT NULL BEGIN
+            INSERT INTO semantic_index_queue(source_id,priority,state,requested_at,updated_at)
+            VALUES(NEW.source_id,10,'queued',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(source_id) DO UPDATE SET priority=MAX(priority,10),state='queued',error=NULL,updated_at=excluded.updated_at;
+         END;
+         CREATE TRIGGER IF NOT EXISTS keepframe_semantic_queue_representation_change
+         AFTER UPDATE OF sha256,source_id ON representations WHEN NEW.source_id IS NOT NULL BEGIN
+            INSERT INTO semantic_index_queue(source_id,priority,state,requested_at,updated_at)
+            VALUES(NEW.source_id,20,'queued',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(source_id) DO UPDATE SET priority=MAX(priority,20),state='queued',error=NULL,updated_at=excluded.updated_at;
+         END;
+         CREATE TRIGGER IF NOT EXISTS keepframe_semantic_invalidate_modified_source
+         AFTER UPDATE OF missing_state ON sources WHEN NEW.missing_state='modified' BEGIN
+            DELETE FROM semantic_embeddings WHERE source_id=NEW.id;
+            INSERT INTO semantic_index_queue(source_id,priority,state,attempts,error,requested_at,updated_at)
+            VALUES(NEW.id,30,'failed',1,'Protected source content changed; resolve the source before reindexing.',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(source_id) DO UPDATE SET priority=MAX(priority,30),state='failed',attempts=semantic_index_queue.attempts+1,error=excluded.error,updated_at=excluded.updated_at;
+         END;",
+    )?;
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT OR IGNORE INTO semantic_index_queue(source_id,priority,state,requested_at,updated_at)
+         SELECT s.id,0,'queued',?1,?1 FROM sources s
+         WHERE s.missing_state='available' AND EXISTS(SELECT 1 FROM representations r WHERE r.source_id=s.id)",
+        [&now],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(13,?1)",
+        [&now],
+    )?;
+    tx.pragma_update(None, "user_version", 13)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +770,55 @@ mod tests {
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
             12
+        );
+    }
+
+    #[test]
+    fn v13_migration_adds_only_rebuildable_semantic_state_and_queues_sources() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE sources(id TEXT PRIMARY KEY,missing_state TEXT NOT NULL DEFAULT 'available'); CREATE TABLE representations(id TEXT PRIMARY KEY,source_id TEXT REFERENCES sources(id),sha256 TEXT NOT NULL); INSERT INTO sources(id) VALUES('source-a'); INSERT INTO representations VALUES('rep-a','source-a','hash'); PRAGMA user_version=12;").unwrap();
+        apply_v13(&mut connection, true, 12).unwrap();
+        apply_v13(&mut connection, true, 13).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM semantic_index_queue WHERE source_id='source-a'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "queued"
+        );
+        assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('semantic_embeddings','semantic_index_queue','semantic_suggestion_decisions')",[],|row|row.get::<_,i64>(0)).unwrap(),3);
+        connection.execute("INSERT INTO semantic_embeddings VALUES('source-a','model','revision',1,'hash',1,x'00',x'0000000000000000','now')",[]).unwrap();
+        connection
+            .execute(
+                "UPDATE sources SET missing_state='modified' WHERE id='source-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM semantic_embeddings", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT priority FROM semantic_index_queue WHERE source_id='source-a' AND state='failed'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            30
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            13
         );
     }
 }

@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const PORTABLE_CATALOGUE_SCHEMA_VERSION: i64 = 3;
+pub(crate) const PORTABLE_CATALOGUE_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -641,8 +641,11 @@ fn portable_organisation(connection: &Connection) -> Result<Value> {
     let stacks=connection.prepare("SELECT id,name,collapsed,top_item_id,created_at,updated_at FROM stacks ORDER BY created_at,id")?.query_map([],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,Option<String>>(1)?,"collapsed":row.get::<_,i64>(2)?!=0,"topItemId":row.get::<_,String>(3)?,"createdAt":row.get::<_,String>(4)?,"updatedAt":row.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let stack_items=connection.prepare("SELECT stack_id,item_id,position FROM stack_items ORDER BY stack_id,position,item_id")?.query_map([],|row|Ok(json!({"stackId":row.get::<_,String>(0)?,"itemId":row.get::<_,String>(1)?,"position":row.get::<_,i64>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let source_groups=connection.prepare("SELECT id,versions_collapsed FROM sources ORDER BY id")?.query_map([],|row|Ok(json!({"sourceId":row.get::<_,String>(0)?,"versionsCollapsed":row.get::<_,i64>(1)?!=0})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    // Only the explicit user decision is portable. Embeddings, queues and
+    // scores remain excluded rebuildable data.
+    let semantic_decisions=connection.prepare("SELECT identity_hash,kind,decision,model_id,model_revision,member_source_ids_json,decided_at FROM semantic_suggestion_decisions ORDER BY decided_at,identity_hash")?.query_map([],|row|{let members:String=row.get(5)?;Ok(json!({"identityHash":row.get::<_,String>(0)?,"kind":row.get::<_,String>(1)?,"decision":row.get::<_,String>(2)?,"modelId":row.get::<_,String>(3)?,"modelRevision":row.get::<_,String>(4)?,"memberSourceIds":serde_json::from_str::<Value>(&members).unwrap_or(Value::Null),"decidedAt":row.get::<_,String>(6)?}))})?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(
-        json!({"collectionSets":sets,"collections":collections,"memberships":memberships,"stacks":stacks,"stackItems":stack_items,"sourceGroups":source_groups}),
+        json!({"collectionSets":sets,"collections":collections,"memberships":memberships,"stacks":stacks,"stackItems":stack_items,"sourceGroups":source_groups,"semanticSuggestionDecisions":semantic_decisions}),
     )
 }
 
@@ -656,7 +659,7 @@ pub(crate) fn export_portable_catalogue(
             "Choose an existing folder for the portable catalogue export.".into(),
         ));
     }
-    let output = destination.join("keepframe-portable-catalogue-v3.json");
+    let output = destination.join("keepframe-portable-catalogue-v4.json");
     let temporary = output.with_extension("json.partial");
     let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut tags = connection.prepare("SELECT at.asset_id,t.name FROM asset_tags at JOIN tags t ON t.id=at.tag_id ORDER BY at.asset_id,t.name COLLATE NOCASE")?;
@@ -861,6 +864,7 @@ pub(crate) fn import_portable_catalogue(connection: &mut Connection, path: &Path
     let stacks = portable_array(&organisation, "stacks")?;
     let stack_items = portable_array(&organisation, "stackItems")?;
     let source_groups = portable_array(&organisation, "sourceGroups")?;
+    let semantic_decisions = portable_array(&organisation, "semanticSuggestionDecisions")?;
     for collection in collections {
         if portable_text(collection, "kind")? == "smart" {
             let rules = serde_json::from_value::<Vec<super::organisation::SmartRule>>(
@@ -869,6 +873,23 @@ pub(crate) fn import_portable_catalogue(connection: &mut Connection, path: &Path
                 })?,
             )?;
             super::organisation::compile_rules(&rules, portable_text(collection, "matchMode")?)?;
+        }
+    }
+    for value in semantic_decisions {
+        let kind = portable_text(value, "kind")?;
+        let decision = portable_text(value, "decision")?;
+        if !matches!(
+            kind,
+            "exact_duplicate" | "near_duplicate" | "burst" | "similar_series"
+        ) || !matches!(decision, "dismissed" | "accepted")
+            || value
+                .get("memberSourceIds")
+                .and_then(Value::as_array)
+                .is_none()
+        {
+            return Err(KeepframeError::Message(
+                "Portable semantic suggestion decision is invalid.".into(),
+            ));
         }
     }
     let imported_ids = portable
@@ -900,7 +921,7 @@ pub(crate) fn import_portable_catalogue(connection: &mut Connection, path: &Path
         }
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch("DELETE FROM collection_items;DELETE FROM collections;DELETE FROM collection_sets;DELETE FROM stack_items;DELETE FROM stacks;")?;
+    tx.execute_batch("DELETE FROM collection_items;DELETE FROM collections;DELETE FROM collection_sets;DELETE FROM stack_items;DELETE FROM stacks;DELETE FROM semantic_suggestion_decisions;")?;
     let existing_virtuals = tx
         .prepare("SELECT id FROM assets WHERE is_primary=0")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -955,6 +976,20 @@ pub(crate) fn import_portable_catalogue(connection: &mut Connection, path: &Path
                     .get("versionsCollapsed")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
+            ],
+        )?;
+    }
+    for value in semantic_decisions {
+        tx.execute(
+            "INSERT INTO semantic_suggestion_decisions(identity_hash,kind,decision,model_id,model_revision,member_source_ids_json,decided_at)VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                portable_text(value, "identityHash")?,
+                portable_text(value, "kind")?,
+                portable_text(value, "decision")?,
+                portable_text(value, "modelId")?,
+                portable_text(value, "modelRevision")?,
+                serde_json::to_string(value.get("memberSourceIds").ok_or_else(|| KeepframeError::Message("Portable semantic suggestion members are missing.".into()))?)?,
+                portable_text(value, "decidedAt")?
             ],
         )?;
     }
@@ -1344,6 +1379,7 @@ mod tests {
         let output = export_portable_catalogue(&connection, &root, &destination).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert_eq!(value["schemaVersion"], PORTABLE_CATALOGUE_SCHEMA_VERSION);
+        assert!(value.get("semanticEmbeddings").is_none());
         assert_eq!(value["assets"][0]["location"]["source"], "manual");
         assert_eq!(
             value["assets"][0]["developRecipe"]["masks"][0]["geometry"]["kind"],

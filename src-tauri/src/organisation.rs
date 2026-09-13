@@ -1072,6 +1072,7 @@ mod tests {
         .unwrap();
         set_stack_top_in(&connection, &stack, &default).unwrap();
         set_stack_collapsed_in(&connection, &stack, false).unwrap();
+        connection.execute("INSERT INTO semantic_suggestion_decisions(identity_hash,kind,decision,model_id,model_revision,member_source_ids_json,decided_at)VALUES('decision-1','burst','dismissed','model','revision','[\"primary\"]','2026-09-13T10:00:00Z')",[]).unwrap();
         assert_eq!(list_stacks_in(&connection).unwrap()[0].member_ids.len(), 3);
         assert!(delete_version_in(&connection, "primary").is_err());
         let destination = root.join("portable");
@@ -1090,6 +1091,9 @@ mod tests {
         connection
             .execute("DELETE FROM assets WHERE is_primary=0", [])
             .unwrap();
+        connection
+            .execute("DELETE FROM semantic_suggestion_decisions", [])
+            .unwrap();
         assert_eq!(
             super::super::interoperability::import_portable_catalogue(&mut connection, &portable)
                 .unwrap(),
@@ -1098,6 +1102,16 @@ mod tests {
         assert_eq!(list_versions_in(&connection, "primary").unwrap().len(), 4);
         assert_eq!(list_collections_in(&connection).unwrap().len(), 2);
         assert_eq!(list_stacks_in(&connection).unwrap()[0].top_item_id, default);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT decision FROM semantic_suggestion_decisions WHERE identity_hash='decision-1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "dismissed"
+        );
         assert_eq!(
             super::super::develop_recipe_in(&connection, &current).unwrap(),
             recipe

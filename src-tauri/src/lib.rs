@@ -3,12 +3,13 @@ mod migrations;
 mod organisation;
 mod professional_export;
 mod safety;
+mod semantic;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use fs2::FileExt;
-use image::{GenericImageView, ImageDecoder, ImageFormat, RgbImage};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, RgbImage};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rayon::prelude::*;
 use reqwest::multipart;
@@ -35,7 +36,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
 const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
@@ -79,6 +80,11 @@ struct AppState {
     preview_generation: Arc<AtomicU64>,
     renderer_caches: Arc<Mutex<RendererCaches>>,
     mask_install_cancel: AtomicBool,
+    semantic_install_cancel: AtomicBool,
+    semantic_index_cancel: AtomicBool,
+    semantic_index_paused: AtomicBool,
+    semantic_generation: AtomicU64,
+    semantic_index_generation: AtomicU64,
     export_generation: Arc<AtomicU64>,
     batch_generation: Arc<AtomicU64>,
     folder_watcher: Mutex<Option<FolderWatcher>>,
@@ -448,6 +454,20 @@ struct WorkerSegmentationResult {
     model: String,
     model_revision: String,
     model_sha256: String,
+    timings: Value,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerEmbeddingResult {
+    vector: Vec<f32>,
+    execution_provider: String,
+    provider: String,
+    provider_version: String,
+    model: String,
+    model_revision: String,
+    model_sha256: String,
+    dimensions: usize,
+    preprocessing_version: i64,
     timings: Value,
 }
 #[derive(Debug, Serialize)]
@@ -1473,6 +1493,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v10(&mut connection, existed, version)?;
     migrations::apply_v11(&mut connection, existed, version)?;
     migrations::apply_v12(&mut connection, existed, version)?;
+    migrations::apply_v13(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -1718,6 +1739,10 @@ fn ensure_analysis_worker_source() -> Result<PathBuf> {
             "segmentation.py",
             include_str!("../../ai-worker/keepframe_worker/segmentation.py"),
         ),
+        (
+            "semantic.py",
+            include_str!("../../ai-worker/keepframe_worker/semantic.py"),
+        ),
     ] {
         let destination = package.join(name);
         if fs::read_to_string(&destination).ok().as_deref() != Some(contents) {
@@ -1743,6 +1768,26 @@ fn segmentation_model_installed() -> bool {
             .is_ok_and(|metadata| metadata.len() == SEGMENTATION_MODEL_BYTES)
         && fs::read_to_string(root.join("MODEL_SHA256.txt"))
             .is_ok_and(|value| value.trim().eq_ignore_ascii_case(SEGMENTATION_MODEL_SHA256))
+}
+fn semantic_model_path() -> PathBuf {
+    PathBuf::from(r"D:\AI Models\Keepframe\semantic\siglip-base-patch16-224")
+}
+fn semantic_model_installed() -> bool {
+    let root = semantic_model_path();
+    [
+        "config.json",
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+        "spiece.model",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+    .iter()
+    .all(|name| root.join(name).is_file())
+        && fs::metadata(root.join("model.safetensors"))
+            .is_ok_and(|metadata| metadata.len() == semantic::MODEL_BYTES)
+        && fs::read_to_string(root.join("MODEL_SHA256.txt"))
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case(semantic::MODEL_SHA256))
 }
 fn intelligent_mask_health_snapshot(
     loaded: bool,
@@ -2146,6 +2191,412 @@ async fn install_intelligent_mask_model(
     Ok(intelligent_mask_health_snapshot(false, false, "not loaded"))
 }
 
+async fn semantic_worker_state(state: &AppState) -> (bool, bool, String) {
+    if !semantic_model_installed() || analysis_runtime_path().is_none() {
+        return (false, false, "unavailable".into());
+    }
+    let Ok((url, token)) = analysis_worker_endpoint(state) else {
+        return (false, false, "starting".into());
+    };
+    for _ in 0..12 {
+        if let Ok(response) = reqwest::Client::new()
+            .get(format!("{url}/health"))
+            .header("X-Keepframe-Token", &token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(details) = value.get("semantic") {
+                        return (
+                            details
+                                .get("loaded")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            details
+                                .get("busy")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            details
+                                .get("executionProvider")
+                                .and_then(Value::as_str)
+                                .unwrap_or("not loaded")
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    (false, false, "starting".into())
+}
+
+#[tauri::command]
+async fn get_semantic_index_status(
+    state: State<'_, AppState>,
+) -> Result<semantic::SemanticIndexStatus> {
+    let root = root_from(&state)?;
+    let connection = open_db(&root)?;
+    semantic::ensure_current_queue(&connection)?;
+    let (loaded, worker_busy, provider) = semantic_worker_state(&state).await;
+    semantic::status(
+        &connection,
+        semantic::SemanticRuntimeStatus {
+            installed: semantic_model_installed(),
+            runtime_available: analysis_runtime_path().is_some(),
+            loaded,
+            busy: worker_busy,
+            paused: state.semantic_index_paused.load(Ordering::SeqCst),
+            execution_provider: provider,
+            storage_path: semantic_model_path().to_string_lossy().into(),
+        },
+    )
+}
+
+#[tauri::command]
+fn cancel_semantic_model_install(state: State<'_, AppState>) {
+    state.semantic_install_cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn install_semantic_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<semantic::SemanticIndexStatus> {
+    if !semantic_model_installed() {
+        state.semantic_install_cancel.store(false, Ordering::SeqCst);
+        let root = semantic_model_path();
+        fs::create_dir_all(&root)?;
+        let files = [
+            ("config.json", 432_u64, None),
+            ("preprocessor_config.json", 368_u64, None),
+            ("special_tokens_map.json", 409_u64, None),
+            (
+                "spiece.model",
+                798_330_u64,
+                Some("80004a3b080eadaf5b5506765c7446744ce341114fc14fa4f833585f39624696"),
+            ),
+            ("tokenizer.json", 2_399_357_u64, None),
+            ("tokenizer_config.json", 711_u64, None),
+            (
+                "model.safetensors",
+                semantic::MODEL_BYTES,
+                Some(semantic::MODEL_SHA256),
+            ),
+        ];
+        let client = reqwest::Client::new();
+        let mut overall = 0_u64;
+        for (name, expected, expected_hash) in files {
+            let destination = root.join(name);
+            let partial = root.join(format!("{name}.partial"));
+            let source = format!(
+                "https://huggingface.co/{}/resolve/{}/{name}",
+                semantic::MODEL_ID,
+                semantic::MODEL_REVISION
+            );
+            let mut response = client.get(source).send().await?.error_for_status()?;
+            let mut file = fs::File::create(&partial)?;
+            let mut digest = Sha256::new();
+            let mut received = 0_u64;
+            while let Some(chunk) = response.chunk().await? {
+                if state.semantic_install_cancel.load(Ordering::SeqCst) {
+                    drop(file);
+                    let _ = fs::remove_file(&partial);
+                    return Err(KeepframeError::Message("Semantic model installation was cancelled; completed files remain reusable.".into()));
+                }
+                file.write_all(&chunk)?;
+                digest.update(&chunk);
+                received += chunk.len() as u64;
+                overall += chunk.len() as u64;
+                let _ = app.emit("semantic-install-progress", json!({"file":name,"receivedBytes":overall,"currentFileBytes":received,"fileBytes":expected,"totalBytes":semantic::INSTALL_BYTES}));
+            }
+            file.sync_all()?;
+            drop(file);
+            if received != expected {
+                let _ = fs::remove_file(&partial);
+                return Err(KeepframeError::Message(format!(
+                    "The downloaded {name} file was truncated."
+                )));
+            }
+            if let Some(expected_hash) = expected_hash {
+                if format!("{:x}", digest.finalize()) != expected_hash {
+                    let _ = fs::remove_file(&partial);
+                    return Err(KeepframeError::Message(format!(
+                        "The downloaded {name} failed SHA-256 verification."
+                    )));
+                }
+            } else if name.ends_with(".json") {
+                serde_json::from_slice::<Value>(&fs::read(&partial)?)?;
+            }
+            if destination.exists() {
+                fs::remove_file(&destination)?;
+            }
+            fs::rename(&partial, &destination)?;
+        }
+        fs::write(
+            root.join("MODEL_SHA256.txt"),
+            format!("{}\n", semantic::MODEL_SHA256),
+        )?;
+    }
+    get_semantic_index_status(state).await
+}
+
+fn validate_worker_embedding(result: &WorkerEmbeddingResult) -> Result<()> {
+    if result.provider != semantic::PROVIDER
+        || result.provider_version != semantic::PROVIDER_VERSION
+        || result.model != semantic::MODEL_ID
+        || result.model_revision != semantic::MODEL_REVISION
+        || result.model_sha256 != semantic::MODEL_SHA256
+        || result.dimensions != semantic::DIMENSION
+        || result.preprocessing_version != semantic::PREPROCESSING_VERSION
+        || result.vector.len() != semantic::DIMENSION
+        || result.vector.iter().any(|value| !value.is_finite())
+    {
+        return Err(KeepframeError::Message(
+            "The semantic provider returned incompatible or corrupt provenance.".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn request_image_embedding(
+    url: &str,
+    token: &str,
+    image: DynamicImage,
+) -> Result<WorkerEmbeddingResult> {
+    let png = encode_srgb_png(&DynamicImage::ImageRgb8(
+        image.thumbnail(640, 640).to_rgb8(),
+    ))?;
+    let form = multipart::Form::new().part(
+        "image",
+        multipart::Part::bytes(png)
+            .file_name("semantic.png")
+            .mime_str("image/png")?,
+    );
+    let result = reqwest::Client::new()
+        .post(format!("{url}/v1/semantic/image"))
+        .header("X-Keepframe-Token", token)
+        .timeout(Duration::from_secs(300))
+        .multipart(form)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<WorkerEmbeddingResult>()
+        .await?;
+    validate_worker_embedding(&result)?;
+    Ok(result)
+}
+
+async fn request_text_embedding(
+    url: &str,
+    token: &str,
+    query: &str,
+) -> Result<WorkerEmbeddingResult> {
+    let form = multipart::Form::new().text("query", query.to_owned());
+    let result = reqwest::Client::new()
+        .post(format!("{url}/v1/semantic/text"))
+        .header("X-Keepframe-Token", token)
+        .timeout(Duration::from_secs(300))
+        .multipart(form)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<WorkerEmbeddingResult>()
+        .await?;
+    validate_worker_embedding(&result)?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn pause_semantic_index(state: State<'_, AppState>) {
+    state.semantic_index_paused.store(true, Ordering::SeqCst);
+    state
+        .semantic_index_generation
+        .fetch_add(1, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn cancel_semantic_index(state: State<'_, AppState>) {
+    state.semantic_index_cancel.store(true, Ordering::SeqCst);
+    state
+        .semantic_index_generation
+        .fetch_add(1, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn start_semantic_index(
+    rebuild: Option<bool>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<semantic::SemanticIndexStatus> {
+    if !semantic_model_installed() {
+        return Err(KeepframeError::Message(
+            "Install the pinned local semantic model before indexing.".into(),
+        ));
+    }
+    let root = root_from(&state)?;
+    if rebuild.unwrap_or(false) {
+        semantic::rebuild_index(&mut open_db(&root)?)?;
+    }
+    semantic::requeue_running(&open_db(&root)?)?;
+    state.semantic_index_paused.store(false, Ordering::SeqCst);
+    state.semantic_index_cancel.store(false, Ordering::SeqCst);
+    let generation = state
+        .semantic_index_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    let (url, token) = analysis_worker_endpoint(&state)?;
+    let total = open_db(&root)?.query_row(
+        "SELECT count(*) FROM semantic_index_queue WHERE state IN('queued','running')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut completed = 0_i64;
+    loop {
+        if generation != state.semantic_index_generation.load(Ordering::SeqCst)
+            || state.semantic_index_cancel.load(Ordering::SeqCst)
+            || state.semantic_index_paused.load(Ordering::SeqCst)
+        {
+            break;
+        }
+        let Some((source_id, thumbnail, source_hash)) =
+            semantic::next_queued_source(&open_db(&root)?)?
+        else {
+            break;
+        };
+        semantic::mark_queue_running(&open_db(&root)?, &source_id)?;
+        let outcome = match image::open(&thumbnail) {
+            Ok(image) => {
+                let hash = semantic::perceptual_hash(&image);
+                let _gpu_guard = state.gpu_gate.lock().await;
+                request_image_embedding(&url, &token, image)
+                    .await
+                    .map(|result| (result, hash))
+            }
+            Err(error) => Err(error.into()),
+        };
+        match outcome {
+            Ok((result, perceptual_hash)) => {
+                let timings = result.timings.clone();
+                semantic::upsert_embedding(
+                    &mut open_db(&root)?,
+                    &source_id,
+                    &source_hash,
+                    &result.vector,
+                    perceptual_hash,
+                )?;
+                completed += 1;
+                let _=app.emit("semantic-index-progress",json!({"current":completed,"total":total,"sourceId":source_id,"executionProvider":result.execution_provider,"timings":timings}));
+            }
+            Err(error) => {
+                semantic::mark_queue_failure(&open_db(&root)?, &source_id, &error.to_string())?;
+                completed += 1;
+                let _=app.emit("semantic-index-progress",json!({"current":completed,"total":total,"sourceId":source_id,"error":error.to_string()}));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    get_semantic_index_status(state).await
+}
+
+#[tauri::command]
+async fn semantic_search(
+    request: semantic::SemanticSearchRequest,
+    state: State<'_, AppState>,
+) -> Result<Value> {
+    if !semantic_model_installed() {
+        return Err(KeepframeError::Message(
+            "Semantic search needs the optional local model.".into(),
+        ));
+    }
+    let request_id = state.semantic_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let (url, token) = analysis_worker_endpoint(&state)?;
+    let _gpu_guard = state.gpu_gate.lock().await;
+    let embedded = request_text_embedding(&url, &token, request.query.trim()).await?;
+    if request_id != state.semantic_generation.load(Ordering::SeqCst) {
+        return Err(KeepframeError::Message(
+            "Semantic query was superseded by a newer request.".into(),
+        ));
+    }
+    let results = semantic::search(&open_db(&root_from(&state)?)?, &embedded.vector, &request)?;
+    Ok(
+        json!({"requestId":request_id,"results":results,"executionProvider":embedded.execution_provider,"timings":embedded.timings}),
+    )
+}
+
+#[tauri::command]
+fn cancel_semantic_search(state: State<'_, AppState>) {
+    state.semantic_generation.fetch_add(1, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn find_similar_sources(
+    item_id: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<semantic::SemanticSearchResult>> {
+    semantic::find_similar(
+        &open_db(&root_from(&state)?)?,
+        &item_id,
+        limit.unwrap_or(80),
+    )
+}
+
+#[tauri::command]
+fn discover_semantic_groups(
+    kind: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<semantic::DiscoveryGroup>> {
+    let connection = open_db(&root_from(&state)?)?;
+    match kind.as_str() {
+        "duplicates" => semantic::duplicate_groups(&connection),
+        "suggestions" => semantic::burst_suggestions(&connection),
+        _ => Err(KeepframeError::Message(
+            "Unsupported semantic discovery group kind.".into(),
+        )),
+    }
+}
+
+#[tauri::command]
+fn decide_semantic_suggestion(
+    group: semantic::DiscoveryGroup,
+    decision: String,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    semantic::record_suggestion_decision(&open_db(&root_from(&state)?)?, &group, &decision)
+}
+
+#[tauri::command]
+fn propose_smart_collection_rules(input: String) -> Result<Value> {
+    semantic::propose_smart_collection(&input)
+}
+
+#[tauri::command]
+fn semantic_index_health(state: State<'_, AppState>) -> Result<Vec<String>> {
+    semantic::health_issues(&open_db(&root_from(&state)?)?)
+}
+
+#[tauri::command]
+fn prioritise_semantic_sources(item_ids: Vec<String>, state: State<'_, AppState>) -> Result<usize> {
+    let connection = open_db(&root_from(&state)?)?;
+    let mut source_ids = Vec::new();
+    for item_id in item_ids.iter().take(500) {
+        if let Some(source_id) = connection
+            .query_row(
+                "SELECT source_id FROM assets WHERE id=?1",
+                [item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            source_ids.push(source_id);
+        }
+    }
+    semantic::queue_sources(&connection, &source_ids, 100)
+}
+
 #[tauri::command]
 async fn propose_intelligent_mask(
     asset_id: String,
@@ -2337,7 +2788,8 @@ fn check_catalogue_integrity(state: State<'_, AppState>) -> Result<String> {
     if sqlite != "ok" {
         return Ok(sqlite);
     }
-    let issues = organisation::health_issues(&connection)?;
+    let mut issues = organisation::health_issues(&connection)?;
+    issues.extend(semantic::health_issues(&connection)?);
     if issues.is_empty() {
         Ok("ok".into())
     } else {
@@ -8195,6 +8647,11 @@ pub fn run() {
             preview_generation: Arc::new(AtomicU64::new(0)),
             renderer_caches: Arc::new(Mutex::new(RendererCaches::default())),
             mask_install_cancel: AtomicBool::new(false),
+            semantic_install_cancel: AtomicBool::new(false),
+            semantic_index_cancel: AtomicBool::new(false),
+            semantic_index_paused: AtomicBool::new(false),
+            semantic_generation: AtomicU64::new(0),
+            semantic_index_generation: AtomicU64::new(0),
             export_generation: Arc::new(AtomicU64::new(0)),
             batch_generation: Arc::new(AtomicU64::new(0)),
             folder_watcher: Mutex::new(None),
@@ -8241,6 +8698,20 @@ pub fn run() {
             cancel_intelligent_mask_install,
             propose_intelligent_mask,
             cancel_intelligent_mask,
+            get_semantic_index_status,
+            install_semantic_model,
+            cancel_semantic_model_install,
+            start_semantic_index,
+            pause_semantic_index,
+            cancel_semantic_index,
+            semantic_search,
+            cancel_semantic_search,
+            find_similar_sources,
+            discover_semantic_groups,
+            decide_semantic_suggestion,
+            propose_smart_collection_rules,
+            semantic_index_health,
+            prioritise_semantic_sources,
             configure_local_ai,
             initialise_library,
             prepare_review_preview,
