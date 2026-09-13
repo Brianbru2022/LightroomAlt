@@ -5,11 +5,13 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { neutralAdjustments, neutralAdvancedDevelop, type AiAction, type Asset, type AssetFilter, type AssetPage, type AssetVersion, type AutoProposal, type BasicAdjustments, type BatchAutoSummary, type BatchJob, type BatchSummary, type CatalogueCollection, type CatalogueVersion, type CollectionSet, type Decision, type DevelopPreset, type DevelopRecipe, type DiscoveryGroup, type EditIntent, type EditRecipe, type ExportBatchReport, type ExportConfig, type ExportPreset, type ExportProgress, type FolderWatchEvent, type ImportOptions, type ImportSummary, type IntelligentMaskCategory, type IntelligentMaskHealth, type IntelligentMaskProposal, type IntegrityReport, type LensProfileStatus, type LibraryMetadataPatch, type LibraryStatus, type MapAsset, type MapBounds, type PromptSet, type RelinkCandidate, type SemanticIndexStatus, type SemanticSearchRequest, type SemanticSearchResponse, type SemanticSearchResult, type ServiceHealth, type SidecarExportSummary, type SidecarImportResult, type SmartCollectionProposal, type SmartRule, type StackSummary, type SyncCategory, type TrashSummary } from "../types";
 import { demoAssets, demoJobs, demoStatus, makeRecipe, renderPrompts } from "./demo";
+import type { AiDerivative, AiEnhancementHealth, AiEnhancementJob, AiEnhancementOperation, AiEnhancementPreview, AiEnhancementProgress, AiEnhancementRequest } from "../types";
 
 const tauri = () => "__TAURI_INTERNALS__" in window;
 export const defaultExportConfig = (changes: Partial<ExportConfig> = {}): ExportConfig => ({ schemaVersion: 1, format: "jpeg", jpegQuality: 90, pngCompression: "balanced", resizeMode: "original", width: 2400, height: 1600, percentage: 100, noEnlarge: true, ppi: 300, sharpening: "standard", metadata: "all", includeLocation: false, includeKeywords: true, includeRating: true, filenameTemplate: "{stem}-{sequence}", customText: "", sequenceStart: 1, sequencePadding: 3, collision: "unique", colourSpace: "srgb", ...changes });
 const intelligentMaskDemo = () => !tauri() && ["localhost", "127.0.0.1"].includes(window.location.hostname) && new URLSearchParams(window.location.search).has("intelligentMaskDemo");
 const semanticDemo = () => !tauri() && ["localhost", "127.0.0.1"].includes(window.location.hostname) && new URLSearchParams(window.location.search).has("semanticDemo");
+const enhancementDemo = () => !tauri() && ["localhost", "127.0.0.1"].includes(window.location.hostname) && new URLSearchParams(window.location.search).has("enhancementDemo");
 const browserMaskCoverage = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAYCAAAAAC+OKDoAAAAP0lEQVR4nGNgGAKAEZnzH4soEzZ5BgQLSe1/7EYjm4AVMOEwgOE/ySYMCQWMaBJEBxSyRqwxgGwCQhTdvgEGAKyOBxyY54qVAAAAAElFTkSuQmCC";
 let browserAssets = structuredClone(demoAssets);
 const browserDevelopRecipes = new Map<string, DevelopRecipe>();
@@ -147,7 +149,7 @@ export const api = {
     return invoke("import_xmp_sidecar", { assetId });
   },
   async exportPortableCatalogue(): Promise<string | null> {
-    if (!tauri()) return "D:\\Photo Library\\keepframe-portable-catalogue-v4.json";
+    if (!tauri()) return "D:\\Photo Library\\keepframe-portable-catalogue-v5.json";
     const destination = await open({ directory: true, multiple: false, title: "Choose a local folder for the portable catalogue export" });
     if (typeof destination !== "string") return null;
     const path = await invoke<string>("export_portable_catalogue", { destination });
@@ -156,7 +158,7 @@ export const api = {
   },
   async importPortableCatalogue():Promise<number|null>{if(!tauri())return browserAssets.length;const path=await open({multiple:false,directory:false,title:"Choose a Keepframe portable catalogue",filters:[{name:"Keepframe portable catalogue",extensions:["json"]}]});if(typeof path!=="string")return null;return invoke("import_portable_catalogue",{path});},
   async rescanLibrary(): Promise<IntegrityReport> {
-    if (!tauri()) return { scannedAssets: browserAssets.length, missingOriginals: 0, missingDerivedVersions: 0, modifiedOriginals: 0, untrackedManagedFiles: 0, sidecarConflicts: 0, findings: [] };
+    if (!tauri()) return { scannedAssets: browserAssets.length, missingOriginals: 0, missingDerivedVersions: 0, modifiedOriginals: 0, missingAiDerivatives: 0, modifiedAiDerivatives: 0, orphanAiDerivatives: 0, unsupportedAiProvenance: 0, untrackedManagedFiles: 0, sidecarConflicts: 0, findings: [] };
     return invoke("rescan_library");
   },
   async relinkSelectedAsset(assetId: string): Promise<string | null> {
@@ -442,6 +444,33 @@ export const api = {
     throw new Error("Intelligent masking model not installed.");
   },
   async cancelIntelligentMask(): Promise<void> { if (tauri()) return invoke("cancel_intelligent_mask"); },
+  async aiEnhancementHealth(): Promise<AiEnhancementHealth> {
+    if (tauri()) return invoke("get_ai_enhancement_health");
+    const installed=enhancementDemo();
+    return {runtimeAvailable:installed,busy:false,cudaAvailable:installed,cudaFreeBytes:24_000_000_000,cudaTotalBytes:32_000_000_000,models:(["denoise","super_resolution"] as AiEnhancementOperation[]).map(operation=>({operation,installed,loaded:false,provider:"Keepframe local restoration provider",providerVersion:"1.0.0",model:operation==="denoise"?"SCUNet colour real PSNR":"Real-ESRGAN x4plus",modelRevision:operation==="denoise"?"SCUNet pinned revision":"Real-ESRGAN pinned revision",modelSha256:"0".repeat(64),licence:operation==="denoise"?"Apache-2.0":"BSD-3-Clause",source:"Official upstream release",approximateBytes:operation==="denoise"?71_982_841:67_040_989,storagePath:"D:\\AI Models\\Keepframe\\enhancement",executionProvider:installed?"CUDA browser fixture":"not loaded",loadedMs:0,supportedScales:operation==="denoise"?[1]:[2,4]}))};
+  },
+  async installAiEnhancementModel(operation:AiEnhancementOperation,onProgress:(progress:{operation:AiEnhancementOperation;receivedBytes:number;totalBytes:number;file:string})=>void):Promise<AiEnhancementHealth>{
+    if(!tauri())return this.aiEnhancementHealth();
+    const unlisten=await listen<{operation:AiEnhancementOperation;receivedBytes:number;totalBytes:number;file:string}>("ai-enhancement-install-progress",event=>onProgress(event.payload));
+    try{return await invoke("install_ai_enhancement_model",{operation});}finally{unlisten();}
+  },
+  async cancelAiEnhancementModelInstall():Promise<void>{if(tauri())return invoke("cancel_ai_enhancement_model_install");},
+  async previewAiEnhancement(request:AiEnhancementRequest):Promise<AiEnhancementPreview>{
+    if(tauri()){const value=await invoke<Omit<AiEnhancementPreview,"beforeUrl"|"afterUrl">>("preview_ai_enhancement",{request});return{...value,beforeUrl:convertFileSrc(value.beforePath),afterUrl:convertFileSrc(value.afterPath)};}
+    if(!enhancementDemo())throw new Error("Install the selected local enhancement model before previewing.");
+    const asset=browserAssets.find(value=>value.id===request.assetId);if(!asset)throw new Error("That catalogue item no longer exists.");
+    return{previewId:crypto.randomUUID(),beforePath:asset.previewUrl,afterPath:asset.previewUrl,beforeUrl:asset.previewUrl,afterUrl:asset.previewUrl,width:request.operation==="super_resolution"?768:384,height:request.operation==="super_resolution"?512:256,provenance:{operation:request.operation,provider:"Keepframe local restoration provider",providerVersion:"1.0.0",model:request.operation==="denoise"?"SCUNet colour real PSNR":"Real-ESRGAN x4plus",modelRevision:"browser fixture",modelSha256:"0".repeat(64),executionProvider:"CUDA browser fixture",scale:request.targetScale,tileSize:256,overlap:request.operation==="denoise"?32:16,tilePeakBytes:120_000_000,timings:{loadMs:0,preprocessMs:3,inferenceMs:120,postprocessMs:9,writeValidateMs:4,totalMs:136}}};
+  },
+  async cancelAiEnhancementPreview():Promise<void>{if(tauri())return invoke("cancel_ai_enhancement_preview");},
+  async applyAiEnhancement(request:AiEnhancementRequest):Promise<AiDerivative>{
+    if(tauri())return invoke("apply_ai_enhancement",{request});
+    throw new Error("Full-resolution AI enhancement is available only in the desktop app.");
+  },
+  async cancelAiEnhancement(assetId:string):Promise<void>{if(tauri())return invoke("cancel_ai_enhancement",{assetId});},
+  async aiEnhancementJobs(assetId?:string):Promise<AiEnhancementJob[]>{return tauri()?invoke("list_ai_enhancement_jobs",{assetId:assetId??null}):[];},
+  async aiDerivative(assetId:string):Promise<AiDerivative|null>{return tauri()?invoke("get_ai_derivative",{assetId}):null;},
+  async deleteAiDerivative(assetId:string):Promise<string>{if(!tauri())throw new Error("No managed derivative exists in browser preview.");return invoke("delete_ai_derivative",{assetId,confirmed:true});},
+  async onAiEnhancementProgress(handler:(progress:AiEnhancementProgress)=>void):Promise<()=>void>{if(!tauri())return()=>undefined;const removeFull=await listen<AiEnhancementProgress>("ai-enhancement-progress",event=>handler(event.payload));const removePreview=await listen<AiEnhancementProgress>("ai-enhancement-preview-progress",event=>handler(event.payload));return()=>{removeFull();removePreview();};},
   async developPresets(): Promise<DevelopPreset[]> { return tauri() ? invoke("list_develop_presets") : structuredClone([...browserBuiltInDevelopPresets, ...browserDevelopPresets]); },
   async saveDevelopPreset(preset: DevelopPreset): Promise<DevelopPreset> {
     if (tauri()) return invoke("save_develop_preset", { preset });

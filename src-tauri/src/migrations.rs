@@ -583,6 +583,58 @@ pub(crate) fn apply_v14(
     tx.commit()
 }
 
+/// Version 15 introduces authoritative AI-derived pixel sources. The new rows
+/// point at managed lossless files and keep parent/root lineage separate from
+/// virtual versions, recipes, disposable previews and model installations.
+pub(crate) fn apply_v15(
+    connection: &mut Connection,
+    _existed: bool,
+    version: i64,
+) -> rusqlite::Result<()> {
+    if version >= 15 {
+        return Ok(());
+    }
+    let tx = connection.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_derivatives(
+            id TEXT PRIMARY KEY,
+            parent_source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
+            root_source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
+            derived_source_id TEXT NOT NULL UNIQUE REFERENCES sources(id) ON DELETE CASCADE,
+            source_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE RESTRICT,
+            operation TEXT NOT NULL CHECK(operation IN('denoise','super_resolution')),
+            provider TEXT NOT NULL,provider_version TEXT NOT NULL,
+            model_id TEXT NOT NULL,model_revision TEXT NOT NULL,model_sha256 TEXT NOT NULL,
+            execution_provider TEXT NOT NULL,parameters_json TEXT NOT NULL,
+            scale INTEGER NOT NULL CHECK(scale IN(1,2,4)),tile_size INTEGER NOT NULL,
+            overlap INTEGER NOT NULL,source_sha256 TEXT NOT NULL,output_sha256 TEXT NOT NULL,
+            output_width INTEGER NOT NULL,output_height INTEGER NOT NULL,
+            pixel_format TEXT NOT NULL,bit_depth INTEGER NOT NULL,
+            managed_relative_path TEXT NOT NULL UNIQUE,provenance_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+         CREATE INDEX IF NOT EXISTS idx_ai_derivatives_parent ON ai_derivatives(parent_source_id,created_at);
+         CREATE INDEX IF NOT EXISTS idx_ai_derivatives_root ON ai_derivatives(root_source_id,created_at);
+         CREATE TABLE IF NOT EXISTS ai_enhancement_jobs(
+            id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE RESTRICT,
+            operation TEXT NOT NULL CHECK(operation IN('denoise','super_resolution')),
+            state TEXT NOT NULL CHECK(state IN('preparing','loading_model','processing','writing','validating','complete','failed','cancelled')),
+            stage TEXT NOT NULL,tiles_complete INTEGER NOT NULL DEFAULT 0,
+            tiles_total INTEGER NOT NULL DEFAULT 0,request_json TEXT NOT NULL,
+            temporary_path TEXT,error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,
+            result_asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_ai_jobs_state_updated ON ai_enhancement_jobs(state,updated_at);",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_migrations(version,applied_at)VALUES(15,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.pragma_update(None, "user_version", 15)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,5 +918,18 @@ mod tests {
                 .unwrap(),
             14
         );
+    }
+
+    #[test]
+    fn v15_migration_adds_authoritative_derivatives_and_durable_jobs() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); CREATE TABLE sources(id TEXT PRIMARY KEY); CREATE TABLE assets(id TEXT PRIMARY KEY,source_id TEXT REFERENCES sources(id)); PRAGMA user_version=14;").unwrap();
+        apply_v15(&mut connection, true, 14).unwrap();
+        apply_v15(&mut connection, true, 15).unwrap();
+        let tables: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('ai_derivatives','ai_enhancement_jobs')", [], |row| row.get(0)).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!((tables, version), (2, 15));
     }
 }

@@ -1,0 +1,257 @@
+{
+  "hardware": {
+    "runtimeAvailable": true,
+    "busy": false,
+    "cudaAvailable": true,
+    "cudaFreeBytes": 31475105792,
+    "cudaTotalBytes": 34190458880,
+    "models": [
+      {
+        "operation": "denoise",
+        "installed": true,
+        "loaded": false,
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "model": "SCUNet colour real PSNR",
+        "modelRevision": "SCUNet@52e440a80a655b01e0b41e9dd9bfe599bc11625e+KAIR-v1.0",
+        "modelSha256": "fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e",
+        "licence": "Apache-2.0",
+        "source": "https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth",
+        "approximateBytes": 71982841,
+        "storagePath": "D:\\AI Models\\Keepframe\\enhancement\\scunet_color_real_psnr.pth",
+        "executionProvider": "not loaded",
+        "loadedMs": 0,
+        "supportedScales": [
+          1
+        ]
+      },
+      {
+        "operation": "super_resolution",
+        "installed": true,
+        "loaded": true,
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "model": "Real-ESRGAN x4plus",
+        "modelRevision": "Real-ESRGAN@a4abfb2979a7bbff3f69f58f58ae324608821e27+v0.1.0",
+        "modelSha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+        "licence": "BSD-3-Clause",
+        "source": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "approximateBytes": 67040989,
+        "storagePath": "D:\\AI Models\\Keepframe\\enhancement\\RealESRGAN_x4plus.pth",
+        "executionProvider": "CUDA FP16",
+        "loadedMs": 151,
+        "supportedScales": [
+          2,
+          4
+        ]
+      }
+    ]
+  },
+  "denoise": {
+    "tile": [
+      512,
+      512
+    ],
+    "cold": {
+      "width": 512,
+      "height": 512,
+      "scale": 1,
+      "executionProvider": "CUDA FP16",
+      "tilePeakBytes": 471127040,
+      "timings": {
+        "loadMs": 1322,
+        "preprocessMs": 9,
+        "inferenceMs": 310,
+        "postprocessMs": 28
+      },
+      "model": "SCUNet colour real PSNR",
+      "modelRevision": "SCUNet@52e440a80a655b01e0b41e9dd9bfe599bc11625e+KAIR-v1.0",
+      "modelSha256": "fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e",
+      "provider": "Keepframe local restoration provider",
+      "providerVersion": "1.0.0",
+      "observedTotalMs": 1669,
+      "pngBytes": 463572
+    },
+    "warm": [
+      {
+        "width": 512,
+        "height": 512,
+        "scale": 1,
+        "executionProvider": "CUDA FP16",
+        "tilePeakBytes": 470995968,
+        "timings": {
+          "loadMs": 0,
+          "preprocessMs": 1,
+          "inferenceMs": 29,
+          "postprocessMs": 16
+        },
+        "model": "SCUNet colour real PSNR",
+        "modelRevision": "SCUNet@52e440a80a655b01e0b41e9dd9bfe599bc11625e+KAIR-v1.0",
+        "modelSha256": "fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e",
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "observedTotalMs": 46,
+        "pngBytes": 463572
+      },
+      {
+        "width": 512,
+        "height": 512,
+        "scale": 1,
+        "executionProvider": "CUDA FP16",
+        "tilePeakBytes": 470995968,
+        "timings": {
+          "loadMs": 0,
+          "preprocessMs": 1,
+          "inferenceMs": 30,
+          "postprocessMs": 14
+        },
+        "model": "SCUNet colour real PSNR",
+        "modelRevision": "SCUNet@52e440a80a655b01e0b41e9dd9bfe599bc11625e+KAIR-v1.0",
+        "modelSha256": "fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e",
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "observedTotalMs": 46,
+        "pngBytes": 463572
+      },
+      {
+        "width": 512,
+        "height": 512,
+        "scale": 1,
+        "executionProvider": "CUDA FP16",
+        "tilePeakBytes": 470995968,
+        "timings": {
+          "loadMs": 0,
+          "preprocessMs": 1,
+          "inferenceMs": 30,
+          "postprocessMs": 15
+        },
+        "model": "SCUNet colour real PSNR",
+        "modelRevision": "SCUNet@52e440a80a655b01e0b41e9dd9bfe599bc11625e+KAIR-v1.0",
+        "modelSha256": "fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e",
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "observedTotalMs": 46,
+        "pngBytes": 463572
+      }
+    ],
+    "quality": {
+      "noisyMse": 139.464,
+      "outputMse": 512.418
+    }
+  },
+  "superResolution": {
+    "tile": [
+      256,
+      256
+    ],
+    "output": [
+      1024,
+      1024
+    ],
+    "cold": {
+      "width": 1024,
+      "height": 1024,
+      "scale": 4,
+      "executionProvider": "CUDA FP16",
+      "tilePeakBytes": 604441600,
+      "timings": {
+        "loadMs": 195,
+        "preprocessMs": 0,
+        "inferenceMs": 98,
+        "postprocessMs": 56
+      },
+      "model": "Real-ESRGAN x4plus",
+      "modelRevision": "Real-ESRGAN@a4abfb2979a7bbff3f69f58f58ae324608821e27+v0.1.0",
+      "modelSha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+      "provider": "Keepframe local restoration provider",
+      "providerVersion": "1.0.0",
+      "observedTotalMs": 350,
+      "pngBytes": 1584854
+    },
+    "warm": [
+      {
+        "width": 1024,
+        "height": 1024,
+        "scale": 4,
+        "executionProvider": "CUDA FP16",
+        "tilePeakBytes": 604441600,
+        "timings": {
+          "loadMs": 0,
+          "preprocessMs": 1,
+          "inferenceMs": 22,
+          "postprocessMs": 71
+        },
+        "model": "Real-ESRGAN x4plus",
+        "modelRevision": "Real-ESRGAN@a4abfb2979a7bbff3f69f58f58ae324608821e27+v0.1.0",
+        "modelSha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "observedTotalMs": 95,
+        "pngBytes": 1584854
+      },
+      {
+        "width": 1024,
+        "height": 1024,
+        "scale": 4,
+        "executionProvider": "CUDA FP16",
+        "tilePeakBytes": 604441600,
+        "timings": {
+          "loadMs": 0,
+          "preprocessMs": 0,
+          "inferenceMs": 26,
+          "postprocessMs": 74
+        },
+        "model": "Real-ESRGAN x4plus",
+        "modelRevision": "Real-ESRGAN@a4abfb2979a7bbff3f69f58f58ae324608821e27+v0.1.0",
+        "modelSha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "observedTotalMs": 101,
+        "pngBytes": 1584854
+      },
+      {
+        "width": 1024,
+        "height": 1024,
+        "scale": 4,
+        "executionProvider": "CUDA FP16",
+        "tilePeakBytes": 604441600,
+        "timings": {
+          "loadMs": 0,
+          "preprocessMs": 0,
+          "inferenceMs": 28,
+          "postprocessMs": 69
+        },
+        "model": "Real-ESRGAN x4plus",
+        "modelRevision": "Real-ESRGAN@a4abfb2979a7bbff3f69f58f58ae324608821e27+v0.1.0",
+        "modelSha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+        "provider": "Keepframe local restoration provider",
+        "providerVersion": "1.0.0",
+        "observedTotalMs": 99,
+        "pngBytes": 1584854
+      }
+    ],
+    "quality": {
+      "lanczosReferencePsnrDb": 21.608
+    }
+  },
+  "cpuDenoise32": {
+    "width": 32,
+    "height": 32,
+    "scale": 1,
+    "executionProvider": "CPU FP32",
+    "tilePeakBytes": 0,
+    "timings": {
+      "loadMs": 102,
+      "preprocessMs": 3,
+      "inferenceMs": 126,
+      "postprocessMs": 1
+    },
+    "model": "SCUNet colour real PSNR",
+    "modelRevision": "SCUNet@52e440a80a655b01e0b41e9dd9bfe599bc11625e+KAIR-v1.0",
+    "modelSha256": "fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e",
+    "provider": "Keepframe local restoration provider",
+    "providerVersion": "1.0.0",
+    "observedTotalMs": 231,
+    "pngBytes": 1630
+  }
+}

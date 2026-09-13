@@ -1,4 +1,5 @@
 mod advanced_develop;
+mod ai_enhancement;
 mod interoperability;
 mod migrations;
 mod organisation;
@@ -37,7 +38,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const PRESET_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SEGMENTATION_MODEL_ID: &str = "microsoft/beit-base-finetuned-ade-640-640";
 const SEGMENTATION_MODEL_REVISION: &str = "a8b6f5ef4acb2ea55d882989deaa02d39401e2b2";
@@ -86,6 +87,8 @@ struct AppState {
     semantic_index_paused: AtomicBool,
     semantic_generation: AtomicU64,
     semantic_index_generation: AtomicU64,
+    enhancement_install_cancel: AtomicBool,
+    enhancement_generation: AtomicU64,
     export_generation: Arc<AtomicU64>,
     batch_generation: Arc<AtomicU64>,
     folder_watcher: Mutex<Option<FolderWatcher>>,
@@ -1399,6 +1402,7 @@ fn allow_media_scope(app: &AppHandle, root: &Path) -> Result<()> {
         root.join(".keepframe/thumbnails"),
         root.join(".keepframe/previews"),
         root.join(".keepframe/review"),
+        root.join(".keepframe/derivatives/ai"),
         root.join("Edits"),
     ] {
         scope.allow_directory(directory, true).map_err(|error| {
@@ -1479,6 +1483,8 @@ fn initialise_layout(root: &Path) -> Result<()> {
         ".keepframe/thumbnails",
         ".keepframe/previews",
         ".keepframe/review",
+        ".keepframe/derivatives/ai",
+        ".keepframe/staging/enhancement",
         ".keepframe/staging",
         ".keepframe/Trash",
         ".keepframe/backups",
@@ -1544,6 +1550,7 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v12(&mut connection, existed, version)?;
     migrations::apply_v13(&mut connection, existed, version)?;
     migrations::apply_v14(&mut connection, existed, version)?;
+    migrations::apply_v15(&mut connection, existed, version)?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -1572,6 +1579,10 @@ fn initialise_layout(root: &Path) -> Result<()> {
     )?;
     connection.execute(
         "UPDATE jobs SET state='cancelled',error='Legacy job did not contain an image-specific reviewed recipe; create a new batch to analyse it safely',updated_at=?1 WHERE recipe_json IS NULL AND state IN ('review_required','queued')",
+        [&recovered_at],
+    )?;
+    connection.execute(
+        "UPDATE ai_enhancement_jobs SET state='failed',stage='Interrupted',error='Keepframe closed before this enhancement was accepted; no derivative was promoted.',updated_at=?1 WHERE state NOT IN('complete','failed','cancelled')",
         [&recovered_at],
     )?;
     Ok(())
@@ -1793,6 +1804,10 @@ fn ensure_analysis_worker_source() -> Result<PathBuf> {
             "semantic.py",
             include_str!("../../ai-worker/keepframe_worker/semantic.py"),
         ),
+        (
+            "enhancement.py",
+            include_str!("../../ai-worker/keepframe_worker/enhancement.py"),
+        ),
     ] {
         let destination = package.join(name);
         if fs::read_to_string(&destination).ok().as_deref() != Some(contents) {
@@ -1884,7 +1899,11 @@ fn start_analysis_worker(state: &AppState) {
     {
         return;
     }
-    if !analysis_installed() && !segmentation_model_installed() {
+    if !analysis_installed()
+        && !segmentation_model_installed()
+        && !ai_enhancement::model_installed(ai_enhancement::DENOISE_MODEL)
+        && !ai_enhancement::model_installed(ai_enhancement::SUPER_RESOLUTION_MODEL)
+    {
         if let Ok(mut worker) = state.analysis_worker.lock() {
             worker.last_error = Some(analysis_installation_detail());
         }
@@ -2391,6 +2410,115 @@ async fn install_semantic_model(
         )?;
     }
     get_semantic_index_status(state).await
+}
+
+#[tauri::command]
+fn cancel_ai_enhancement_model_install(state: State<'_, AppState>) {
+    state
+        .enhancement_install_cancel
+        .store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn get_ai_enhancement_health(
+    state: State<'_, AppState>,
+) -> Result<ai_enhancement::EnhancementHealth> {
+    let runtime_available = analysis_runtime_path().is_some();
+    let fallback = ai_enhancement::offline_health(runtime_available);
+    if !runtime_available || !fallback.models.iter().any(|model| model.installed) {
+        return Ok(fallback);
+    }
+    let (url, token) = match analysis_worker_endpoint(&state) {
+        Ok(endpoint) => endpoint,
+        Err(_) => return Ok(fallback),
+    };
+    let client = reqwest::Client::new();
+    for _ in 0..20 {
+        if let Ok(response) = client
+            .get(format!("{url}/health"))
+            .header("X-Keepframe-Token", &token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(enhancement) = value.get("enhancement") {
+                        if let Ok(health) = serde_json::from_value::<
+                            ai_enhancement::EnhancementHealth,
+                        >(enhancement.clone())
+                        {
+                            return Ok(health);
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(fallback)
+}
+
+#[tauri::command]
+async fn install_ai_enhancement_model(
+    operation: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ai_enhancement::EnhancementHealth> {
+    let spec = ai_enhancement::model_spec(&operation)?;
+    if !ai_enhancement::model_installed(spec) {
+        state
+            .enhancement_install_cancel
+            .store(false, Ordering::SeqCst);
+        fs::create_dir_all(ai_enhancement::model_root())?;
+        let destination = ai_enhancement::model_path(spec);
+        let partial = destination.with_extension("pth.partial");
+        let download: Result<()> = async {
+        let mut response = reqwest::Client::new()
+            .get(spec.source)
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut file = fs::File::create(&partial)?;
+        let mut digest = Sha256::new();
+        let mut received = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            if state.enhancement_install_cancel.load(Ordering::SeqCst) {
+                drop(file);
+                let _ = fs::remove_file(&partial);
+                return Err(KeepframeError::Message(
+                    "AI enhancement model installation was cancelled.".into(),
+                ));
+            }
+            file.write_all(&chunk)?;
+            digest.update(&chunk);
+            received += chunk.len() as u64;
+            let _ = app.emit(
+                "ai-enhancement-install-progress",
+                json!({"operation":operation,"receivedBytes":received,"totalBytes":spec.bytes,"file":spec.filename}),
+            );
+        }
+        file.sync_all()?;
+        drop(file);
+        if received != spec.bytes || format!("{:x}", digest.finalize()) != spec.sha256 {
+            let _ = fs::remove_file(&partial);
+            return Err(KeepframeError::Message(
+                "The downloaded enhancement model was truncated or failed SHA-256 verification."
+                    .into(),
+            ));
+        }
+        if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        fs::rename(&partial, destination)?;
+        Ok(())
+        }.await;
+        if let Err(error) = download {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+    }
+    get_ai_enhancement_health(state).await
 }
 
 fn validate_worker_embedding(result: &WorkerEmbeddingResult) -> Result<()> {
@@ -4926,6 +5054,366 @@ async fn preview_develop_recipe(
     .map_err(|error| KeepframeError::Message(format!("Develop preview failed: {error}")))?
 }
 
+async fn ready_enhancement_worker(
+    state: &AppState,
+) -> Result<(String, String, ai_enhancement::EnhancementHealth)> {
+    let (url, token) = analysis_worker_endpoint(state)?;
+    let client = reqwest::Client::new();
+    for _ in 0..30 {
+        if let Ok(response) = client
+            .get(format!("{url}/health"))
+            .header("X-Keepframe-Token", &token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(details) = value.get("enhancement") {
+                        if let Ok(health) = serde_json::from_value(details.clone()) {
+                            return Ok((url, token, health));
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(KeepframeError::Message(
+        "The local enhancement worker did not become ready.".into(),
+    ))
+}
+
+#[tauri::command]
+async fn preview_ai_enhancement(
+    mut request: ai_enhancement::EnhancementRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ai_enhancement::EnhancementPreview> {
+    let spec = request.validate()?;
+    if !ai_enhancement::model_installed(spec) {
+        return Err(KeepframeError::Message(format!(
+            "{} is not installed. Use the explicit Install action before previewing.",
+            spec.model
+        )));
+    }
+    let region = request
+        .preview_region
+        .unwrap_or(ai_enhancement::PreviewRegion {
+            x: 0.375,
+            y: 0.375,
+            width: 0.25,
+            height: 0.25,
+        });
+    let root = root_from(&state)?;
+    let identity = ai_enhancement::source_identity(&open_db(&root)?, &request.asset_id)?;
+    let path = contained_library_file(&root, &identity.path)?.ok_or_else(|| {
+        KeepframeError::Message(
+            "The selected enhancement source is missing from the library.".into(),
+        )
+    })?;
+    let expected = identity.expected_dimensions;
+    let working = root.join(".keepframe/staging/working");
+    let source = tauri::async_runtime::spawn_blocking(move || {
+        prepare_full_resolution_image(&path, expected, &working)
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Enhancement decode failed: {error}")))??;
+    let preview = ai_enhancement::crop_preview(&source, region)?;
+    request.preview_region = None;
+    let generation = state.enhancement_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let (url, token, health) = ready_enhancement_worker(&state).await?;
+    let tile_size = ai_enhancement::recommended_tile(&request.operation, &health);
+    let _gpu = state.gpu_gate.lock().await;
+    let processed = ai_enhancement::process_tiled(
+        &preview,
+        &request,
+        tile_size,
+        &url,
+        &token,
+        |current, total, stage| {
+            let _ = app.emit(
+                "ai-enhancement-preview-progress",
+                json!({"assetId":request.asset_id,"current":current,"total":total,"stage":stage}),
+            );
+        },
+        || state.enhancement_generation.load(Ordering::Acquire) != generation,
+    )
+    .await?;
+    if state.enhancement_generation.load(Ordering::Acquire) != generation {
+        return Err(KeepframeError::Message(
+            "AI enhancement preview was cancelled.".into(),
+        ));
+    }
+    let preview_id = Uuid::new_v4().to_string();
+    let before_path = root
+        .join(".keepframe/review")
+        .join(format!("enhance-{preview_id}-before.png"));
+    let after_path = root
+        .join(".keepframe/review")
+        .join(format!("enhance-{preview_id}-after.png"));
+    fs::write(&before_path, encode_srgb_png(&preview)?)?;
+    fs::write(
+        &after_path,
+        encode_srgb_png(&DynamicImage::ImageRgb8(processed.image.clone()))?,
+    )?;
+    Ok(ai_enhancement::EnhancementPreview {
+        preview_id,
+        before_path: before_path.to_string_lossy().into(),
+        after_path: after_path.to_string_lossy().into(),
+        width: processed.image.width(),
+        height: processed.image.height(),
+        provenance: processed.provenance,
+    })
+}
+
+#[tauri::command]
+fn cancel_ai_enhancement_preview(state: State<'_, AppState>) {
+    state.enhancement_generation.fetch_add(1, Ordering::AcqRel);
+}
+
+#[tauri::command]
+async fn apply_ai_enhancement(
+    mut request: ai_enhancement::EnhancementRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ai_enhancement::AcceptedDerivative> {
+    request.preview_region = None;
+    let spec = request.validate()?;
+    if !ai_enhancement::model_installed(spec) {
+        return Err(KeepframeError::Message(format!(
+            "{} is not installed. No catalogue change was made.",
+            spec.model
+        )));
+    }
+    let root = root_from(&state)?;
+    let job_id = ai_enhancement::create_job(&open_db(&root)?, &request)?;
+    let fail_job = |detail: &str| {
+        if let Ok(connection) = open_db(&root) {
+            let _ = ai_enhancement::update_job(
+                &connection,
+                &job_id,
+                "failed",
+                "Failed",
+                0,
+                0,
+                Some(detail),
+            );
+        }
+    };
+    let identity = match ai_enhancement::source_identity(&open_db(&root)?, &request.asset_id) {
+        Ok(value) => value,
+        Err(error) => {
+            fail_job(&error.to_string());
+            return Err(error);
+        }
+    };
+    let path = match contained_library_file(&root, &identity.path) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            let error = KeepframeError::Message(
+                "The selected enhancement source is missing from the library.".into(),
+            );
+            fail_job(&error.to_string());
+            return Err(error);
+        }
+        Err(error) => {
+            fail_job(&error.to_string());
+            return Err(error);
+        }
+    };
+    let output_pixels = identity
+        .expected_dimensions
+        .map(|(width, height)| {
+            u64::from(width) * u64::from(height) * u64::from(request.target_scale).pow(2)
+        })
+        .unwrap_or(0);
+    if output_pixels > 0 {
+        let minimum_free = output_pixels
+            .saturating_mul(8)
+            .saturating_add(256 * 1024 * 1024);
+        if fs2::available_space(&root).unwrap_or(u64::MAX) < minimum_free {
+            ai_enhancement::update_job(
+                &open_db(&root)?,
+                &job_id,
+                "failed",
+                "Disk space check failed",
+                0,
+                0,
+                Some("Insufficient free space for staged and accepted enhancement data."),
+            )?;
+            return Err(KeepframeError::Message(
+                "There is not enough free space for the staged enhancement and accepted derivative."
+                    .into(),
+            ));
+        }
+    }
+    let expected = identity.expected_dimensions;
+    let working = root.join(".keepframe/staging/working");
+    ai_enhancement::update_job(
+        &open_db(&root)?,
+        &job_id,
+        "preparing",
+        "Decoding full-resolution source",
+        0,
+        0,
+        None,
+    )?;
+    let source = match tauri::async_runtime::spawn_blocking(move || {
+        prepare_full_resolution_image(&path, expected, &working)
+    })
+    .await
+    .map_err(|error| KeepframeError::Message(format!("Enhancement decode failed: {error}")))
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) | Err(error) => {
+            fail_job(&error.to_string());
+            return Err(error);
+        }
+    };
+    let (url, token, health) = match ready_enhancement_worker(&state).await {
+        Ok(value) => value,
+        Err(error) => {
+            fail_job(&error.to_string());
+            return Err(error);
+        }
+    };
+    let tile_size = ai_enhancement::recommended_tile(&request.operation, &health);
+    let _gpu = state.gpu_gate.lock().await;
+    let process_result = ai_enhancement::process_tiled(
+        &source,
+        &request,
+        tile_size,
+        &url,
+        &token,
+        |current, total, stage| {
+            if let Ok(connection) = open_db(&root) {
+                let state_name = if stage == "Loading model" {
+                    "loading_model"
+                } else {
+                    "processing"
+                };
+                let _ = ai_enhancement::update_job(
+                    &connection,
+                    &job_id,
+                    state_name,
+                    stage,
+                    current,
+                    total,
+                    None,
+                );
+            }
+            let _ = app.emit(
+                "ai-enhancement-progress",
+                json!({"jobId":job_id,"assetId":request.asset_id,"current":current,"total":total,"stage":stage}),
+            );
+        },
+        || {
+            open_db(&root)
+                .map(|connection| ai_enhancement::job_cancelled(&connection, &job_id))
+                .unwrap_or(true)
+        },
+    )
+    .await;
+    let processed = match process_result {
+        Ok(processed) => processed,
+        Err(error) => {
+            let cancelled = error.to_string().to_ascii_lowercase().contains("cancelled");
+            let _ = ai_enhancement::update_job(
+                &open_db(&root)?,
+                &job_id,
+                if cancelled { "cancelled" } else { "failed" },
+                if cancelled { "Cancelled" } else { "Failed" },
+                0,
+                0,
+                Some(&error.to_string()),
+            );
+            return Err(error);
+        }
+    };
+    if ai_enhancement::job_cancelled(&open_db(&root)?, &job_id) {
+        ai_enhancement::update_job(
+            &open_db(&root)?,
+            &job_id,
+            "cancelled",
+            "Cancelled before acceptance",
+            0,
+            0,
+            Some("AI enhancement was cancelled; no derivative was promoted."),
+        )?;
+        return Err(KeepframeError::Message(
+            "AI enhancement was cancelled before acceptance.".into(),
+        ));
+    }
+    ai_enhancement::update_job(
+        &open_db(&root)?,
+        &job_id,
+        "writing",
+        "Writing staged derivative",
+        1,
+        1,
+        None,
+    )?;
+    let mut connection = open_db(&root)?;
+    let accepted = match ai_enhancement::persist_accepted(
+        &root,
+        &mut connection,
+        &job_id,
+        &request.asset_id,
+        &processed.image,
+        processed.provenance,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            fail_job(&error.to_string());
+            return Err(error);
+        }
+    };
+    refresh_catalogue_thumbnail(&root, &connection, &accepted.asset_id)?;
+    let _ = app.emit(
+        "ai-enhancement-progress",
+        json!({"jobId":job_id,"assetId":request.asset_id,"current":1,"total":1,"stage":"Complete","resultAssetId":accepted.asset_id}),
+    );
+    Ok(accepted)
+}
+
+#[tauri::command]
+fn cancel_ai_enhancement(asset_id: String, state: State<'_, AppState>) -> Result<()> {
+    let connection = open_db(&root_from(&state)?)?;
+    let job_id: String = connection.query_row(
+        "SELECT id FROM ai_enhancement_jobs WHERE asset_id=?1 AND state NOT IN('complete','failed','cancelled') ORDER BY created_at DESC LIMIT 1",
+        [&asset_id],
+        |row| row.get(0),
+    )?;
+    ai_enhancement::cancel_job(&connection, &job_id)
+}
+
+#[tauri::command]
+fn list_ai_enhancement_jobs(
+    asset_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ai_enhancement::EnhancementJob>> {
+    ai_enhancement::list_jobs(&open_db(&root_from(&state)?)?, asset_id.as_deref())
+}
+
+#[tauri::command]
+fn get_ai_derivative(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<ai_enhancement::AcceptedDerivative>> {
+    ai_enhancement::derivative_for_asset(&open_db(&root_from(&state)?)?, &asset_id)
+}
+
+#[tauri::command]
+fn delete_ai_derivative(
+    asset_id: String,
+    confirmed: bool,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let root = root_from(&state)?;
+    ai_enhancement::delete_derivative(&mut open_db(&root)?, &root, &asset_id, confirmed)
+}
+
 #[tauri::command]
 fn list_develop_presets(state: State<'_, AppState>) -> Result<Vec<DevelopPreset>> {
     let connection = open_db(&root_from(&state)?)?;
@@ -6221,6 +6709,11 @@ fn watch_kind(kind: &EventKind) -> Option<&'static str> {
 }
 
 fn write_debounced_watch_event(root: &Path, folder: &str, path: &Path, kind: &str) {
+    // Catalogue internals, accepted AI derivatives and their staging files are
+    // never external inbox candidates, even when the user watches the library.
+    if path.starts_with(root.join(".keepframe")) {
+        return;
+    }
     let Ok(connection) = open_db(root) else {
         return;
     };
@@ -8836,6 +9329,8 @@ pub fn run() {
             semantic_index_paused: AtomicBool::new(false),
             semantic_generation: AtomicU64::new(0),
             semantic_index_generation: AtomicU64::new(0),
+            enhancement_install_cancel: AtomicBool::new(false),
+            enhancement_generation: AtomicU64::new(0),
             export_generation: Arc::new(AtomicU64::new(0)),
             batch_generation: Arc::new(AtomicU64::new(0)),
             folder_watcher: Mutex::new(None),
@@ -8885,6 +9380,16 @@ pub fn run() {
             get_semantic_index_status,
             install_semantic_model,
             cancel_semantic_model_install,
+            get_ai_enhancement_health,
+            install_ai_enhancement_model,
+            cancel_ai_enhancement_model_install,
+            preview_ai_enhancement,
+            cancel_ai_enhancement_preview,
+            apply_ai_enhancement,
+            cancel_ai_enhancement,
+            list_ai_enhancement_jobs,
+            get_ai_derivative,
+            delete_ai_derivative,
             start_semantic_index,
             pause_semantic_index,
             cancel_semantic_index,
@@ -11549,9 +12054,23 @@ mod tests {
         let path = root.join("external/new-photo.jpg");
         write_debounced_watch_event(&root, r"D:\Camera", &path, "new_file");
         write_debounced_watch_event(&root, r"D:\Camera", &path, "new_file");
+        write_debounced_watch_event(
+            &root,
+            r"D:\Camera",
+            &root.join(".keepframe/derivatives/ai/result.png"),
+            "new_file",
+        );
         let connection = open_db(&root).unwrap();
         let count: i64 = connection.query_row("SELECT count(*) FROM watch_events WHERE folder_path=?1 AND path=?2 AND kind='new_file'", params![r"D:\Camera",path.to_string_lossy()], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+        let internal: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM watch_events WHERE path LIKE '%.keepframe%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(internal, 0);
         assert_eq!(
             watch_kind(&EventKind::Create(notify::event::CreateKind::File)),
             Some("new_file")

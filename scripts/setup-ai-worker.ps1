@@ -18,4 +18,4 @@ $WorkerPython = Join-Path $Venv "Scripts\python.exe"
 if ($LASTEXITCODE -ne 0) { throw "Could not update pip in the analysis runtime." }
 & $WorkerPython -m pip install -r (Join-Path $WorkerRoot "requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "Could not install the analysis runtime dependencies." }
-Write-Host "Local AI runtime ready. Install only the model needed: the optional 17.5 GB analysis model or the 900 MB intelligent-masking model."
+Write-Host "Local AI runtime ready. Models are separate explicit installs: 17.5 GB analysis, 900 MB intelligent masking, 72 MB AI Denoise, or 67 MB Super Resolution."

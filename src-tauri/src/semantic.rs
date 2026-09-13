@@ -285,6 +285,7 @@ pub(crate) fn ensure_current_queue(connection: &Connection) -> Result<usize> {
         "INSERT OR IGNORE INTO semantic_index_queue(source_id,priority,state,attempts,error,requested_at,updated_at)
          SELECT s.id,0,'queued',0,NULL,?4,?4 FROM sources s
          WHERE s.trashed_at IS NULL AND EXISTS(SELECT 1 FROM representations r WHERE r.source_id=s.id)
+         AND NOT EXISTS(SELECT 1 FROM ai_derivatives d WHERE d.derived_source_id=s.id)
          AND NOT EXISTS(
             SELECT 1 FROM semantic_embeddings e WHERE e.source_id=s.id
             AND e.model_id=?1 AND e.model_revision=?2 AND e.preprocessing_version=?3
@@ -303,6 +304,7 @@ pub(crate) fn next_queued_source(
              FROM semantic_index_queue q JOIN sources s ON s.id=q.source_id
              WHERE q.state='queued' AND s.trashed_at IS NULL AND s.missing_state='available'
              AND EXISTS(SELECT 1 FROM representations r WHERE r.source_id=s.id)
+             AND NOT EXISTS(SELECT 1 FROM ai_derivatives d WHERE d.derived_source_id=s.id)
              ORDER BY q.priority DESC,q.requested_at,q.source_id LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -319,7 +321,8 @@ pub(crate) fn rebuild_index(connection: &mut Connection) -> Result<usize> {
     let count = tx.execute(
         "INSERT INTO semantic_index_queue(source_id,priority,state,requested_at,updated_at)
          SELECT s.id,0,'queued',?1,?1 FROM sources s WHERE s.trashed_at IS NULL
-         AND s.missing_state='available' AND EXISTS(SELECT 1 FROM representations r WHERE r.source_id=s.id)",
+         AND s.missing_state='available' AND EXISTS(SELECT 1 FROM representations r WHERE r.source_id=s.id)
+         AND NOT EXISTS(SELECT 1 FROM ai_derivatives d WHERE d.derived_source_id=s.id)",
         [&now],
     )?;
     tx.commit()?;
@@ -448,6 +451,7 @@ fn load_candidates(connection: &Connection, filter: &SemanticFilter) -> Result<V
          FROM assets a JOIN sources s ON s.id=a.source_id
          JOIN semantic_embeddings e ON e.source_id=s.id AND e.model_id=?1 AND e.model_revision=?2 AND e.preprocessing_version=?3
          WHERE a.trashed_at IS NULL AND s.trashed_at IS NULL
+         AND NOT EXISTS(SELECT 1 FROM ai_derivatives d WHERE d.derived_source_id=s.id)
          ORDER BY a.source_id,a.is_primary DESC,a.version_index,a.id",
     )?;
     let rows = statement.query_map(
@@ -1005,7 +1009,7 @@ mod tests {
     use super::*;
     fn schema() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE sources(id TEXT PRIMARY KEY,trashed_at TEXT,missing_state TEXT NOT NULL DEFAULT 'available',thumbnail_path TEXT);CREATE TABLE assets(id TEXT PRIMARY KEY,source_id TEXT NOT NULL REFERENCES sources(id),filename TEXT,decision TEXT,rating INTEGER,title TEXT,caption TEXT,captured_at TEXT,is_primary INTEGER,version_index INTEGER,trashed_at TEXT);CREATE TABLE representations(id TEXT PRIMARY KEY,source_id TEXT REFERENCES sources(id),sha256 TEXT,extension TEXT,is_raw INTEGER);CREATE INDEX idx_test_representations_source ON representations(source_id,is_raw,id);CREATE TABLE tags(id TEXT PRIMARY KEY,name TEXT);CREATE TABLE asset_tags(asset_id TEXT,tag_id TEXT);CREATE INDEX idx_test_asset_tags_asset ON asset_tags(asset_id);CREATE TABLE develop_recipes(asset_id TEXT PRIMARY KEY);CREATE TABLE collection_items(collection_id TEXT,item_id TEXT);CREATE TABLE semantic_embeddings(source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,model_id TEXT NOT NULL,model_revision TEXT NOT NULL,preprocessing_version INTEGER NOT NULL,source_hash TEXT NOT NULL,dimension INTEGER NOT NULL,vector BLOB NOT NULL,perceptual_hash BLOB NOT NULL,indexed_at TEXT NOT NULL,PRIMARY KEY(source_id,model_id,model_revision,preprocessing_version));CREATE TABLE semantic_index_queue(source_id TEXT PRIMARY KEY REFERENCES sources(id),priority INTEGER,state TEXT,attempts INTEGER DEFAULT 0,error TEXT,requested_at TEXT,updated_at TEXT);CREATE TABLE semantic_suggestion_decisions(identity_hash TEXT PRIMARY KEY,kind TEXT,decision TEXT,model_id TEXT,model_revision TEXT,member_source_ids_json TEXT,decided_at TEXT);").unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE sources(id TEXT PRIMARY KEY,trashed_at TEXT,missing_state TEXT NOT NULL DEFAULT 'available',thumbnail_path TEXT);CREATE TABLE assets(id TEXT PRIMARY KEY,source_id TEXT NOT NULL REFERENCES sources(id),filename TEXT,decision TEXT,rating INTEGER,title TEXT,caption TEXT,captured_at TEXT,is_primary INTEGER,version_index INTEGER,trashed_at TEXT);CREATE TABLE representations(id TEXT PRIMARY KEY,source_id TEXT REFERENCES sources(id),sha256 TEXT,extension TEXT,is_raw INTEGER);CREATE INDEX idx_test_representations_source ON representations(source_id,is_raw,id);CREATE TABLE tags(id TEXT PRIMARY KEY,name TEXT);CREATE TABLE asset_tags(asset_id TEXT,tag_id TEXT);CREATE INDEX idx_test_asset_tags_asset ON asset_tags(asset_id);CREATE TABLE develop_recipes(asset_id TEXT PRIMARY KEY);CREATE TABLE collection_items(collection_id TEXT,item_id TEXT);CREATE TABLE semantic_embeddings(source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,model_id TEXT NOT NULL,model_revision TEXT NOT NULL,preprocessing_version INTEGER NOT NULL,source_hash TEXT NOT NULL,dimension INTEGER NOT NULL,vector BLOB NOT NULL,perceptual_hash BLOB NOT NULL,indexed_at TEXT NOT NULL,PRIMARY KEY(source_id,model_id,model_revision,preprocessing_version));CREATE TABLE semantic_index_queue(source_id TEXT PRIMARY KEY REFERENCES sources(id),priority INTEGER,state TEXT,attempts INTEGER DEFAULT 0,error TEXT,requested_at TEXT,updated_at TEXT);CREATE TABLE semantic_suggestion_decisions(identity_hash TEXT PRIMARY KEY,kind TEXT,decision TEXT,model_id TEXT,model_revision TEXT,member_source_ids_json TEXT,decided_at TEXT);CREATE TABLE ai_derivatives(derived_source_id TEXT PRIMARY KEY,parent_source_id TEXT,root_source_id TEXT);").unwrap();
         connection
     }
     fn vector(seed: usize) -> Vec<f32> {

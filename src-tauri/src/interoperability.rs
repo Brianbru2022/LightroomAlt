@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const PORTABLE_CATALOGUE_SCHEMA_VERSION: i64 = 4;
+pub(crate) const PORTABLE_CATALOGUE_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +52,10 @@ pub(crate) struct IntegrityReport {
     pub missing_originals: usize,
     pub missing_derived_versions: usize,
     pub modified_originals: usize,
+    pub missing_ai_derivatives: usize,
+    pub modified_ai_derivatives: usize,
+    pub orphan_ai_derivatives: usize,
+    pub unsupported_ai_provenance: usize,
     pub untracked_managed_files: usize,
     pub sidecar_conflicts: usize,
     pub findings: Vec<IntegrityFinding>,
@@ -143,7 +147,7 @@ fn validate_xml(bytes: &[u8]) -> Result<()> {
 
 fn read_asset(connection: &Connection, asset_id: &str) -> Result<SidecarAsset> {
     let mut asset = connection.query_row(
-        "SELECT a.id,s.filename,a.decision,s.captured_at,s.latitude,s.longitude,s.embedded_latitude,s.embedded_longitude,s.manual_latitude,s.manual_longitude,COALESCE(s.location_source,'none'),r.path FROM assets a JOIN sources s ON s.id=a.source_id JOIN representations r ON r.id=(SELECT r2.id FROM representations r2 WHERE r2.source_id=a.source_id ORDER BY r2.is_raw ASC,r2.path ASC LIMIT 1) WHERE a.id=?1 AND a.is_primary=1 AND a.trashed_at IS NULL",
+        "SELECT a.id,s.filename,a.decision,s.captured_at,s.latitude,s.longitude,s.embedded_latitude,s.embedded_longitude,s.manual_latitude,s.manual_longitude,COALESCE(s.location_source,'none'),r.path FROM assets a JOIN sources s ON s.id=a.source_id JOIN representations r ON r.id=(SELECT r2.id FROM representations r2 WHERE r2.source_id=a.source_id ORDER BY r2.is_raw ASC,r2.path ASC LIMIT 1) WHERE a.id=?1 AND a.is_primary=1 AND a.trashed_at IS NULL AND NOT EXISTS(SELECT 1 FROM ai_derivatives d WHERE d.derived_source_id=s.id)",
         [asset_id],
         |row| Ok(SidecarAsset { id: row.get(0)?, filename: row.get(1)?, decision: row.get(2)?, captured_at: row.get(3)?, latitude: row.get(4)?, longitude: row.get(5)?, embedded_latitude: row.get(6)?, embedded_longitude: row.get(7)?, manual_latitude: row.get(8)?, manual_longitude: row.get(9)?, location_source: row.get(10)?, original_path: PathBuf::from(row.get::<_, String>(11)?), tags: Vec::new() }),
     ).optional()?.ok_or_else(|| KeepframeError::Message("The selected catalogue item has no exportable original representation.".into()))?;
@@ -518,6 +522,37 @@ struct PortableAsset {
     original: serde_json::Value,
     develop_recipe: Option<serde_json::Value>,
     derived_versions: Vec<PortableVersion>,
+    ai_derivative: Option<PortableAiDerivative>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PortableAiDerivative {
+    id: String,
+    parent_source_id: String,
+    root_source_id: String,
+    derived_source_id: String,
+    source_asset_id: String,
+    operation: String,
+    provider: String,
+    provider_version: String,
+    model_id: String,
+    model_revision: String,
+    model_sha256: String,
+    execution_provider: String,
+    parameters: Value,
+    scale: i64,
+    tile_size: i64,
+    overlap: i64,
+    source_sha256: String,
+    output_sha256: String,
+    output_width: i64,
+    output_height: i64,
+    pixel_format: String,
+    bit_depth: i64,
+    managed_relative_path: String,
+    provenance_version: i64,
+    created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -576,8 +611,11 @@ pub(crate) fn recover_moved_managed_paths(
         if Path::new(&path).is_file() {
             continue;
         }
-        let Some(candidate) = rebase_managed_path(root, Path::new(&path), &["Originals", "Edits"])
-        else {
+        let Some(candidate) = rebase_managed_path(
+            root,
+            Path::new(&path),
+            &["Originals", "Edits", "derivatives"],
+        ) else {
             continue;
         };
         if hash_file(&candidate)? == hash {
@@ -659,7 +697,7 @@ pub(crate) fn export_portable_catalogue(
             "Choose an existing folder for the portable catalogue export.".into(),
         ));
     }
-    let output = destination.join("keepframe-portable-catalogue-v4.json");
+    let output = destination.join("keepframe-portable-catalogue-v5.json");
     let temporary = output.with_extension("json.partial");
     let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut tags = connection.prepare("SELECT at.asset_id,t.name FROM asset_tags at JOIN tags t ON t.id=at.tag_id ORDER BY at.asset_id,t.name COLLATE NOCASE")?;
@@ -709,6 +747,41 @@ pub(crate) fn export_portable_catalogue(
                 ))
             })?;
         recipe_map.insert(asset, serde_json::to_value(value)?);
+    }
+    let mut derivative_map = HashMap::new();
+    let mut derivatives = connection.prepare("SELECT id,parent_source_id,root_source_id,derived_source_id,source_asset_id,operation,provider,provider_version,model_id,model_revision,model_sha256,execution_provider,parameters_json,scale,tile_size,overlap,source_sha256,output_sha256,output_width,output_height,pixel_format,bit_depth,managed_relative_path,provenance_version,created_at FROM ai_derivatives ORDER BY created_at,id")?;
+    for row in derivatives.query_map([], |row| {
+        let parameters: String = row.get(12)?;
+        Ok(PortableAiDerivative {
+            id: row.get(0)?,
+            parent_source_id: row.get(1)?,
+            root_source_id: row.get(2)?,
+            derived_source_id: row.get(3)?,
+            source_asset_id: row.get(4)?,
+            operation: row.get(5)?,
+            provider: row.get(6)?,
+            provider_version: row.get(7)?,
+            model_id: row.get(8)?,
+            model_revision: row.get(9)?,
+            model_sha256: row.get(10)?,
+            execution_provider: row.get(11)?,
+            parameters: serde_json::from_str(&parameters).unwrap_or(Value::Null),
+            scale: row.get(13)?,
+            tile_size: row.get(14)?,
+            overlap: row.get(15)?,
+            source_sha256: row.get(16)?,
+            output_sha256: row.get(17)?,
+            output_width: row.get(18)?,
+            output_height: row.get(19)?,
+            pixel_format: row.get(20)?,
+            bit_depth: row.get(21)?,
+            managed_relative_path: row.get(22)?,
+            provenance_version: row.get(23)?,
+            created_at: row.get(24)?,
+        })
+    })? {
+        let derivative = row?;
+        derivative_map.insert(derivative.derived_source_id.clone(), derivative);
     }
     let file = fs::File::create(&temporary)?;
     let mut writer = BufWriter::new(file);
@@ -779,6 +852,7 @@ pub(crate) fn export_portable_catalogue(
             copyright,
             creator,
         ) = row?;
+        let ai_derivative = derivative_map.remove(&source_id);
         let record = PortableAsset {
             id: id.clone(),
             source_id,
@@ -802,6 +876,7 @@ pub(crate) fn export_portable_catalogue(
             original: json!({"path":path,"managedRelativePath":path.as_deref().and_then(|path| relative_or_absolute(root,path)),"sha256":sha256,"byteSize":byte_size,"extension":extension,"isRaw":is_raw.map(|value| value != 0)}),
             develop_recipe: recipe_map.remove(&id),
             derived_versions: version_map.remove(&id).unwrap_or_default(),
+            ai_derivative,
         };
         if !first {
             writer.write_all(b",")?;
@@ -919,6 +994,42 @@ pub(crate) fn import_portable_catalogue(connection: &mut Connection, path: &Path
                 )));
             }
         }
+        if let Some(derivative) = &item.ai_derivative {
+            let managed = Path::new(&derivative.managed_relative_path);
+            let safe_relative = !managed.is_absolute()
+                && managed
+                    .components()
+                    .all(|component| !matches!(component, std::path::Component::ParentDir))
+                && derivative
+                    .managed_relative_path
+                    .replace('\\', "/")
+                    .starts_with(".keepframe/derivatives/ai/");
+            let lineage_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE id=?1) AND EXISTS(SELECT 1 FROM sources WHERE id=?2) AND EXISTS(SELECT 1 FROM assets WHERE id=?3) AND EXISTS(SELECT 1 FROM representations WHERE source_id=?4 AND sha256=?5)",
+                params![derivative.parent_source_id,derivative.root_source_id,derivative.source_asset_id,derivative.derived_source_id,derivative.output_sha256],
+                |row| row.get(0),
+            )?;
+            if derivative.derived_source_id != item.source_id
+                || !matches!(
+                    derivative.operation.as_str(),
+                    "denoise" | "super_resolution"
+                )
+                || !matches!(derivative.scale, 1 | 2 | 4)
+                || derivative.model_sha256.len() != 64
+                || derivative.source_sha256.len() != 64
+                || derivative.output_sha256.len() != 64
+                || derivative.bit_depth != 8
+                || derivative.provenance_version != 1
+                || !derivative.parameters.is_object()
+                || !safe_relative
+                || !lineage_exists
+            {
+                return Err(KeepframeError::Message(format!(
+                    "AI derivative metadata for {} does not match this physical library.",
+                    item.id
+                )));
+            }
+        }
     }
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute_batch("DELETE FROM collection_items;DELETE FROM collections;DELETE FROM collection_sets;DELETE FROM stack_items;DELETE FROM stacks;DELETE FROM semantic_suggestion_decisions;")?;
@@ -943,6 +1054,24 @@ pub(crate) fn import_portable_catalogue(connection: &mut Connection, path: &Path
             tx.execute("DELETE FROM develop_recipes WHERE asset_id=?1", [&item.id])?;
         }
         super::replace_asset_tags(&tx, &item.id, &item.tags)?;
+    }
+    for derivative in portable
+        .assets
+        .iter()
+        .filter_map(|item| item.ai_derivative.as_ref())
+    {
+        tx.execute(
+            "DELETE FROM ai_derivatives WHERE derived_source_id=?1",
+            [&derivative.derived_source_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ai_derivatives(id,parent_source_id,root_source_id,derived_source_id,source_asset_id,operation,provider,provider_version,model_id,model_revision,model_sha256,execution_provider,parameters_json,scale,tile_size,overlap,source_sha256,output_sha256,output_width,output_height,pixel_format,bit_depth,managed_relative_path,provenance_version,created_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+            params![derivative.id,derivative.parent_source_id,derivative.root_source_id,derivative.derived_source_id,derivative.source_asset_id,derivative.operation,derivative.provider,derivative.provider_version,derivative.model_id,derivative.model_revision,derivative.model_sha256,derivative.execution_provider,serde_json::to_string(&derivative.parameters)?,derivative.scale,derivative.tile_size,derivative.overlap,derivative.source_sha256,derivative.output_sha256,derivative.output_width,derivative.output_height,derivative.pixel_format,derivative.bit_depth,derivative.managed_relative_path,derivative.provenance_version,derivative.created_at],
+        )?;
+        tx.execute(
+            "DELETE FROM semantic_index_queue WHERE source_id=?1",
+            [&derivative.derived_source_id],
+        )?;
     }
     for value in sets {
         tx.execute("INSERT INTO collection_sets(id,name,position,created_at,updated_at)VALUES(?1,?2,?3,?4,?4)",params![portable_text(value,"id")?,portable_text(value,"name")?,value.get("position").and_then(Value::as_i64).unwrap_or(0),Utc::now().to_rfc3339()])?;
@@ -1003,6 +1132,10 @@ pub(crate) fn rescan_library(connection: &mut Connection, root: &Path) -> Result
         missing_originals: 0,
         missing_derived_versions: 0,
         modified_originals: 0,
+        missing_ai_derivatives: 0,
+        modified_ai_derivatives: 0,
+        orphan_ai_derivatives: 0,
+        unsupported_ai_provenance: 0,
         untracked_managed_files: 0,
         sidecar_conflicts: 0,
         findings: Vec::new(),
@@ -1025,6 +1158,46 @@ pub(crate) fn rescan_library(connection: &mut Connection, root: &Path) -> Result
         report.scanned_assets += 1;
         let mut state = "available";
         let mut has_representation = false;
+        let derivative: Option<(String, String, String, String)> = tx.query_row(
+            "SELECT parent_source_id,root_source_id,model_id,model_revision FROM ai_derivatives WHERE derived_source_id=?1",
+            [&source_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        if let Some((parent, root_source, model, revision)) = derivative.as_ref() {
+            let parent_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE id=?1 AND trashed_at IS NULL)",
+                [parent],
+                |row| row.get(0),
+            )?;
+            if !parent_exists {
+                report.orphan_ai_derivatives += 1;
+                report.findings.push(IntegrityFinding {
+                    asset_id: Some(primary_item_id.clone()),
+                    filename: Some(filename.clone()),
+                    kind: "ai_derivative_parent_missing".into(),
+                    detail: format!("Parent {parent}; root {root_source}"),
+                });
+            }
+            let supported = matches!(
+                (model.as_str(), revision.as_str()),
+                (
+                    "scunet_color_real_psnr",
+                    "52e440a80a655b01e0b41e9dd9bfe599bc11625e"
+                ) | (
+                    "RealESRGAN_x4plus",
+                    "a4abfb2979a7bbff3f69f58f58ae324608821e27"
+                )
+            );
+            if !supported {
+                report.unsupported_ai_provenance += 1;
+                report.findings.push(IntegrityFinding {
+                    asset_id: Some(primary_item_id.clone()),
+                    filename: Some(filename.clone()),
+                    kind: "ai_derivative_provenance_unsupported".into(),
+                    detail: format!("{model}@{revision}"),
+                });
+            }
+        }
         let mut representations =
             tx.prepare("SELECT path,sha256,byte_size FROM representations WHERE source_id=?1")?;
         for row in representations.query_map([&source_id], |row| {
@@ -1039,23 +1212,43 @@ pub(crate) fn rescan_library(connection: &mut Connection, root: &Path) -> Result
             known_paths.insert(PathBuf::from(&path));
             let candidate = PathBuf::from(&path);
             if !candidate.is_file() {
-                state = "original_missing";
-                report.missing_originals += 1;
+                state = if derivative.is_some() {
+                    "derived_missing"
+                } else {
+                    "original_missing"
+                };
+                if derivative.is_some() {
+                    report.missing_ai_derivatives += 1;
+                } else {
+                    report.missing_originals += 1;
+                }
                 report.findings.push(IntegrityFinding {
                     asset_id: Some(primary_item_id.clone()),
                     filename: Some(filename.clone()),
-                    kind: "original_missing".into(),
+                    kind: if derivative.is_some() {
+                        "ai_derivative_missing".into()
+                    } else {
+                        "original_missing".into()
+                    },
                     detail: path,
                 });
             } else if fs::metadata(&candidate)?.len() as i64 != byte_size
-                && hash_file(&candidate)? != hash
+                || hash_file(&candidate)? != hash
             {
                 state = "modified";
-                report.modified_originals += 1;
+                if derivative.is_some() {
+                    report.modified_ai_derivatives += 1;
+                } else {
+                    report.modified_originals += 1;
+                }
                 report.findings.push(IntegrityFinding {
                     asset_id: Some(primary_item_id.clone()),
                     filename: Some(filename.clone()),
-                    kind: "original_modified".into(),
+                    kind: if derivative.is_some() {
+                        "ai_derivative_modified".into()
+                    } else {
+                        "original_modified".into()
+                    },
                     detail: candidate.to_string_lossy().into(),
                 });
             }
@@ -1118,7 +1311,11 @@ pub(crate) fn rescan_library(connection: &mut Connection, root: &Path) -> Result
             });
         }
     }
-    for directory in [root.join("Originals"), root.join("Edits")] {
+    for directory in [
+        root.join("Originals"),
+        root.join("Edits"),
+        root.join(".keepframe").join("derivatives").join("ai"),
+    ] {
         if directory.is_dir() {
             for entry in walkdir::WalkDir::new(directory)
                 .into_iter()

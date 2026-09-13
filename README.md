@@ -90,6 +90,8 @@ See `MILESTONE_14_SEMANTIC_DISCOVERY_GUIDE.md` for the optional local semantic m
 
 See `MILESTONE_15_ADVANCED_DEVELOP_GUIDE.md` for point and channel curves, Colour Mixer, grading, capture detail, the pinned Lensfun subset, optical/mask geometry, advanced preset and Sync policy, profiling and native acceptance boundaries.
 
+See `MILESTONE_16_AI_ENHANCEMENT_GUIDE.md` for explicit local AI Denoise and Super Resolution installation, crop review, full-resolution tiled processing, derived-master lineage, portability, integrity checks, performance evidence and current output limits.
+
 ## Optional local AI
 
 The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe rejects non-loopback service addresses. Optional Qwen3-VL analysis is installed separately; no model downloads automatically.
@@ -100,7 +102,7 @@ The existing image-edit service defaults to `http://127.0.0.1:7868`. Keepframe r
 .\scripts\download-segmentation-model.ps1
 ```
 
-The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The optional Qwen analysis model is approximately 17.5 GB, the BEiT intelligent-masking model is approximately 900 MB, and the separately confirmed SigLIP semantic model is approximately 778 MiB. Every model download requires an explicit action. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
+The runtime may require several GB; it is installed at `D:\AI Models\Keepframe\runtime`. The optional Qwen analysis model is approximately 17.5 GB, the BEiT intelligent-masking model is approximately 900 MB, the confirmed SigLIP semantic model is approximately 778 MiB, and the AI Denoise/Super Resolution weights total about 139 MB. Every model download requires an explicit action. Every weight, cache and companion-worker asset is constrained beneath `D:\AI Models\Keepframe`.
 
 When the vision model is absent, Keepframe labels the recipe as a deterministic controls-only fallback. Qwen-Image-Edit at port 7868 is a separate integration and is reported independently in Settings & Health.
 

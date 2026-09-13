@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from PIL import Image
 
 from .schemas import AnalysisResponse, normalise_payload
-from . import segmentation, semantic
+from . import enhancement, segmentation, semantic
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 MODEL_ROOT = Path(os.environ.get("KEEPFRAME_MODEL_ROOT", r"D:\AI Models\Keepframe"))
@@ -68,6 +68,7 @@ def health() -> dict:
         "offline": True,
         "segmentation": segmentation.status(),
         "semantic": semantic.status(),
+        "enhancement": enhancement.status(),
     }
 
 
@@ -112,6 +113,7 @@ def unload() -> dict:
     _processor = None
     segmentation.unload()
     semantic.unload()
+    enhancement.unload()
     try:
         import torch
         if torch.cuda.is_available():
@@ -167,3 +169,24 @@ def semantic_text(query: str = Form(...)) -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Local semantic text embedding failed: {exc}") from exc
+
+
+@app.post("/v1/enhancement/tile", dependencies=[Depends(authorised)])
+def enhance_tile(
+    image: UploadFile = File(...),
+    operation: str = Form(...),
+    force_cpu: bool = Form(False),
+) -> dict:
+    data = image.file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="No enhancement tile was supplied")
+    try:
+        result = enhancement.run_tile(Image.open(io.BytesIO(data)), operation, force_cpu)
+        png = result.pop("png")
+        return {**result, "pngBase64": base64.b64encode(png).decode("ascii")}
+    except enhancement.EnhancementOutOfMemory as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Local enhancement failed: {exc}") from exc
