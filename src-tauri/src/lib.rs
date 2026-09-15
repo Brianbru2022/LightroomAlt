@@ -1517,9 +1517,6 @@ fn initialise_layout(root: &Path) -> Result<()> {
       CREATE INDEX IF NOT EXISTS idx_asset_tags_tag_asset ON asset_tags(tag_id,asset_id);
       CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at DESC);
       CREATE INDEX IF NOT EXISTS idx_assets_decision_captured_at ON assets(decision,captured_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_assets_location ON assets(latitude,longitude,captured_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_assets_location_source ON assets(location_source,captured_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_assets_missing_state ON assets(missing_state,captured_at DESC);
       CREATE TABLE IF NOT EXISTS sidecar_exports(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,path TEXT NOT NULL,content_hash TEXT NOT NULL,exported_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS watch_folders(path TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS watch_events(id INTEGER PRIMARY KEY AUTOINCREMENT,folder_path TEXT NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('new_file','file_changed','file_removed')),observed_at TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'inbox',UNIQUE(folder_path,path,kind,state));
@@ -1551,6 +1548,11 @@ fn initialise_layout(root: &Path) -> Result<()> {
     migrations::apply_v13(&mut connection, existed, version)?;
     migrations::apply_v14(&mut connection, existed, version)?;
     migrations::apply_v15(&mut connection, existed, version)?;
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_assets_location ON assets(latitude,longitude,captured_at DESC);\
+         CREATE INDEX IF NOT EXISTS idx_assets_location_source ON assets(location_source,captured_at DESC);\
+         CREATE INDEX IF NOT EXISTS idx_assets_missing_state ON assets(missing_state,captured_at DESC);",
+    )?;
     if database_integrity(&connection)? != "ok" {
         return Err(KeepframeError::Message(
             "The catalogue failed its integrity check and was not opened.".into(),
@@ -11009,6 +11011,45 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(recorded, 1);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_catalogue_migrates_before_post_v4_asset_indexes_are_created() {
+        let root =
+            std::env::temp_dir().join(format!("keepframe-legacy-index-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(".keepframe")).unwrap();
+        let legacy = Connection::open(db_path(&root)).unwrap();
+        legacy.execute_batch(
+            "CREATE TABLE assets(id TEXT PRIMARY KEY,filename TEXT NOT NULL,decision TEXT NOT NULL DEFAULT 'undecided',rating INTEGER NOT NULL DEFAULT 0,title TEXT,caption TEXT,copyright TEXT,creator TEXT,captured_at TEXT NOT NULL,date_fallback INTEGER NOT NULL DEFAULT 0,camera TEXT,width INTEGER,height INTEGER,latitude REAL,longitude REAL,embedded_latitude REAL,embedded_longitude REAL,manual_latitude REAL,manual_longitude REAL,last_verified_at TEXT,thumbnail_path TEXT NOT NULL,preferred_version_id TEXT,created_at TEXT NOT NULL,trashed_at TEXT);\
+             CREATE TABLE representations(id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,path TEXT NOT NULL UNIQUE,sha256 TEXT NOT NULL,extension TEXT NOT NULL,stem TEXT NOT NULL,byte_size INTEGER NOT NULL,is_raw INTEGER NOT NULL DEFAULT 0);\
+             PRAGMA user_version=4;",
+        ).unwrap();
+        drop(legacy);
+
+        initialise_layout(&root).unwrap();
+        let connection = open_db(&root).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let location_source: String = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('assets') WHERE name='location_source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let missing_state: String = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('assets') WHERE name='missing_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(location_source, "location_source");
+        assert_eq!(missing_state, "missing_state");
         drop(connection);
         fs::remove_dir_all(root).unwrap();
     }
